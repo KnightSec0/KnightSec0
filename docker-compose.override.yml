@@ -1,0 +1,27 @@
+version: '3.9'
+
+# Override for production/OpSec use — enables network isolation
+# Apply with: docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+
+services:
+  tor-proxy:
+    networks:
+      - tor_network
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+
+networks:
+  tor_network:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
