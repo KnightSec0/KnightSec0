@@ -19,7 +19,7 @@ COPY . .
 
 # Install OSINT CLI tools
 RUN mkdir -p /tools && \
-    pip install maigret sherlock whatsmyname holehe social-analyzer && \
+    pip install maigret sherlock-project holehe social-analyzer && \
     git clone --depth 1 https://github.com/laramies/theHarvester.git /tools/theHarvester && \
     cd /tools/theHarvester && pip install -r requirements/base.txt && \
     git clone --depth 1 https://github.com/DedSecInside/TorBot.git /tools/TorBot && \

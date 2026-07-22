@@ -37,3 +37,6 @@ python-dateutil>=2.9.0
 tqdm>=4.66.4
 tenacity>=8.3.0
 orjson>=3.10.3
+
+# Optional structured LLM reporting
+openai>=1.68.0,<3.0.0

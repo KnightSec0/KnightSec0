@@ -6,6 +6,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class Settings:
     # Database
@@ -27,6 +34,19 @@ class Settings:
     hunter_api_key: Optional[str] = os.getenv("HUNTER_API_KEY")
     sociallinks_api_key: Optional[str] = os.getenv("SOCIALLINKS_API_KEY")
     brave_api_key: Optional[str] = os.getenv("BRAVE_API_KEY")
+
+    # Evidence analysis / reporting
+    llm_provider: str = os.getenv("LLM_PROVIDER", "none")
+    openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5")
+    ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+    ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.3")
+    llm_include_identifiers: bool = _env_bool("LLM_INCLUDE_IDENTIFIERS", False)
+
+    # Connector safety / resource controls
+    connector_timeout: int = int(os.getenv("CONNECTOR_TIMEOUT", "30"))
+    max_osint_concurrency: int = int(os.getenv("MAX_OSINT_CONCURRENCY", "4"))
+    allow_sensitive_pivots: bool = _env_bool("ALLOW_SENSITIVE_PIVOTS", False)
 
     # Celery / Redis
     celery_broker: str = os.getenv("CELERY_BROKER", "redis://redis:6379/0")

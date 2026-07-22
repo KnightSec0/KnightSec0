@@ -6,7 +6,8 @@ import logging
 from typing import Optional
 import aiohttp
 
-from ..config import settings
+from config import settings
+from intelligence.redaction import redact_sensitive
 
 logger = logging.getLogger("deepvault.investigators.breach")
 
@@ -81,7 +82,11 @@ class BreachInvestigator:
                                 results.append({
                                     "email": email,
                                     "username": entry.get("username"),
-                                    "password": entry.get("password", "<redacted>"),
+                                    "credential_data_present": bool(
+                                        entry.get("password")
+                                        or entry.get("hashed_password")
+                                        or entry.get("hash")
+                                    ),
                                     "database": entry.get("database_name"),
                                     "leaked_date": entry.get("leak_date"),
                                     "source": "dehashed",
@@ -109,7 +114,7 @@ class BreachInvestigator:
                             for entry in data.get("records", []):
                                 results.append({
                                     "query": query,
-                                    "record": entry,
+                                    "record": redact_sensitive(entry),
                                     "source": "intelx",
                                 })
                 except Exception as e:

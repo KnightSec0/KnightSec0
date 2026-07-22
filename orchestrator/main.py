@@ -22,6 +22,8 @@ from investigators.darkweb import DarkWebInvestigator
 from investigators.documents import DocumentInvestigator
 from investigators.geolocation import GeolocationInvestigator
 from investigators.financial import FinancialInvestigator
+from investigators.email_footprint import EmailFootprintInvestigator
+from reporting.person_report import PersonReportGenerator
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -75,8 +77,7 @@ async def create_tables():
 @app.task(bind=True, max_retries=3, default_retry_delay=60)
 def run_investigation(self, investigation_id: str):
     """Entry point: run full investigation pipeline for a given ID."""
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(_run_investigation_pipeline(investigation_id))
+    asyncio.run(_run_investigation_pipeline(investigation_id))
 
 
 async def _run_investigation_pipeline(investigation_id: str):
@@ -130,7 +131,7 @@ async def _run_investigation_pipeline(investigation_id: str):
             # ---- STAGE 2: Social Media Discovery ----
             logger.info("Stage 2: Social media discovery...")
             usernames_to_scan = list(set(
-                [target["username"]] if target["username"] else []
+                ([target["username"]] if target["username"] else [])
                 + target.get("discovered_usernames", [])
             ))
             if usernames_to_scan:
@@ -154,9 +155,30 @@ async def _run_investigation_pipeline(investigation_id: str):
             # ---- STAGE 3: Breach Detection ----
             logger.info("Stage 3: Breach detection...")
             emails_to_check = list(set(
-                [target["email"]] if target["email"] else []
+                ([target["email"]] if target["email"] else [])
                 + target.get("discovered_emails", [])
             ))
+            # ---- STAGE 3A: Email service footprint ----
+            logger.info("Stage 3A: Email service footprint...")
+            email_footprint = EmailFootprintInvestigator()
+            footprint_results = await email_footprint.run(emails_to_check)
+            for item in footprint_results:
+                metadata = item.get("metadata", {})
+                all_artifacts.append(Artifact(
+                    investigation_id=inv_uuid,
+                    source=item.get("source", "holehe"),
+                    source_type="service_registration",
+                    identifier_type="email",
+                    identifier_value=metadata.get("email", ""),
+                    context={"evidence": item},
+                    confidence=(
+                        "high" if item.get("confidence", 0) >= 0.8
+                        else "medium" if item.get("confidence", 0) >= 0.6
+                        else "low"
+                    ),
+                ))
+            logger.info("  Found %s email-service signals", len(footprint_results))
+
             breach = BreachInvestigator()
             breach_results = await breach.run(
                 emails=emails_to_check,
@@ -194,7 +216,7 @@ async def _run_investigation_pipeline(investigation_id: str):
                 ))
 
             # ---- STAGE 5: Dark Web (if depth >= deep) ----
-            if target.get("depth") in ("deep", "full"):
+            if settings.allow_sensitive_pivots and target.get("depth") in ("deep", "full"):
                 logger.info("Stage 5: Dark web search...")
                 darkweb = DarkWebInvestigator()
                 darkweb_queries = list(set(
@@ -220,7 +242,7 @@ async def _run_investigation_pipeline(investigation_id: str):
                     logger.info(f"  {category}: {len(items)} results")
 
             # ---- STAGE 6: Geolocation ----
-            if target.get("depth") == "full":
+            if settings.allow_sensitive_pivots and target.get("depth") == "full":
                 logger.info("Stage 6: Geolocation...")
                 geo = GeolocationInvestigator()
                 geo_results = await geo.run(emails=emails_to_check)
@@ -236,7 +258,7 @@ async def _run_investigation_pipeline(investigation_id: str):
                     ))
 
             # ---- STAGE 7: Financial / Crypto ----
-            if target.get("depth") == "full":
+            if settings.allow_sensitive_pivots and target.get("depth") == "full":
                 logger.info("Stage 7: Financial/crypto...")
                 fin = FinancialInvestigator()
                 fin_results = await fin.run(
@@ -259,6 +281,17 @@ async def _run_investigation_pipeline(investigation_id: str):
                 session.add(artifact)
             await session.commit()
 
+            # ---- STAGE 9: Evidence-linked person report ----
+            logger.info("Stage 9: Generating structured person report...")
+            report = await PersonReportGenerator().generate(
+                target=target,
+                artifacts=all_artifacts,
+            )
+            inv.case_metadata = inv.case_metadata or {}
+            inv.case_metadata["structured_report"] = report.model_dump(mode="json")
+            inv.risk_score = report.overall_risk.value
+            await session.commit()
+
             # Mark complete
             inv.status = InvestigationStatus.COMPLETED
             inv.completed_at = datetime.now(timezone.utc)
@@ -270,8 +303,8 @@ async def _run_investigation_pipeline(investigation_id: str):
         except Exception as e:
             logger.exception(f"Investigation {investigation_id} FAILED: {e}")
             inv.status = InvestigationStatus.FAILED
-            inv.metadata = inv.metadata or {}
-            inv.metadata["error"] = str(e)
+            inv.case_metadata = inv.case_metadata or {}
+            inv.case_metadata["error"] = str(e)
             await session.commit()
             raise
 

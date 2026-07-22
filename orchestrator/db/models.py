@@ -48,7 +48,7 @@ class Investigation(Base):
         DateTime, onupdate=datetime.datetime.utcnow, nullable=True
     )
     completed_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
-    metadata: Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
+    case_metadata: Mapped[Optional[dict]] = mapped_column("metadata", JSON, default=dict)
 
     artifacts = relationship("Artifact", back_populates="investigation",
                               cascade="all, delete-orphan",

@@ -1,61 +1,78 @@
-"""
-Social Media Investigator — discovers profiles across 400+ platforms.
-"""
+"""Person-focused social profile discovery with independent corroboration."""
+
+from __future__ import annotations
+
 import asyncio
 import logging
-from typing import Optional
-import subprocess
-import json
+
+from config import settings
+from connectors import MaigretConnector, SherlockConnector
+from intelligence.correlation import correlate_evidence
+from intelligence.models import ConnectorResult, Evidence
 
 logger = logging.getLogger("deepvault.investigators.social")
 
 
+def _confidence_label(score: float) -> str:
+    if score >= 0.80:
+        return "high"
+    if score >= 0.60:
+        return "medium"
+    return "low"
+
+
 class SocialMediaInvestigator:
-    """
-    Uses Sherlock, Maigret, and WhatsMyName to discover accounts
-    across social media platforms and forums.
-    """
+    """Run username connectors in parallel and preserve source provenance."""
+
+    def __init__(self) -> None:
+        self.connectors = [SherlockConnector(), MaigretConnector()]
+        self._semaphore = asyncio.Semaphore(settings.max_osint_concurrency)
+
+    async def _search(
+        self, connector: SherlockConnector | MaigretConnector, username: str
+    ) -> ConnectorResult:
+        async with self._semaphore:
+            return await connector.search(username)
 
     async def run(self, usernames: list[str]) -> list[dict]:
-        """Discover social media accounts for given usernames."""
-        logger.info(f"Social media search for {len(usernames)} usernames")
-        results = []
+        clean_usernames = list(
+            dict.fromkeys(username.strip() for username in usernames if username.strip())
+        )
+        logger.info("Social profile search for %s username(s)", len(clean_usernames))
 
-        # Sherlock search
-        for username in usernames:
-            try:
-                result = await asyncio.to_thread(self._sherlock_search, username)
-                results.extend(result)
-            except Exception as e:
-                logger.warning(f"Sherlock error for {username}: {e}")
+        tasks = [
+            self._search(connector, username)
+            for username in clean_usernames
+            for connector in self.connectors
+        ]
+        connector_results = await asyncio.gather(*tasks) if tasks else []
 
-        return results
+        raw_evidence: list[Evidence] = []
+        for result in connector_results:
+            raw_evidence.extend(result.evidence)
+            for error in result.errors:
+                if error:
+                    logger.warning("%s: %s", result.connector, error)
 
-    @staticmethod
-    def _sherlock_search(username: str) -> list[dict]:
-        """Run sherlock command and parse results."""
-        try:
-            output = subprocess.run(
-                ["sherlock", username, "--output", "/tmp/sherlock_results.json"],
-                capture_output=True,
-                timeout=60,
-                text=True
+        correlated = correlate_evidence(raw_evidence)
+        results: list[dict] = []
+        for item in correlated:
+            username = ""
+            observations = item.metadata.get("observations", [])
+            if observations:
+                username = (
+                    observations[0].get("metadata", {}).get("username", "")
+                )
+            results.append(
+                {
+                    "username": username,
+                    "source": item.source,
+                    "url": item.value,
+                    "confidence": _confidence_label(item.confidence),
+                    "confidence_score": item.confidence,
+                    "identity_status": item.identity_status.value,
+                    "corroborated_by": item.corroborated_by,
+                    "evidence": item.safe_dump(),
+                }
             )
-            try:
-                with open("/tmp/sherlock_results.json", "r") as f:
-                    data = json.load(f)
-                    results = []
-                    for site, details in data.items():
-                        if isinstance(details, dict) and details.get("exists"):
-                            results.append({
-                                "username": username,
-                                "source": site,
-                                "url": details.get("url_main", ""),
-                                "confidence": "high",
-                            })
-                    return results
-            except FileNotFoundError:
-                return []
-        except Exception as e:
-            logger.error(f"Sherlock execution failed: {e}")
-            return []
+        return results

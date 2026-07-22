@@ -9,7 +9,7 @@ from typing import Optional
 import aiohttp
 from bs4 import BeautifulSoup
 
-from ..config import settings
+from config import settings
 
 logger = logging.getLogger("deepvault.investigators.identity")
 
@@ -50,8 +50,8 @@ class IdentityInvestigator:
         """Generate likely usernames from a name."""
         f = first.lower().strip()
         l = last.lower().strip()
-        fi = f[0]
-        li = l[0]
+        fi = f[0] if f else ""
+        li = l[0] if l else ""
         patterns = [
             f, l,
             f"{f}{l}", f"{f}.{l}", f"{f}_{l}",
@@ -81,9 +81,23 @@ class IdentityInvestigator:
             async with self.session.get(url, params=params, timeout=15) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    emails = data.get("data", {}).get("emails", [])
-                    return [{"email": e.get("value"), "type": e.get("type", "unknown"),
-                             "confidence": e.get("confidence", 0)} for e in emails]
+                    record = data.get("data", {})
+                    emails = record.get("emails") or []
+                    if record.get("email"):
+                        emails = [{
+                            "value": record.get("email"),
+                            "type": record.get("type", "unknown"),
+                            "confidence": record.get("score", record.get("confidence", 0)),
+                        }]
+                    return [
+                        {
+                            "email": e.get("value"),
+                            "type": e.get("type", "unknown"),
+                            "confidence": e.get("confidence", 0),
+                        }
+                        for e in emails
+                        if e.get("value")
+                    ]
                 elif resp.status == 404:
                     return []
                 else:
@@ -112,13 +126,10 @@ class IdentityInvestigator:
         }
 
         queries = [
-            f'intitle:"{name}" "email" "contact"',
-            f'intitle:"{name}" "phone" OR "tel"',
             f'"{name}" site:linkedin.com/in/',
-            f'"{name}" site:facebook.com/',
             f'"{name}" site:github.com',
-            f'"{name}" site:twitter.com',
             f'"{name}" "resume" OR "CV" filetype:pdf',
+            f'"{name}" "security" OR "cybersecurity" OR "engineer"',
         ]
 
         results = []
@@ -164,7 +175,7 @@ class IdentityInvestigator:
     # ------------------------------------------------------------------
     # Main pipeline
     # ------------------------------------------------------------------
-    async def run(self, first_name: str, last_name: str) -> dict:
+    async def run(self, first_name: str, last_name: str, domains: Optional[list[str]] = None) -> dict:
         """Full identity expansion pipeline."""
         logger.info("Identity investigation for %s %s", first_name, last_name)
 
@@ -178,10 +189,10 @@ class IdentityInvestigator:
             email_perms = self.generate_email_permutations(first_name, last_name)
             username_perms = self.generate_username_permutations(first_name, last_name)
 
-            # Hunter.io for each permutation on common domains
+            # Hunter is meaningful for known organizational domains only.
+            # Do not enumerate consumer-mail domains from a person's name.
             hunter_results = []
-            for domain in ["gmail.com", "outlook.com", "yahoo.com", "protonmail.com",
-                           "icloud.com", "hotmail.com", "live.com", "mail.com"]:
+            for domain in domains or []:
                 h = await self.search_hunter_io(first_name, last_name, domain)
                 hunter_results.extend(h)
 
@@ -198,7 +209,7 @@ class IdentityInvestigator:
             found_emails.extend([h["email"] for h in hunter_results if h.get("email")])
             found_emails = list(set(found_emails))
 
-            found_phones = self.extract_phones(all_text)
+            found_phones = []  # Disabled by default: avoid aggregating personal phone data.
 
             # Common usernames from social URLs
             found_usernames = []
