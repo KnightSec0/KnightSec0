@@ -68,6 +68,10 @@ class Settings:
         "ALLOW_INFRASTRUCTURE_ENRICHMENT", False
     )
     authorization_reference: Optional[str] = os.getenv("AUTHORIZATION_REFERENCE")
+    person_osint_sources: str = os.getenv(
+        "PERSON_OSINT_SOURCES",
+        "github,hibp,hunter,brave,sherlock,maigret,holehe",
+    )
 
     # Celery / Redis
     celery_broker: str = os.getenv("CELERY_BROKER", "redis://redis:6379/0")

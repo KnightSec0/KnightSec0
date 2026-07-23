@@ -1,6 +1,7 @@
 """
 DeepVault Orchestrator — Celery entrypoint and task definitions.
 """
+
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -14,7 +15,6 @@ from sqlalchemy.orm import sessionmaker
 
 from config import settings
 from db.models import Base, Investigation, InvestigationStatus, Artifact
-from db.neo4j_client import Neo4jClient
 from investigators.identity import IdentityInvestigator
 from investigators.social import SocialMediaInvestigator
 from investigators.breach import BreachInvestigator
@@ -23,6 +23,10 @@ from investigators.documents import DocumentInvestigator
 from investigators.geolocation import GeolocationInvestigator
 from investigators.financial import FinancialInvestigator
 from investigators.email_footprint import EmailFootprintInvestigator
+from investigators.person_intelligence import PersonIntelligenceInvestigator
+from intelligence.models import InvestigationTarget
+from intelligence.policy import CollectionPolicy
+from intelligence.redaction import redact_sensitive
 from reporting.person_report import PersonReportGenerator
 
 # ---------------------------------------------------------------------------
@@ -61,7 +65,9 @@ app.conf.update(
 # Database engine
 # ---------------------------------------------------------------------------
 engine = create_async_engine(settings.db_url, echo=False, pool_size=10, max_overflow=20)
-async_session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+async_session_factory = sessionmaker(
+    engine, class_=AsyncSession, expire_on_commit=False
+)
 
 
 async def create_tables():
@@ -117,36 +123,62 @@ async def _run_investigation_pipeline(investigation_id: str):
             logger.info("Stage 1: Identity expansion...")
             identity = IdentityInvestigator()
             identity_results = await identity.run(
-                first_name=target["name"].split()[0] if " " in target["name"] else target["name"],
+                first_name=target["name"].split()[0]
+                if " " in target["name"]
+                else target["name"],
                 last_name=target["name"].split()[-1] if " " in target["name"] else "",
             )
             # Merge discovered identifiers
             if identity_results.get("emails_found"):
-                target.setdefault("discovered_emails", []).extend(identity_results["emails_found"])
+                target.setdefault("discovered_emails", []).extend(
+                    identity_results["emails_found"]
+                )
             if identity_results.get("usernames_found"):
-                target.setdefault("discovered_usernames", []).extend(identity_results["usernames_found"])
+                target.setdefault("discovered_usernames", []).extend(
+                    identity_results["usernames_found"]
+                )
             if identity_results.get("phones_found"):
-                target.setdefault("discovered_phones", []).extend(identity_results["phones_found"])
+                target.setdefault("discovered_phones", []).extend(
+                    identity_results["phones_found"]
+                )
+
+            # ---- STAGE 1B: Policy-gated person intelligence ----
+            person_artifacts = await _collect_person_intelligence(
+                inv=inv,
+                target=target,
+                investigation_id=inv_uuid,
+            )
+            all_artifacts.extend(person_artifacts)
+            logger.info(
+                "  Collected %s normalized person-intelligence artifacts",
+                len(person_artifacts),
+            )
 
             # ---- STAGE 2: Social Media Discovery ----
             logger.info("Stage 2: Social media discovery...")
-            usernames_to_scan = list(set(
-                ([target["username"]] if target["username"] else [])
-                + target.get("discovered_usernames", [])
-            ))
+            usernames_to_scan = list(
+                set(
+                    ([target["username"]] if target["username"] else [])
+                    + target.get("discovered_usernames", [])
+                )
+            )
             if usernames_to_scan:
-                social = SocialMediaInvestigator()
+                social = SocialMediaInvestigator(
+                    excluded_sources=set(target.get("_expanded_sources", []))
+                )
                 social_results = await social.run(usernames_to_scan)
                 for acct in social_results:
-                    all_artifacts.append(Artifact(
-                        investigation_id=inv_uuid,
-                        source=acct.get("source", "social"),
-                        source_type="social_media",
-                        identifier_type="username",
-                        identifier_value=acct.get("username", ""),
-                        context=acct,
-                        confidence="high" if acct.get("url") else "medium",
-                    ))
+                    all_artifacts.append(
+                        Artifact(
+                            investigation_id=inv_uuid,
+                            source=acct.get("source", "social"),
+                            source_type="social_media",
+                            identifier_type="username",
+                            identifier_value=acct.get("username", ""),
+                            context=acct,
+                            confidence="high" if acct.get("url") else "medium",
+                        )
+                    )
                     # Extract any new emails from profiles
                     if acct.get("email"):
                         target.setdefault("discovered_emails", []).append(acct["email"])
@@ -154,47 +186,58 @@ async def _run_investigation_pipeline(investigation_id: str):
 
             # ---- STAGE 3: Breach Detection ----
             logger.info("Stage 3: Breach detection...")
-            emails_to_check = list(set(
-                ([target["email"]] if target["email"] else [])
-                + target.get("discovered_emails", [])
-            ))
+            emails_to_check = list(
+                set(
+                    ([target["email"]] if target["email"] else [])
+                    + target.get("discovered_emails", [])
+                )
+            )
             # ---- STAGE 3A: Email service footprint ----
             logger.info("Stage 3A: Email service footprint...")
-            email_footprint = EmailFootprintInvestigator()
-            footprint_results = await email_footprint.run(emails_to_check)
+            footprint_results = []
+            if "holehe" not in target.get("_expanded_sources", []):
+                email_footprint = EmailFootprintInvestigator()
+                footprint_results = await email_footprint.run(emails_to_check)
             for item in footprint_results:
                 metadata = item.get("metadata", {})
-                all_artifacts.append(Artifact(
-                    investigation_id=inv_uuid,
-                    source=item.get("source", "holehe"),
-                    source_type="service_registration",
-                    identifier_type="email",
-                    identifier_value=metadata.get("email", ""),
-                    context={"evidence": item},
-                    confidence=(
-                        "high" if item.get("confidence", 0) >= 0.8
-                        else "medium" if item.get("confidence", 0) >= 0.6
-                        else "low"
-                    ),
-                ))
+                all_artifacts.append(
+                    Artifact(
+                        investigation_id=inv_uuid,
+                        source=item.get("source", "holehe"),
+                        source_type="service_registration",
+                        identifier_type="email",
+                        identifier_value=metadata.get("email", ""),
+                        context={"evidence": item},
+                        confidence=(
+                            "high"
+                            if item.get("confidence", 0) >= 0.8
+                            else "medium"
+                            if item.get("confidence", 0) >= 0.6
+                            else "low"
+                        ),
+                    )
+                )
             logger.info("  Found %s email-service signals", len(footprint_results))
 
             breach = BreachInvestigator()
             breach_results = await breach.run(
                 emails=emails_to_check,
                 usernames=usernames_to_scan,
+                excluded_sources=set(target.get("_expanded_sources", [])),
             )
             for source_name, records in breach_results.items():
                 for rec in records:
-                    all_artifacts.append(Artifact(
-                        investigation_id=inv_uuid,
-                        source=source_name,
-                        source_type="breach",
-                        identifier_type="email",
-                        identifier_value=rec.get("email", target.get("email", "")),
-                        context=rec,
-                        confidence=_breach_confidence(source_name),
-                    ))
+                    all_artifacts.append(
+                        Artifact(
+                            investigation_id=inv_uuid,
+                            source=source_name,
+                            source_type="breach",
+                            identifier_type="email",
+                            identifier_value=rec.get("email", target.get("email", "")),
+                            context=rec,
+                            confidence=_breach_confidence(source_name),
+                        )
+                    )
                 logger.info(f"  {source_name}: {len(records)} records found")
 
             # ---- STAGE 4: Document / Paste Search ----
@@ -205,40 +248,50 @@ async def _run_investigation_pipeline(investigation_id: str):
                 emails=emails_to_check,
             )
             for doc in doc_results:
-                all_artifacts.append(Artifact(
-                    investigation_id=inv_uuid,
-                    source="document_search",
-                    source_type="document",
-                    identifier_type=doc.get("type", "unknown"),
-                    identifier_value=doc.get("value", ""),
-                    context=doc,
-                    confidence="medium",
-                ))
+                all_artifacts.append(
+                    Artifact(
+                        investigation_id=inv_uuid,
+                        source="document_search",
+                        source_type="document",
+                        identifier_type=doc.get("type", "unknown"),
+                        identifier_value=doc.get("value", ""),
+                        context=doc,
+                        confidence="medium",
+                    )
+                )
 
             # ---- STAGE 5: Dark Web (if depth >= deep) ----
-            if settings.allow_sensitive_pivots and target.get("depth") in ("deep", "full"):
+            if settings.allow_sensitive_pivots and target.get("depth") in (
+                "deep",
+                "full",
+            ):
                 logger.info("Stage 5: Dark web search...")
                 darkweb = DarkWebInvestigator()
-                darkweb_queries = list(set(
-                    [target["name"]] + target.get("aliases", [])
-                    + [e for e in emails_to_check if e]
-                    + [u for u in usernames_to_scan if u]
-                    + [target.get("phone", "")]
-                ))
+                darkweb_queries = list(
+                    set(
+                        [target["name"]]
+                        + target.get("aliases", [])
+                        + [e for e in emails_to_check if e]
+                        + [u for u in usernames_to_scan if u]
+                        + [target.get("phone", "")]
+                    )
+                )
                 darkweb_results = await darkweb.run(
                     queries=[q for q in darkweb_queries if q]
                 )
                 for category, items in darkweb_results.items():
                     for item in items:
-                        all_artifacts.append(Artifact(
-                            investigation_id=inv_uuid,
-                            source=category,
-                            source_type="darkweb",
-                            identifier_type="mention",
-                            identifier_value=item.get("url", ""),
-                            context=item,
-                            confidence="speculative",
-                        ))
+                        all_artifacts.append(
+                            Artifact(
+                                investigation_id=inv_uuid,
+                                source=category,
+                                source_type="darkweb",
+                                identifier_type="mention",
+                                identifier_value=item.get("url", ""),
+                                context=item,
+                                confidence="speculative",
+                            )
+                        )
                     logger.info(f"  {category}: {len(items)} results")
 
             # ---- STAGE 6: Geolocation ----
@@ -247,15 +300,17 @@ async def _run_investigation_pipeline(investigation_id: str):
                 geo = GeolocationInvestigator()
                 geo_results = await geo.run(emails=emails_to_check)
                 for loc in geo_results:
-                    all_artifacts.append(Artifact(
-                        investigation_id=inv_uuid,
-                        source="geolocation",
-                        source_type="address",
-                        identifier_type="location",
-                        identifier_value=loc.get("address", ""),
-                        context=loc,
-                        confidence="medium",
-                    ))
+                    all_artifacts.append(
+                        Artifact(
+                            investigation_id=inv_uuid,
+                            source="geolocation",
+                            source_type="address",
+                            identifier_type="location",
+                            identifier_value=loc.get("address", ""),
+                            context=loc,
+                            confidence="medium",
+                        )
+                    )
 
             # ---- STAGE 7: Financial / Crypto ----
             if settings.allow_sensitive_pivots and target.get("depth") == "full":
@@ -266,15 +321,19 @@ async def _run_investigation_pipeline(investigation_id: str):
                     usernames=usernames_to_scan,
                 )
                 for crypto in fin_results:
-                    all_artifacts.append(Artifact(
-                        investigation_id=inv_uuid,
-                        source="crypto",
-                        source_type="crypto",
-                        identifier_type="btc" if crypto.get("type") == "bitcoin" else "eth",
-                        identifier_value=crypto.get("address", ""),
-                        context=crypto,
-                        confidence="speculative",
-                    ))
+                    all_artifacts.append(
+                        Artifact(
+                            investigation_id=inv_uuid,
+                            source="crypto",
+                            source_type="crypto",
+                            identifier_type="btc"
+                            if crypto.get("type") == "bitcoin"
+                            else "eth",
+                            identifier_value=crypto.get("address", ""),
+                            context=crypto,
+                            confidence="speculative",
+                        )
+                    )
 
             # ---- STAGE 8: Persist artifacts ----
             for artifact in all_artifacts:
@@ -297,8 +356,10 @@ async def _run_investigation_pipeline(investigation_id: str):
             inv.completed_at = datetime.now(timezone.utc)
             await session.commit()
 
-            logger.info(f"Investigation {investigation_id} COMPLETE — "
-                        f"Artifacts: {len(all_artifacts)}")
+            logger.info(
+                f"Investigation {investigation_id} COMPLETE — "
+                f"Artifacts: {len(all_artifacts)}"
+            )
 
         except Exception as e:
             logger.exception(f"Investigation {investigation_id} FAILED: {e}")
@@ -310,7 +371,128 @@ async def _run_investigation_pipeline(investigation_id: str):
 
 
 def _breach_confidence(source: str) -> str:
-    return {"hibp": "high", "dehashed": "high", "intelx": "medium"}.get(source, "medium")
+    return {"hibp": "high", "dehashed": "high", "intelx": "medium"}.get(
+        source, "medium"
+    )
+
+
+async def _collect_person_intelligence(
+    *,
+    inv: Investigation,
+    target: dict,
+    investigation_id: UUID,
+) -> list[Artifact]:
+    """Run approved normalized connectors and return persistence-safe artifacts."""
+    metadata = inv.case_metadata or {}
+    if not metadata.get("authorization_confirmed"):
+        logger.info(
+            "Skipping expanded person intelligence: authorization is not confirmed"
+        )
+        return []
+
+    authorization_reference = str(
+        metadata.get("authorization_reference")
+        or settings.authorization_reference
+        or ""
+    ).strip()
+    if not authorization_reference:
+        logger.warning(
+            "Skipping expanded person intelligence: authorization reference is missing"
+        )
+        return []
+
+    expires_at_raw = metadata.get("authorization_expires_at")
+    try:
+        expires_at = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Skipping expanded person intelligence: valid authorization expiry is missing"
+        )
+        return []
+
+    configured_sources = {
+        source.strip().lower()
+        for source in settings.person_osint_sources.split(",")
+        if source.strip()
+    }
+    requested_sources = metadata.get("permitted_sources")
+    if isinstance(requested_sources, list):
+        configured_sources &= {
+            str(source).strip().lower() for source in requested_sources
+        }
+    target["_expanded_sources"] = sorted(configured_sources)
+
+    names = [target["name"], *target.get("aliases", [])]
+    usernames = [
+        value
+        for value in [target.get("username"), *target.get("discovered_usernames", [])]
+        if value
+    ]
+    emails = [
+        value
+        for value in [target.get("email"), *target.get("discovered_emails", [])]
+        if value
+    ]
+    person_target = InvestigationTarget(
+        name=names[0],
+        aliases=names[1:],
+        usernames=usernames,
+        emails=emails,
+        domains=[str(value) for value in metadata.get("authorized_domains", [])],
+        employer=metadata.get("employer"),
+        location=metadata.get("location"),
+        lawful_purpose=str(
+            metadata.get("lawful_purpose") or "Authorized defensive OSINT review"
+        ),
+        authorization_confirmed=True,
+    )
+    policy = CollectionPolicy(
+        authorization_reference=authorization_reference,
+        purpose=person_target.lawful_purpose,
+        expires_at=expires_at,
+        permitted_sources=frozenset(configured_sources),
+        infrastructure_enrichment=bool(
+            settings.allow_infrastructure_enrichment
+            and metadata.get("allow_infrastructure_enrichment")
+        ),
+    )
+    investigator = PersonIntelligenceInvestigator(policy)
+    results = await investigator.collect_plan(
+        target=person_target,
+        authorized_ips=[str(value) for value in metadata.get("authorized_ips", [])],
+        concurrency=settings.max_osint_concurrency,
+    )
+
+    artifacts: list[Artifact] = []
+    for request, result in results:
+        for error in result.errors:
+            if error:
+                logger.warning("%s: %s", result.connector, error)
+        for evidence in result.evidence:
+            artifacts.append(
+                Artifact(
+                    investigation_id=investigation_id,
+                    source=evidence.source,
+                    source_type=evidence.type,
+                    identifier_type=request.identifier_type,
+                    identifier_value=request.identifier,
+                    context={
+                        "evidence": redact_sensitive(evidence.model_dump(mode="json"))
+                    },
+                    confidence=_confidence_label(evidence.confidence),
+                )
+            )
+    return artifacts
+
+
+def _confidence_label(score: float) -> str:
+    if score >= 0.8:
+        return "high"
+    if score >= 0.55:
+        return "medium"
+    return "low"
 
 
 @app.task

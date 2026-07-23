@@ -24,8 +24,13 @@ def _confidence_label(score: float) -> str:
 class SocialMediaInvestigator:
     """Run username connectors in parallel and preserve source provenance."""
 
-    def __init__(self) -> None:
-        self.connectors = [SherlockConnector(), MaigretConnector()]
+    def __init__(self, *, excluded_sources: set[str] | None = None) -> None:
+        excluded = excluded_sources or set()
+        self.connectors = [
+            connector
+            for connector in (SherlockConnector(), MaigretConnector())
+            if connector.name not in excluded
+        ]
         self._semaphore = asyncio.Semaphore(settings.max_osint_concurrency)
 
     async def _search(
@@ -36,7 +41,9 @@ class SocialMediaInvestigator:
 
     async def run(self, usernames: list[str]) -> list[dict]:
         clean_usernames = list(
-            dict.fromkeys(username.strip() for username in usernames if username.strip())
+            dict.fromkeys(
+                username.strip() for username in usernames if username.strip()
+            )
         )
         logger.info("Social profile search for %s username(s)", len(clean_usernames))
 
@@ -60,9 +67,7 @@ class SocialMediaInvestigator:
             username = ""
             observations = item.metadata.get("observations", [])
             if observations:
-                username = (
-                    observations[0].get("metadata", {}).get("username", "")
-                )
+                username = observations[0].get("metadata", {}).get("username", "")
             results.append(
                 {
                     "username": username,

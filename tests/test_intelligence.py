@@ -12,6 +12,7 @@ from intelligence.models import Evidence, SourceReliability
 from intelligence.models import InvestigationTarget
 from intelligence.policy import CollectionPolicy
 from intelligence.redaction import redact_sensitive
+from investigators.person_intelligence import PersonIntelligenceInvestigator
 from reporting.person_report import PersonReportGenerator, _consensus
 from reporting.schemas import Finding, InvestigationReport, RiskLevel
 
@@ -103,6 +104,41 @@ class IntelligenceTests(unittest.TestCase):
         policy.authorize(target, "github")
         with self.assertRaises(PermissionError):
             policy.authorize(target, "shodan")
+
+    def test_person_collection_plan_routes_identifiers_by_source(self):
+        target = InvestigationTarget(
+            name="Alice Example",
+            usernames=["alice"],
+            emails=["alice@example.test"],
+            domains=["example.test"],
+            employer="Example Corp",
+            location="Paris",
+            lawful_purpose="Authorized defensive review",
+            authorization_confirmed=True,
+        )
+        policy = CollectionPolicy(
+            authorization_reference="AUTH-123",
+            purpose=target.lawful_purpose,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+            permitted_sources=frozenset(
+                {"github", "hibp", "brave", "spiderfoot", "shodan"}
+            ),
+            infrastructure_enrichment=True,
+        )
+        plan = PersonIntelligenceInvestigator(policy).build_plan(
+            target=target,
+            authorized_ips=["203.0.113.10"],
+        )
+        routed = {(item.source, item.identifier, item.identifier_type) for item in plan}
+        self.assertIn(("github", "alice", "username"), routed)
+        self.assertIn(("hibp", "alice@example.test", "email"), routed)
+        self.assertIn(
+            ("brave", "Alice Example Example Corp Paris", "person_query"),
+            routed,
+        )
+        self.assertIn(("spiderfoot", "example.test", "passive_target"), routed)
+        self.assertIn(("shodan", "203.0.113.10", "authorized_ip"), routed)
+        self.assertFalse(any(item.source == "censys" for item in plan))
 
     def test_consensus_excludes_single_provider_claim(self):
         evidence_id = "EVID-ABC"

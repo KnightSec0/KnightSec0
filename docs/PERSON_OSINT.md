@@ -113,6 +113,49 @@ OPENAI_COMPATIBLE_BASE_URL=
 OPENAI_COMPATIBLE_MODEL=
 ```
 
+## Enabling the operational person pipeline
+
+The expanded connector stage runs only when the investigation's
+`case_metadata` contains explicit authorization. This keeps existing cases
+safe and prevents a name alone from triggering global collection.
+
+```json
+{
+  "authorization_confirmed": true,
+  "authorization_reference": "CASE-2026-001",
+  "authorization_expires_at": "2026-12-31T23:59:59Z",
+  "lawful_purpose": "Consent-based defensive exposure assessment",
+  "permitted_sources": [
+    "github",
+    "hibp",
+    "hunter",
+    "brave",
+    "sherlock",
+    "maigret",
+    "holehe"
+  ],
+  "employer": "Example Corp",
+  "location": "Paris"
+}
+```
+
+Configure the deployment-wide ceiling separately:
+
+```env
+PERSON_OSINT_SOURCES=github,hibp,hunter,brave,sherlock,maigret,holehe
+```
+
+The case allowlist can only narrow that ceiling. SpiderFoot, Shodan and Censys
+must be deliberately added to both lists. Shodan and Censys additionally
+require `allow_infrastructure_enrichment: true`, the environment-level opt-in,
+and literal IPs in `authorized_ips`.
+
+The pipeline routes identifiers by source: usernames to GitHub/Sherlock/Maigret,
+emails to HIBP/Hunter/Holehe, a name-plus-context query to Brave, approved
+domains or usernames to passive SpiderFoot, and only approved IPs to
+Shodan/Censys. Duplicate legacy calls are suppressed when the normalized stage
+already queried the same source.
+
 ## Validation
 
 From the repository root:
