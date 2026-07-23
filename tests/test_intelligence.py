@@ -8,6 +8,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from sqlalchemy.pool import NullPool
+
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "orchestrator"))
 
@@ -17,7 +19,7 @@ from intelligence.models import InvestigationTarget
 from intelligence.policy import CollectionPolicy
 from intelligence.redaction import redact_sensitive
 from investigators.person_intelligence import PersonIntelligenceInvestigator
-from main import app, _previous_report_evidence, _running_task_is_stale
+from main import app, engine, _previous_report_evidence, _running_task_is_stale
 from reporting.person_report import (
     PersonReportGenerator,
     _baseline_report,
@@ -56,6 +58,9 @@ class IntelligenceTests(unittest.TestCase):
     def test_celery_registers_stable_task_names(self):
         self.assertIn("deepvault.run_investigation", app.tasks)
         self.assertIn("deepvault.periodic_healthcheck", app.tasks)
+
+    def test_async_database_connections_are_not_reused_across_task_loops(self):
+        self.assertIsInstance(engine.sync_engine.pool, NullPool)
 
     def test_redaction_removes_credentials(self):
         result = redact_sensitive(

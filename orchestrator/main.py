@@ -12,6 +12,7 @@ from celery.signals import worker_ready, worker_shutdown
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import noload, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from config import settings
 from db.models import Base, Investigation, InvestigationStatus, Artifact
@@ -64,7 +65,11 @@ app.conf.update(
 # ---------------------------------------------------------------------------
 # Database engine
 # ---------------------------------------------------------------------------
-engine = create_async_engine(settings.db_url, echo=False, pool_size=10, max_overflow=20)
+# Celery invokes each synchronous task through ``asyncio.run()``, which creates a
+# fresh event loop. Async driver connections cannot be reused across those loops,
+# so retaining them in SQLAlchemy's default pool eventually raises
+# "Future attached to a different loop" on a worker's second task.
+engine = create_async_engine(settings.db_url, echo=False, poolclass=NullPool)
 async_session_factory = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
 )
@@ -962,9 +967,7 @@ def periodic_healthcheck():
 # ---------------------------------------------------------------------------
 @worker_ready.connect
 def on_worker_ready(**kwargs):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(create_tables())
+    asyncio.run(create_tables())
     logger.info("DeepVault orchestrator ready.")
 
 
