@@ -32,7 +32,7 @@ open http://localhost:8080
 | Surface Web | Email/Domain harvesting, public documents | theHarvester, Recon-ng, Brave/Bing APIs |
 | Identity Expansion | Name → email/phone/address permutations | Hunter.io, social-analyzer, holehe, custom dorking |
 | Social Media | Profile discovery across 400+ platforms | Sherlock, Maigret, WhatsMyName |
-| Data Breaches | Credential exposure, stealer logs, paste sites | HIBP, DeHashed, IntelX |
+| Data Breaches | Breach names, dates and exposed data classes (no credentials) | HIBP |
 | Dark Web | Tor hidden service crawling, .onion mentions | TorBot, Ahmia, OnionScan |
 | Geolocation | IP history, Wi-Fi networks, physical addresses | Shodan, ipinfo.io, WiGLE |
 | Crypto | Bitcoin/Ethereum wallet discovery | Blockchain explorers, WalletExplorer |
@@ -83,9 +83,9 @@ open http://localhost:8080
 - Automatically pivots: every new username found gets re-scanned
 
 ### 3. Breach Investigator (orchestrator/investigators/breach.py)
-- Checks Have I Been Pwned, DeHashed, and Intelligence X
-- Reveals exposed passwords, credential pairs, and sensitive data classes
-- Cross-references email, username, and phone across all breach databases
+- Checks Have I Been Pwned for breach metadata
+- Retains breach names, dates and data classes, never passwords or hashes
+- Treats breach association as an exposure signal, not proof of account ownership
 
 ### 4. Dark Web Investigator (orchestrator/investigators/darkweb.py)
 - Routes all traffic through Tor SOCKS5 proxy
@@ -94,7 +94,7 @@ open http://localhost:8080
 
 ### 5. Correlation Engine (orchestrator/correlator/graph_builder.py)
 - Builds a Neo4j knowledge graph linking every artifact to the target
-- Creates relationship chains: email → breach → password → other accounts
+- Creates evidence-linked relationships without credential nodes
 - Confidence-scored connections with source provenance
 
 ### 6. Reporting Engine (orchestrator/reporting/pdf_generator.py)

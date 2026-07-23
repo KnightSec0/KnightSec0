@@ -4,13 +4,22 @@ This phase adds a normalized evidence pipeline for authorized investigations of
 specific people. DeepVault treats every automated result as an observation, not
 as proof that a person controls an account.
 
-## Sources in phase 1
+## Sources
 
 - Sherlock: public username presence
 - Maigret: independent username corroboration
 - Holehe: public service-registration signals
-- Existing HIBP, Hunter, Brave, DeHashed and IntelX modules, with credential
-  values removed before persistence
+- GitHub: public profile metadata only
+- HIBP: breach metadata and data classes only
+- Hunter: email validity and deliverability metadata
+- Brave: candidate person results which always require identity disambiguation
+- SpiderFoot: passive scans submitted to an explicitly configured instance
+- Shodan and Censys: infrastructure metadata only when the IP is in the written
+  authorization scope
+
+Every connector emits the same evidence model: stable evidence ID, source,
+source URL where available, collection time, reliability, confidence,
+identity status, notes and minimized metadata.
 
 ## Confidence rules
 
@@ -26,7 +35,7 @@ Set one provider:
 ```env
 LLM_PROVIDER=none
 # or: openai
-# or: ollama
+# or: anthropic, gemini, ollama, openai-compatible
 ```
 
 OpenAI uses the Responses API with structured JSON output and `store=False`.
@@ -41,6 +50,17 @@ Every finding must contain at least one valid evidence ID. If the provider
 returns unsupported references or fails, DeepVault falls back to a deterministic
 evidence-only report.
 
+For consensus reporting, configure a comma-separated provider list:
+
+```env
+LLM_CONSENSUS_PROVIDERS=openai,anthropic,gemini
+```
+
+Only identical claims with the same evidence citations that receive a majority
+vote are retained. Provider-only claims are discarded. The baseline report
+also includes an evidence-linked timeline, detected contradictions, source
+coverage, limitations and analyst recommendations.
+
 ## Safe defaults
 
 Sensitive pivots such as geolocation, dark-web and financial modules are
@@ -52,6 +72,46 @@ ALLOW_SENSITIVE_PIVOTS=false
 
 DeepVault does not retain passwords, authentication tokens, cookies, private
 messages or session material.
+
+## Authorization and privacy
+
+Collection must be governed by a `CollectionPolicy` with a case authorization
+reference, expiry, lawful purpose and explicit source allowlist. Infrastructure
+enrichment additionally requires:
+
+```env
+ALLOW_INFRASTRUCTURE_ENRICHMENT=true
+AUTHORIZATION_REFERENCE=CASE-2025-001
+```
+
+The target IP must be a literal authorized IP. DeepVault does not perform broad
+Shodan or Censys discovery from a person's name or email.
+
+Do not put API keys in targets, evidence, logs or reports. Store them only in
+environment variables or a secrets manager. Raw breach records, passwords,
+hashes, tokens, cookies, private communications and leaked credentials are
+redacted before persistence or model processing.
+
+## Connector configuration
+
+```env
+GITHUB_TOKEN=                 # optional for higher public API limits
+HIBP_API_KEY=
+HUNTER_API_KEY=
+BRAVE_API_KEY=
+SPIDERFOOT_URL=http://spiderfoot:5001
+SHODAN_API_KEY=
+CENSYS_API_ID=
+CENSYS_API_SECRET=
+
+ANTHROPIC_API_KEY=
+ANTHROPIC_MODEL=claude-sonnet-4-20250514
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-2.5-pro
+OPENAI_COMPATIBLE_API_KEY=
+OPENAI_COMPATIBLE_BASE_URL=
+OPENAI_COMPATIBLE_MODEL=
+```
 
 ## Validation
 

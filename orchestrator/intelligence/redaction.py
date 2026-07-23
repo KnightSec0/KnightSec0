@@ -17,6 +17,12 @@ _SENSITIVE_KEY_PARTS = {
     "authorization",
     "private_key",
     "api_key",
+    "private_message",
+    "private_communication",
+    "message_body",
+    "raw_leak",
+    "raw_record",
+    "hash",
 }
 
 _BEARER_PATTERN = re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]{12,}")

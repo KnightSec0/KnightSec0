@@ -15,8 +15,21 @@ from intelligence.correlation import (
 from intelligence.models import Evidence, IdentityStatus, SourceReliability
 from intelligence.redaction import redact_sensitive
 
-from .providers import OllamaReportProvider, OpenAIReportProvider
-from .schemas import Finding, InvestigationReport, RiskLevel
+from .providers import (
+    AnthropicReportProvider,
+    BaseReportProvider,
+    GeminiReportProvider,
+    OllamaReportProvider,
+    OpenAIReportProvider,
+)
+from .schemas import (
+    Contradiction,
+    Finding,
+    InvestigationReport,
+    RiskLevel,
+    SourceCoverage,
+    TimelineEvent,
+)
 
 logger = logging.getLogger("deepvault.reporting.person_report")
 
@@ -113,9 +126,7 @@ def _baseline_report(evidence: list[Evidence]) -> InvestigationReport:
             statement=_finding_statement(item),
             evidence_ids=[item.id],
             confidence=item.confidence,
-            severity=(
-                RiskLevel.MODERATE if item.type == "breach" else RiskLevel.LOW
-            ),
+            severity=(RiskLevel.MODERATE if item.type == "breach" else RiskLevel.LOW),
             limitations=[
                 "Automated matches require analyst review.",
                 "A matching username or email signal is not proof of identity.",
@@ -130,12 +141,55 @@ def _baseline_report(evidence: list[Evidence]) -> InvestigationReport:
         f"the current defensive exposure level is {risk.value}. "
         "These results are observations, not a definitive identity determination."
     )
+    timeline = [
+        TimelineEvent(
+            occurred_at=item.observed_at,
+            description=_finding_statement(item),
+            evidence_ids=[item.id],
+        )
+        for item in sorted(evidence, key=lambda entry: entry.observed_at)
+    ]
+    coverage = [
+        SourceCoverage(
+            source=source,
+            evidence_count=count,
+            status="evidence_collected",
+            evidence_ids=[item.id for item in evidence if item.source == source],
+        )
+        for source, count in sorted(Counter(item.source for item in evidence).items())
+    ]
+    contradictions: list[Contradiction] = []
+    by_type: dict[str, list[Evidence]] = {}
+    for item in evidence:
+        by_type.setdefault(item.type, []).append(item)
+    for evidence_type, items in by_type.items():
+        high_confidence = [item for item in items if item.confidence >= 0.65]
+        values = {item.value.casefold().strip() for item in high_confidence}
+        if len(values) > 1 and evidence_type in {"location", "employer", "real_name"}:
+            contradictions.append(
+                Contradiction(
+                    description=(
+                        f"Sources report conflicting {evidence_type.replace('_', ' ')} values."
+                    ),
+                    evidence_ids=[item.id for item in high_confidence],
+                    recommendation="Resolve the conflict manually using dated primary sources.",
+                )
+            )
     return InvestigationReport(
         executive_summary=summary,
+        executive_summary_evidence_ids=[item.id for item in evidence],
         identity_confidence=identity_status.value,
         overall_risk=risk,
         evidence_count=len(evidence),
         findings=findings,
+        timeline=timeline,
+        contradictions=contradictions,
+        source_coverage=coverage,
+        recommendations=[
+            "Manually verify possible identity matches using independent public attributes.",
+            "Prioritize remediation for verified breach exposure and rotate affected credentials outside DeepVault.",
+            "Document source access dates and analyst decisions in the case record.",
+        ],
         limitations=[
             "Only configured public and contractually authorized sources were queried.",
             "False positives are possible, especially for common names and usernames.",
@@ -171,9 +225,7 @@ def _llm_payload(
         for key in ("aliases", "discovered_emails", "discovered_usernames"):
             values = safe_target.get(key)
             if isinstance(values, list):
-                safe_target[key] = [
-                    _pseudonymize(str(value), key) for value in values
-                ]
+                safe_target[key] = [_pseudonymize(str(value), key) for value in values]
 
     return {
         "target": safe_target,
@@ -188,9 +240,7 @@ def _llm_payload(
     }
 
 
-def _validate_references(
-    report: InvestigationReport, evidence: list[Evidence]
-) -> None:
+def _validate_references(report: InvestigationReport, evidence: list[Evidence]) -> None:
     valid_ids = {item.id for item in evidence}
     for finding in report.findings:
         invalid = set(finding.evidence_ids) - valid_ids
@@ -198,6 +248,93 @@ def _validate_references(
             raise ValueError(
                 f"Report finding contains unknown evidence IDs: {sorted(invalid)}"
             )
+    sections = [*report.timeline, *report.contradictions, *report.source_coverage]
+    for item in sections:
+        invalid = set(item.evidence_ids) - valid_ids
+        if invalid:
+            raise ValueError(
+                f"Report section contains unknown evidence IDs: {sorted(invalid)}"
+            )
+    invalid_summary = set(report.executive_summary_evidence_ids) - valid_ids
+    if invalid_summary:
+        raise ValueError(
+            f"Executive summary contains unknown evidence IDs: {sorted(invalid_summary)}"
+        )
+
+
+def _provider(name: str) -> BaseReportProvider:
+    if name == "openai":
+        if not settings.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured")
+        return OpenAIReportProvider(
+            api_key=settings.openai_api_key, model=settings.openai_model
+        )
+    if name == "anthropic":
+        if not settings.anthropic_api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is not configured")
+        return AnthropicReportProvider(
+            api_key=settings.anthropic_api_key, model=settings.anthropic_model
+        )
+    if name == "gemini":
+        if not settings.gemini_api_key:
+            raise RuntimeError("GEMINI_API_KEY is not configured")
+        return GeminiReportProvider(
+            api_key=settings.gemini_api_key, model=settings.gemini_model
+        )
+    if name == "ollama":
+        return OllamaReportProvider(
+            base_url=settings.ollama_base_url, model=settings.ollama_model
+        )
+    if name == "openai-compatible":
+        if (
+            not settings.openai_compatible_api_key
+            or not settings.openai_compatible_base_url
+        ):
+            raise RuntimeError("OpenAI-compatible endpoint is not configured")
+        return OpenAIReportProvider(
+            api_key=settings.openai_compatible_api_key,
+            model=settings.openai_compatible_model,
+            base_url=settings.openai_compatible_base_url,
+        )
+    raise RuntimeError(f"Unsupported LLM provider: {name}")
+
+
+def _consensus(
+    reports: list[InvestigationReport], baseline: InvestigationReport
+) -> InvestigationReport:
+    """Retain only claims independently repeated by a majority of providers."""
+    if not reports:
+        return baseline
+    threshold = len(reports) // 2 + 1
+    votes: dict[tuple[str, tuple[str, ...]], list[Finding]] = {}
+    for report in reports:
+        for finding in report.findings:
+            key = (
+                finding.statement.casefold().strip(),
+                tuple(sorted(finding.evidence_ids)),
+            )
+            votes.setdefault(key, []).append(finding)
+    findings = []
+    for candidates in votes.values():
+        if len(candidates) < threshold:
+            continue
+        selected = candidates[0].model_copy(
+            update={
+                "confidence": sum(item.confidence for item in candidates)
+                / len(candidates)
+            }
+        )
+        findings.append(selected)
+    return baseline.model_copy(
+        update={
+            "findings": findings or baseline.findings,
+            "methodology": baseline.methodology
+            + [
+                f"Consensus synthesized from {len(reports)} provider reports; "
+                f"claims required {threshold} matching votes."
+            ],
+        }
+    )
 
 
 class PersonReportGenerator:
@@ -208,31 +345,29 @@ class PersonReportGenerator:
         correlated = correlate_evidence(normalized)
         baseline = _baseline_report(correlated)
 
-        provider_name = settings.llm_provider.strip().lower()
-        if provider_name == "none":
+        provider_names = [
+            item.strip().lower()
+            for item in settings.llm_consensus_providers.split(",")
+            if item.strip()
+        ]
+        if not provider_names:
+            provider_names = [settings.llm_provider.strip().lower()]
+        if provider_names == ["none"]:
             return baseline
 
         try:
-            if provider_name == "openai":
-                if not settings.openai_api_key:
-                    raise RuntimeError("OPENAI_API_KEY is not configured")
-                provider = OpenAIReportProvider(
-                    api_key=settings.openai_api_key,
-                    model=settings.openai_model,
-                )
-            elif provider_name == "ollama":
-                provider = OllamaReportProvider(
-                    base_url=settings.ollama_base_url,
-                    model=settings.ollama_model,
-                )
-            else:
-                raise RuntimeError(f"Unsupported LLM_PROVIDER: {provider_name}")
-
-            report = await provider.generate(
-                _llm_payload(target, correlated, baseline)
-            )
-            _validate_references(report, correlated)
-            return report
+            payload = _llm_payload(target, correlated, baseline)
+            reports = []
+            for name in provider_names:
+                try:
+                    report = await _provider(name).generate(payload)
+                    _validate_references(report, correlated)
+                    reports.append(report)
+                except Exception as exc:
+                    logger.warning("%s report provider failed: %s", name, exc)
+            if len(provider_names) > 1:
+                return _consensus(reports, baseline)
+            return reports[0] if reports else baseline
         except Exception as exc:
             logger.warning("LLM report generation failed; using baseline: %s", exc)
             return baseline

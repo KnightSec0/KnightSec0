@@ -28,9 +28,12 @@ class BaseReportProvider(ABC):
 
 
 class OpenAIReportProvider(BaseReportProvider):
-    def __init__(self, *, api_key: str, model: str) -> None:
+    def __init__(
+        self, *, api_key: str, model: str, base_url: str | None = None
+    ) -> None:
         self.api_key = api_key
         self.model = model
+        self.base_url = base_url
 
     async def generate(self, payload: dict[str, Any]) -> InvestigationReport:
         try:
@@ -38,7 +41,7 @@ class OpenAIReportProvider(BaseReportProvider):
         except ImportError as exc:
             raise RuntimeError("The openai package is not installed") from exc
 
-        client = AsyncOpenAI(api_key=self.api_key)
+        client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
         response = await client.responses.create(
             model=self.model,
             store=False,
@@ -54,6 +57,54 @@ class OpenAIReportProvider(BaseReportProvider):
             },
         )
         return InvestigationReport.model_validate_json(response.output_text)
+
+
+class AnthropicReportProvider(BaseReportProvider):
+    def __init__(self, *, api_key: str, model: str) -> None:
+        self.api_key = api_key
+        self.model = model
+
+    async def generate(self, payload: dict[str, Any]) -> InvestigationReport:
+        try:
+            from anthropic import AsyncAnthropic
+        except ImportError as exc:
+            raise RuntimeError("The anthropic package is not installed") from exc
+        client = AsyncAnthropic(api_key=self.api_key)
+        response = await client.messages.create(
+            model=self.model,
+            max_tokens=8192,
+            system=_SYSTEM_INSTRUCTIONS,
+            messages=[{"role": "user", "content": json.dumps(payload)}],
+        )
+        content = "".join(
+            block.text
+            for block in response.content
+            if getattr(block, "type", "") == "text"
+        )
+        return InvestigationReport.model_validate_json(content)
+
+
+class GeminiReportProvider(BaseReportProvider):
+    def __init__(self, *, api_key: str, model: str) -> None:
+        self.api_key = api_key
+        self.model = model
+
+    async def generate(self, payload: dict[str, Any]) -> InvestigationReport:
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise RuntimeError("The google-genai package is not installed") from exc
+        client = genai.Client(api_key=self.api_key)
+        response = await client.aio.models.generate_content(
+            model=self.model,
+            contents=json.dumps(payload),
+            config={
+                "system_instruction": _SYSTEM_INSTRUCTIONS,
+                "response_mime_type": "application/json",
+                "response_schema": InvestigationReport,
+            },
+        )
+        return InvestigationReport.model_validate_json(response.text)
 
 
 class OllamaReportProvider(BaseReportProvider):
