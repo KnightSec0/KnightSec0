@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import asyncio
 import json
 import os
@@ -15,7 +17,7 @@ from intelligence.models import InvestigationTarget
 from intelligence.policy import CollectionPolicy
 from intelligence.redaction import redact_sensitive
 from investigators.person_intelligence import PersonIntelligenceInvestigator
-from main import _running_task_is_stale
+from main import app, _running_task_is_stale
 from reporting.person_report import (
     PersonReportGenerator,
     _baseline_report,
@@ -35,6 +37,10 @@ class FakeArtifact:
 
 
 class IntelligenceTests(unittest.TestCase):
+    def test_celery_registers_stable_task_names(self):
+        self.assertIn("deepvault.run_investigation", app.tasks)
+        self.assertIn("deepvault.periodic_healthcheck", app.tasks)
+
     def test_redaction_removes_credentials(self):
         result = redact_sensitive(
             {

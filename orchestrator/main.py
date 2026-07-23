@@ -756,7 +756,7 @@ def _confidence_label(score: float) -> str:
     return "low"
 
 
-@app.task
+@app.task(name="deepvault.periodic_healthcheck")
 def periodic_healthcheck():
     """Periodic task to ensure all services are operational."""
     logger.debug("Healthcheck OK")

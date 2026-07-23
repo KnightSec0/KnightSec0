@@ -146,6 +146,24 @@ put passwords, API tokens, session cookies, private communications, raw breach
 records, or leaked credentials into form fields: form data and reports may be
 persisted.
 
+### Existing PostgreSQL volume rejects the configured password
+
+`POSTGRES_PASSWORD` initializes a new PostgreSQL volume; changing
+`DB_PASSWORD` later does not rotate the password already stored for the
+`deepvault` role. To preserve existing cases, synchronize that role to the
+current container setting without printing the password:
+
+```bash
+docker compose exec -T postgres sh -lc \
+  'printf "ALTER ROLE deepvault PASSWORD :'\''new_password'\'';\n" |
+   psql -v ON_ERROR_STOP=1 -U deepvault -d deepvault \
+   --set=new_password="$POSTGRES_PASSWORD"'
+docker compose restart orchestrator dashboard
+```
+
+Do not use `docker compose down -v` as a password-reset shortcut unless deleting
+all local DeepVault volumes and case data is intentional.
+
 ## Connector configuration
 
 ```env
