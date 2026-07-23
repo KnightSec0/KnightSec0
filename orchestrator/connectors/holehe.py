@@ -20,6 +20,24 @@ from .cli import run_cli
 _EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _POSITIVE = re.compile(r"^\[\+\]\s+([^\s]+)")
+_SERVICE_DOMAIN = re.compile(
+    r"^(?=.{1,253}$)"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+    re.IGNORECASE,
+)
+
+
+def _positive_service(raw_line: str) -> str | None:
+    """Parse a used-service row while excluding Holehe's summary legend."""
+    line = _ANSI.sub("", raw_line).strip()
+    match = _POSITIVE.match(line)
+    if not match:
+        return None
+    service = match.group(1).strip("[](),:;").casefold()
+    if not _SERVICE_DOMAIN.fullmatch(service):
+        return None
+    return service
 
 
 class HoleheConnector(BaseConnector):
@@ -53,12 +71,8 @@ class HoleheConnector(BaseConnector):
         evidence: list[Evidence] = []
         seen: set[str] = set()
         for raw_line in command_result.stdout.splitlines():
-            line = _ANSI.sub("", raw_line).strip()
-            match = _POSITIVE.match(line)
-            if not match:
-                continue
-            service = match.group(1).strip("[](),:;").lower()
-            if not service or service in seen:
+            service = _positive_service(raw_line)
+            if service is None or service in seen:
                 continue
             seen.add(service)
             evidence.append(

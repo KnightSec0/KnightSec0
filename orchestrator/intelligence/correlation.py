@@ -60,11 +60,29 @@ def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:
         representative = group[0]
         sources = sorted({item.source for item in group})
         avg_confidence = mean(item.confidence for item in group)
-        reliability_bonus = max(
-            _RELIABILITY_BONUS.get(item.reliability, 0.0) for item in group
+        # Reliability describes the quality of a source, but it is not independent
+        # identity corroboration. Applying it to a lone observation can otherwise
+        # promote a merely possible match to probable (or beyond).
+        reliability_bonus = (
+            max(_RELIABILITY_BONUS.get(item.reliability, 0.0) for item in group)
+            if len(sources) > 1
+            else 0.0
         )
         corroboration_bonus = min(max(len(sources) - 1, 0) * 0.10, 0.25)
         score = min(avg_confidence + reliability_bonus + corroboration_bonus, 0.99)
+        independent_sources = [
+            source for source in sources if source != representative.source
+        ]
+        identity_status = status_from_score(score)
+        if len(sources) == 1 and identity_status in {
+            IdentityStatus.PROBABLE,
+            IdentityStatus.HIGHLY_PROBABLE,
+            IdentityStatus.CONFIRMED,
+        }:
+            # Observation confidence and identity attribution are different:
+            # one source can be confident in what it returned, but cannot by
+            # itself establish that the observation belongs to this person.
+            identity_status = IdentityStatus.POSSIBLE
 
         merged_notes = list(
             dict.fromkeys(note for item in group for note in item.notes)
@@ -82,8 +100,8 @@ def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:
             representative.model_copy(
                 update={
                     "confidence": score,
-                    "identity_status": status_from_score(score),
-                    "corroborated_by": sources,
+                    "identity_status": identity_status,
+                    "corroborated_by": independent_sources,
                     "notes": merged_notes,
                     "metadata": merged_metadata,
                 }
@@ -97,5 +115,46 @@ def identity_confidence_summary(evidence_items: list[Evidence]) -> IdentityStatu
     """Return the strongest defensible identity status in the evidence set."""
     if not evidence_items:
         return IdentityStatus.INSUFFICIENT_EVIDENCE
-    strongest = max(evidence_items, key=lambda item: item.confidence)
-    return strongest.identity_status
+
+    def has_independent_corroboration(item: Evidence) -> bool:
+        other_sources = {
+            source for source in item.corroborated_by if source != item.source
+        }
+        if other_sources:
+            return True
+
+        # Preserve compatibility with evidence correlated before
+        # ``corroborated_by`` was limited to other sources.
+        source_count = item.metadata.get("source_count")
+        return isinstance(source_count, int) and source_count >= 2
+
+    status_rank = {
+        IdentityStatus.UNRELATED: 0,
+        IdentityStatus.INSUFFICIENT_EVIDENCE: 1,
+        IdentityStatus.POSSIBLE: 2,
+        IdentityStatus.PROBABLE: 3,
+        IdentityStatus.HIGHLY_PROBABLE: 4,
+        IdentityStatus.CONFIRMED: 5,
+    }
+    independently_corroborated = [
+        item for item in evidence_items if has_independent_corroboration(item)
+    ]
+    if independently_corroborated:
+        strongest = max(
+            independently_corroborated,
+            key=lambda item: (status_rank[item.identity_status], item.confidence),
+        )
+        return strongest.identity_status
+
+    # Without an independent source, evidence may support a candidate identity
+    # for analyst review but not a probable or confirmed overall identity claim.
+    if any(
+        status_rank[item.identity_status] >= status_rank[IdentityStatus.POSSIBLE]
+        for item in evidence_items
+    ):
+        return IdentityStatus.POSSIBLE
+    if all(
+        item.identity_status == IdentityStatus.UNRELATED for item in evidence_items
+    ):
+        return IdentityStatus.UNRELATED
+    return IdentityStatus.INSUFFICIENT_EVIDENCE

@@ -42,6 +42,7 @@ class Settings:
     sociallinks_api_key: Optional[str] = os.getenv("SOCIALLINKS_API_KEY")
     brave_api_key: Optional[str] = os.getenv("BRAVE_API_KEY")
     github_token: Optional[str] = os.getenv("GITHUB_TOKEN")
+    gravatar_api_key: Optional[str] = os.getenv("GRAVATAR_API_KEY")
     censys_api_id: Optional[str] = os.getenv("CENSYS_API_ID")
     censys_api_secret: Optional[str] = os.getenv("CENSYS_API_SECRET")
     spiderfoot_url: Optional[str] = os.getenv("SPIDERFOOT_URL")
@@ -77,7 +78,8 @@ class Settings:
     authorization_reference: Optional[str] = os.getenv("AUTHORIZATION_REFERENCE")
     person_osint_sources: str = os.getenv(
         "PERSON_OSINT_SOURCES",
-        "github,hibp,hunter,brave,sherlock,maigret,holehe,spiderfoot,shodan,censys",
+        "github,gravatar,hibp,hunter,brave,sherlock,maigret,holehe,"
+        "spiderfoot,shodan,censys",
     )
 
     # Celery / Redis

@@ -122,6 +122,7 @@ used without a paid API subscription when their local command-line tools are
 installed in the worker image:
 
 - GitHub public profiles (a `GITHUB_TOKEN` is optional for higher rate limits)
+- Gravatar public profiles (a `GRAVATAR_API_KEY` is optional)
 - Sherlock public username discovery
 - Maigret public username discovery
 - Holehe public service-registration signals

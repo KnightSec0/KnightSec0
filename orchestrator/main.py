@@ -723,6 +723,11 @@ async def _collect_person_intelligence(
         elif status["status"] == "not_queried":
             status["status"] = "no_results"
         if result.errors:
+            status["reason_code"] = _connector_status_reason(result.errors)
+            status["detail"] = _connector_status_detail(
+                request.source,
+                result.errors,
+            )
             logger.warning(
                 "%s reported %s collection error(s)",
                 result.connector,
@@ -754,6 +759,64 @@ def _confidence_label(score: float) -> str:
     if score >= 0.55:
         return "medium"
     return "low"
+
+
+def _connector_status_reason(errors: list[str]) -> str:
+    """Classify raw connector errors into an allow-listed persistence value."""
+    normalized = " ".join(errors).casefold()
+    if "not configured" in normalized:
+        return "missing_configuration"
+    if "not installed" in normalized or "not on path" in normalized:
+        return "connector_unavailable"
+    if "timed out" in normalized or "timeout" in normalized:
+        return "timeout"
+    if any(token in normalized for token in ("rate limit", "too many requests", "429")):
+        return "rate_limited"
+    if any(
+        token in normalized
+        for token in ("unauthorized", "forbidden", "401", "403", "authentication")
+    ):
+        return "authentication_rejected"
+    if "invalid" in normalized:
+        return "invalid_request_or_response"
+    return "request_failed"
+
+
+def _connector_status_detail(source: str, errors: list[str]) -> str:
+    """Convert connector failures into safe, actionable coverage notes.
+
+    Raw provider and CLI errors can contain request details or credentials, so
+    only a small allow-listed set of failure categories is persisted.
+    """
+
+    display_name = {
+        "github": "GitHub",
+        "hibp": "HIBP",
+        "spiderfoot": "SpiderFoot",
+    }.get(source.casefold(), source.replace("_", " ").title())
+    reason = _connector_status_reason(errors)
+    templates = {
+        "missing_configuration": (
+            f"{display_name} configuration or credentials are not configured."
+        ),
+        "connector_unavailable": (
+            f"{display_name} local connector is not installed or available."
+        ),
+        "timeout": (
+            f"{display_name} did not complete before the connector timeout."
+        ),
+        "rate_limited": (
+            f"{display_name} was unavailable because of provider rate limiting."
+        ),
+        "authentication_rejected": (
+            f"{display_name} rejected the configured provider credentials."
+        ),
+        "invalid_request_or_response": (
+            f"{display_name} rejected the target or returned an invalid response."
+        ),
+        "request_failed": f"{display_name} could not complete this collection request.",
+    }
+    return templates[reason]
 
 
 @app.task(name="deepvault.periodic_healthcheck")

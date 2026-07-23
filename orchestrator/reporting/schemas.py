@@ -43,6 +43,7 @@ class SourceCoverage(BaseModel):
     source: str
     evidence_count: int = Field(ge=0)
     status: str
+    detail: str = Field(default="", max_length=500)
     evidence_ids: list[str] = Field(default_factory=list)
 
 

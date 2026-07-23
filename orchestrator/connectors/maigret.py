@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import time
 from typing import Any, Iterator
+from urllib.parse import urlsplit
 
 from config import settings
 from intelligence.models import (
@@ -35,15 +36,52 @@ def _walk_dicts(value: Any) -> Iterator[dict[str, Any]]:
 
 
 def _is_claimed(record: dict[str, Any]) -> bool:
-    status = str(
+    if record.get("exists") is True:
+        return True
+
+    status: Any = (
         record.get("status")
         or record.get("status_msg")
         or record.get("message")
         or ""
-    ).casefold()
-    return record.get("exists") is True or any(
-        word in status for word in ("claimed", "found", "taken", "exists")
     )
+    if isinstance(status, dict):
+        status = (
+            status.get("status")
+            or status.get("status_msg")
+            or status.get("message")
+            or ""
+        )
+    return str(status).strip().casefold() in {
+        "claimed",
+        "found",
+        "taken",
+        "exists",
+    }
+
+
+def _site_from_url(url: str) -> str:
+    """Return a stable public hostname, never Maigret's nested site config."""
+    hostname = (urlsplit(url).hostname or "").strip(".").casefold()
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    return hostname or "unknown"
+
+
+def _site_name(record: dict[str, Any]) -> str | None:
+    """Extract only a short scalar display name from a Maigret result."""
+    candidates: list[Any] = [record.get("site_name"), record.get("name")]
+    status = record.get("status")
+    if isinstance(status, dict):
+        candidates.extend([status.get("site_name"), status.get("name")])
+
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        cleaned = " ".join(candidate.split()).strip()
+        if cleaned and len(cleaned) <= 120:
+            return cleaned
+    return None
 
 
 class MaigretConnector(BaseConnector):
@@ -111,6 +149,12 @@ class MaigretConnector(BaseConnector):
                 if url in dedupe:
                     continue
                 dedupe.add(url)
+                metadata = {
+                    "username": identifier,
+                    "site": _site_from_url(url),
+                }
+                if display_name := _site_name(record):
+                    metadata["site_name"] = display_name
                 evidence.append(
                     Evidence(
                         type="social_profile",
@@ -123,15 +167,7 @@ class MaigretConnector(BaseConnector):
                         notes=[
                             "Username presence must be corroborated with profile attributes.",
                         ],
-                        metadata={
-                            "username": identifier,
-                            "site": str(
-                                record.get("site_name")
-                                or record.get("site")
-                                or record.get("name")
-                                or "unknown"
-                            ),
-                        },
+                        metadata=metadata,
                     )
                 )
 

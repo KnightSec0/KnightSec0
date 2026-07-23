@@ -81,7 +81,8 @@ class IntelligenceTests(unittest.TestCase):
         correlated = correlate_evidence(items)
         self.assertEqual(len(correlated), 1)
         self.assertGreater(correlated[0].confidence, 0.70)
-        self.assertEqual(set(correlated[0].corroborated_by), {"sherlock", "maigret"})
+        self.assertEqual(correlated[0].source, "sherlock")
+        self.assertEqual(set(correlated[0].corroborated_by), {"maigret"})
 
     def test_report_findings_reference_real_evidence(self):
         artifacts = [

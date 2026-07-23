@@ -9,6 +9,7 @@ from connectors import (
     BravePersonSearchConnector,
     CensysConnector,
     GitHubProfileConnector,
+    GravatarProfileConnector,
     HIBPConnector,
     HunterConnector,
     HoleheConnector,
@@ -37,6 +38,7 @@ class PersonIntelligenceInvestigator:
             item.name: item
             for item in (
                 GitHubProfileConnector(),
+                GravatarProfileConnector(),
                 HIBPConnector(),
                 HunterConnector(),
                 BravePersonSearchConnector(),
@@ -84,7 +86,7 @@ class PersonIntelligenceInvestigator:
             for source in ("github", "sherlock", "maigret"):
                 requests.append(CollectionRequest(source, username, "username"))
         for email in emails:
-            for source in ("hibp", "hunter", "holehe"):
+            for source in ("gravatar", "hibp", "hunter", "holehe"):
                 requests.append(CollectionRequest(source, email, "email"))
 
         person_query = " ".join(

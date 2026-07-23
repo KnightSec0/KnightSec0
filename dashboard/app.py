@@ -125,6 +125,7 @@ _SENSITIVE_KEY_PARTS = {
 }
 _ALLOWED_SOURCES = {
     "github",
+    "gravatar",
     "sherlock",
     "maigret",
     "holehe",
@@ -570,23 +571,39 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
     def safe(value: Any) -> str:
         return escape(str(value if value is not None else ""))
 
-    findings = "".join(
-        (
+    def confidence_label(value: Any) -> str:
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return str(value if value is not None else "")
+        if 0.0 <= score <= 1.0:
+            return f"{score * 100:.0f}%"
+        return str(value)
+
+    finding_parts = []
+    for item in report.get("findings", []):
+        finding_limitations = "".join(
+            f"<li>{safe(limitation)}</li>"
+            for limitation in item.get("limitations", [])
+        )
+        finding_parts.append(
             "<article class='finding'>"
             f"<h3>{safe(item.get('title'))}</h3>"
             f"<p>{safe(item.get('statement'))}</p>"
-            f"<p class='meta'>Confidence {safe(item.get('confidence'))} · "
+            f"<p class='meta'>Confidence "
+            f"{safe(confidence_label(item.get('confidence')))} · "
             f"Evidence {safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"{f'<ul>{finding_limitations}</ul>' if finding_limitations else ''}"
             "</article>"
         )
-        for item in report.get("findings", [])
-    )
+    findings = "".join(finding_parts)
     coverage = "".join(
         (
             "<tr>"
             f"<td>{safe(item.get('source'))}</td>"
             f"<td>{safe(item.get('evidence_count'))}</td>"
-            f"<td>{safe(item.get('status'))}</td>"
+            f"<td>{safe(str(item.get('status') or '').replace('_', ' '))}</td>"
+            f"<td>{safe(item.get('detail'))}</td>"
             f"<td>{safe(', '.join(item.get('evidence_ids', [])))}</td>"
             "</tr>"
         )
@@ -619,7 +636,8 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             "<article class='finding'>"
             f"<h3>{safe(item.get('id'))} · {safe(item.get('source'))}</h3>"
             f"<p><strong>Type:</strong> {safe(item.get('type'))} · "
-            f"<strong>Confidence:</strong> {safe(item.get('confidence'))} · "
+            f"<strong>Confidence:</strong> "
+            f"{safe(confidence_label(item.get('confidence')))} · "
             f"<strong>Identity:</strong> {safe(item.get('identity_status'))}</p>"
             f"<p><strong>Value:</strong> {safe(item.get('value'))}</p>"
             f"<p><strong>Source URL:</strong> {safe(item.get('source_url'))}</p>"
@@ -680,10 +698,10 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
   {findings or "<p>No evidence-backed findings were produced.</p>"}
   <h2>Source coverage</h2>
   <table><thead><tr><th>Source</th><th>Evidence</th><th>Status</th>
-    <th>Evidence IDs</th></tr></thead>
+    <th>Coverage note</th><th>Evidence IDs</th></tr></thead>
     <tbody>{coverage}</tbody></table>
-  <h2>Timeline</h2>
-  {timeline or "<p>No dated evidence events were produced.</p>"}
+  <h2>Evidence-derived timeline</h2>
+  {timeline or "<p>No source-provided event dates were available. Collection timestamps are intentionally excluded because they are not person-history events.</p>"}
   <h2>Contradictions</h2>
   {contradictions or "<p>No contradiction entries were produced.</p>"}
   <h2>Evidence appendix</h2>

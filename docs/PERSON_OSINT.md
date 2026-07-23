@@ -168,6 +168,7 @@ all local DeepVault volumes and case data is intentional.
 
 ```env
 GITHUB_TOKEN=                 # optional for higher public API limits
+GRAVATAR_API_KEY=             # optional for public profile enrichment
 HIBP_API_KEY=
 HUNTER_API_KEY=
 BRAVE_API_KEY=
@@ -199,6 +200,7 @@ safe and prevents a name alone from triggering global collection.
   "lawful_purpose": "Consent-based defensive exposure assessment",
   "permitted_sources": [
     "github",
+    "gravatar",
     "hibp",
     "hunter",
     "brave",
@@ -214,7 +216,7 @@ safe and prevents a name alone from triggering global collection.
 Configure the deployment-wide ceiling separately:
 
 ```env
-PERSON_OSINT_SOURCES=github,hibp,hunter,brave,sherlock,maigret,holehe,spiderfoot,shodan,censys
+PERSON_OSINT_SOURCES=github,gravatar,hibp,hunter,brave,sherlock,maigret,holehe,spiderfoot,shodan,censys
 ```
 
 The case allowlist can only narrow that ceiling. SpiderFoot, Shodan and Censys
@@ -223,7 +225,7 @@ require `allow_infrastructure_enrichment: true`, the environment-level opt-in,
 and literal IPs in `authorized_ips`.
 
 The pipeline routes identifiers by source: usernames to GitHub/Sherlock/Maigret,
-emails to HIBP/Hunter/Holehe, a name-plus-context query to Brave, approved
+emails to Gravatar/HIBP/Hunter/Holehe, a name-plus-context query to Brave, approved
 domains or usernames to passive SpiderFoot, and only approved IPs to
 Shodan/Censys. Duplicate legacy calls are suppressed when the normalized stage
 already queried the same source.

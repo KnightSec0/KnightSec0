@@ -1,14 +1,15 @@
-"""Sherlock username connector using its documented JSON export."""
+"""Sherlock username connector using its supported CSV export."""
 
 from __future__ import annotations
 
-import json
+import csv
 from pathlib import Path
 import re
 import shutil
 import tempfile
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from config import settings
 from intelligence.models import (
@@ -27,8 +28,21 @@ _USERNAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 def _claimed(details: dict[str, Any]) -> bool:
     if details.get("exists") is True:
         return True
-    status = str(details.get("status", "")).casefold()
-    return any(word in status for word in ("claimed", "found", "taken", "exists"))
+    status = details.get("exists") or details.get("status") or ""
+    status_token = str(status).strip().casefold().rsplit(".", 1)[-1]
+    return status_token in {
+        "claimed",
+        "found",
+        "taken",
+        "exists",
+    }
+
+
+def _site_from_url(url: str) -> str:
+    hostname = (urlsplit(url).hostname or "").strip(".").casefold()
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    return hostname or "unknown"
 
 
 class SherlockConnector(BaseConnector):
@@ -51,16 +65,18 @@ class SherlockConnector(BaseConnector):
             )
 
         with tempfile.TemporaryDirectory(prefix="deepvault-sherlock-") as temp_dir:
-            output_path = Path(temp_dir) / "result.json"
             try:
                 command_result = await run_cli(
                     [
                         binary,
                         identifier,
-                        "--json",
-                        str(output_path),
+                        "--csv",
+                        "--folderoutput",
+                        temp_dir,
+                        "--no-txt",
                         "--print-found",
                         "--no-color",
+                        "--local",
                         "--timeout",
                         str(min(settings.connector_timeout, 60)),
                     ],
@@ -69,8 +85,9 @@ class SherlockConnector(BaseConnector):
             except TimeoutError as exc:
                 return ConnectorResult(connector=self.name, errors=[str(exc)])
 
-            if not output_path.exists():
-                error = command_result.stderr.strip() or "Sherlock produced no JSON output"
+            csv_paths = sorted(Path(temp_dir).glob("*.csv"))
+            if not csv_paths:
+                error = command_result.stderr.strip() or "Sherlock produced no CSV report"
                 return ConnectorResult(
                     connector=self.name,
                     errors=[error[:500]],
@@ -78,46 +95,56 @@ class SherlockConnector(BaseConnector):
                 )
 
             try:
-                payload = json.loads(output_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+                with csv_paths[0].open(
+                    "r",
+                    encoding="utf-8",
+                    newline="",
+                ) as report_file:
+                    payload = list(csv.DictReader(report_file))
+            except (OSError, csv.Error) as exc:
                 return ConnectorResult(
                     connector=self.name,
-                    errors=[f"Invalid Sherlock JSON: {exc}"],
+                    errors=[f"Invalid Sherlock CSV: {exc}"],
                     duration_ms=command_result.duration_ms,
                 )
 
         evidence: list[Evidence] = []
-        if isinstance(payload, dict):
-            for site, details in payload.items():
-                if not isinstance(details, dict) or not _claimed(details):
-                    continue
-                url = (
-                    details.get("url_user")
-                    or details.get("url")
-                    or details.get("url_main")
+        seen: set[str] = set()
+        for details in payload:
+            if not _claimed(details):
+                continue
+            url = details.get("url_user") or details.get("url_main")
+            if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            site = str(details.get("name") or "").strip()[:120]
+            evidence.append(
+                Evidence(
+                    type="social_profile",
+                    value=url,
+                    source=self.name,
+                    source_url=url,
+                    confidence=0.55,
+                    reliability=SourceReliability.MEDIUM,
+                    identity_status=IdentityStatus.POSSIBLE,
+                    notes=[
+                        "Username presence is not sufficient to confirm identity.",
+                        "Manual profile-content validation is required.",
+                    ],
+                    metadata={
+                        "username": identifier,
+                        "site": site or _site_from_url(url),
+                        "platform": _site_from_url(url),
+                        "status": str(
+                            details.get("exists")
+                            or details.get("status")
+                            or "claimed"
+                        ),
+                    },
                 )
-                if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-                    continue
-                evidence.append(
-                    Evidence(
-                        type="social_profile",
-                        value=url,
-                        source=self.name,
-                        source_url=url,
-                        confidence=0.55,
-                        reliability=SourceReliability.MEDIUM,
-                        identity_status=IdentityStatus.POSSIBLE,
-                        notes=[
-                            "Username presence is not sufficient to confirm identity.",
-                            "Manual profile-content validation is required.",
-                        ],
-                        metadata={
-                            "username": identifier,
-                            "site": str(site),
-                            "status": str(details.get("status", "claimed")),
-                        },
-                    )
-                )
+            )
 
         return ConnectorResult(
             connector=self.name,

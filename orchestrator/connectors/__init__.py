@@ -1,5 +1,6 @@
 """Safe, source-specific OSINT connectors."""
 
+from .gravatar import GravatarProfileConnector
 from .holehe import HoleheConnector
 from .maigret import MaigretConnector
 from .sherlock import SherlockConnector
@@ -18,6 +19,7 @@ __all__ = [
     "BravePersonSearchConnector",
     "CensysConnector",
     "GitHubProfileConnector",
+    "GravatarProfileConnector",
     "HIBPConnector",
     "HoleheConnector",
     "HunterConnector",
