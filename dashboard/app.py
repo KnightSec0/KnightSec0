@@ -178,6 +178,7 @@ class InvestigationCreate(BaseModel):
     authorized_domains: list[str] = Field(default_factory=list, max_length=20)
     authorized_ips: list[str] = Field(default_factory=list, max_length=20)
     allow_infrastructure_enrichment: bool = False
+    compare_previous_cases: bool = False
     lawful_purpose: str = Field(min_length=8, max_length=500)
     authorization_reference: str = Field(min_length=3, max_length=200)
     authorization_expires_at: datetime
@@ -424,6 +425,7 @@ async def _serialize(
         "completed_at": investigation.completed_at,
         "authorization_reference": metadata.get("authorization_reference"),
         "permitted_sources": metadata.get("permitted_sources", []),
+        "compare_previous_cases": bool(metadata.get("compare_previous_cases")),
         "source_status": metadata.get("source_status", []),
         "artifact_count": await _artifact_count(session, investigation.id),
         "has_report": report is not None,
@@ -491,6 +493,7 @@ async def create_investigation(payload: InvestigationCreate) -> dict[str, Any]:
         "authorized_domains": payload.authorized_domains,
         "authorized_ips": payload.authorized_ips,
         "allow_infrastructure_enrichment": payload.allow_infrastructure_enrichment,
+        "compare_previous_cases": payload.compare_previous_cases,
     }
     investigation = Investigation(
         target_name=payload.target_name.strip(),
@@ -631,6 +634,136 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
         )
         for item in report.get("contradictions", [])
     )
+    identity_graph = report.get("identity_graph")
+    identity_graph = identity_graph if isinstance(identity_graph, dict) else {}
+    graph_nodes = identity_graph.get("nodes", [])
+    graph_nodes = graph_nodes if isinstance(graph_nodes, list) else []
+    graph_edge_items = identity_graph.get("edges", [])
+    graph_edge_items = graph_edge_items if isinstance(graph_edge_items, list) else []
+    graph_hypothesis_items = identity_graph.get("hypotheses", [])
+    graph_hypothesis_items = (
+        graph_hypothesis_items if isinstance(graph_hypothesis_items, list) else []
+    )
+    graph_pivot_items = identity_graph.get("pivots", [])
+    graph_pivot_items = (
+        graph_pivot_items if isinstance(graph_pivot_items, list) else []
+    )
+    node_labels = {
+        str(item.get("id")): item.get("label") or item.get("id")
+        for item in graph_nodes
+        if isinstance(item, dict) and item.get("id")
+    }
+    graph_hypotheses = "".join(
+        (
+            "<article class='finding'>"
+            f"<h3>{safe(item.get('identity_status'))} · "
+            f"{safe(confidence_label(item.get('confidence')))}</h3>"
+            f"<p>{safe(item.get('claim'))}</p>"
+            f"<p class='meta'>Evidence "
+            f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            + (
+                "<ul>"
+                + "".join(
+                    f"<li>{safe(limitation)}</li>"
+                    for limitation in item.get("limitations", [])
+                )
+                + "</ul>"
+                if item.get("limitations")
+                else ""
+            )
+            + "</article>"
+        )
+        for item in graph_hypothesis_items
+        if isinstance(item, dict)
+    )
+    graph_edges = "".join(
+        (
+            "<tr>"
+            f"<td>{safe(item.get('relationship'))}</td>"
+            f"<td>{safe(node_labels.get(str(item.get('source_node_id')), item.get('source_node_id')))}</td>"
+            f"<td>{safe(node_labels.get(str(item.get('target_node_id')), item.get('target_node_id')))}</td>"
+            f"<td>{safe(confidence_label(item.get('confidence')))}</td>"
+            f"<td>{safe(item.get('identity_status'))}</td>"
+            f"<td>{safe(', '.join(item.get('evidence_ids', [])))}</td>"
+            "</tr>"
+        )
+        for item in graph_edge_items
+        if isinstance(item, dict)
+    )
+    graph_pivots = "".join(
+        (
+            "<article class='finding'>"
+            f"<h3>#{safe(item.get('rank'))} · {safe(item.get('title'))}</h3>"
+            f"<p>{safe(item.get('rationale'))}</p>"
+            f"<p>{safe(item.get('action'))}</p>"
+            "<p class='meta'>Manual review only · new authorization required · "
+            f"{safe(item.get('priority'))} priority</p>"
+            f"<p class='meta'>Evidence "
+            f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            "</article>"
+        )
+        for item in graph_pivot_items
+        if isinstance(item, dict)
+    )
+    temporal = report.get("temporal_comparison")
+    temporal = temporal if isinstance(temporal, dict) else {}
+    temporal_counts = temporal.get("counts")
+    temporal_counts = temporal_counts if isinstance(temporal_counts, dict) else {}
+    temporal_groups = []
+    for key, label in (
+        ("added", "Added"),
+        ("changed", "Changed"),
+        ("persisting", "Persisting"),
+        ("not_observed", "Not observed"),
+    ):
+        entries = temporal.get(key, [])
+        if not isinstance(entries, list) or not entries:
+            continue
+        parts = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            evidence_ids = [
+                value
+                for value in (
+                    item.get("previous_evidence_id"),
+                    item.get("current_evidence_id"),
+                )
+                if value
+            ]
+            changed_fields = item.get("changed_fields", [])
+            parts.append(
+                "<article class='finding'>"
+                f"<h3>{safe(item.get('type'))} · {safe(item.get('value'))}</h3>"
+                + (
+                    f"<p class='meta'>Changed fields: "
+                    f"{safe(', '.join(changed_fields))}</p>"
+                    if changed_fields
+                    else ""
+                )
+                + f"<p class='meta'>Evidence {safe(' → '.join(evidence_ids))}</p>"
+                "</article>"
+            )
+        if parts:
+            temporal_groups.append(f"<h3>{safe(label)}</h3>{''.join(parts)}")
+    temporal_scope = temporal.get("scope")
+    temporal_scope = temporal_scope if isinstance(temporal_scope, dict) else {}
+    temporal_section = ""
+    if temporal:
+        temporal_section = (
+            "<h2>Changes since the previous comparable case</h2>"
+            f"<p><strong>Baseline case:</strong> "
+            f"{safe(temporal_scope.get('previous_case_id'))}</p>"
+            "<p>"
+            f"<strong>Added:</strong> {safe(temporal_counts.get('added', 0))} · "
+            f"<strong>Changed:</strong> {safe(temporal_counts.get('changed', 0))} · "
+            f"<strong>Persisting:</strong> {safe(temporal_counts.get('persisting', 0))} · "
+            f"<strong>Not observed:</strong> "
+            f"{safe(temporal_counts.get('not_observed', 0))}"
+            "</p>"
+            f"<div class='notice'>{safe(temporal.get('scope_note'))}</div>"
+            + "".join(temporal_groups)
+        )
     evidence_ledger = "".join(
         (
             "<article class='finding'>"
@@ -669,6 +802,8 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
     h1 {{ margin-bottom: 4px; }} h2 {{ margin-top: 32px; }}
     .summary, .finding {{ background: #f3f7f4; border: 1px solid #d7e3da;
       border-radius: 10px; padding: 18px; margin: 12px 0; }}
+    .notice {{ background: #fff7db; border: 1px solid #ead58a;
+      border-radius: 10px; padding: 14px; margin: 12px 0; }}
     .meta {{ color: #52635a; font-size: 13px; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ border-bottom: 1px solid #d7e3da; padding: 10px; text-align: left; }}
@@ -696,6 +831,18 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
   </section>
   <h2>Findings</h2>
   {findings or "<p>No evidence-backed findings were produced.</p>"}
+  <h2>Evidence-first identity analysis</h2>
+  <p><strong>Graph:</strong> {safe(len(graph_nodes))} nodes ·
+    {safe(len(graph_edge_items))} relationships ·
+    {safe(len(graph_hypothesis_items))} hypotheses</p>
+  {graph_hypotheses or "<p>No evidence-backed identity hypotheses were produced.</p>"}
+  <h3>Provenance relationships</h3>
+  <table><thead><tr><th>Relation</th><th>From</th><th>To</th>
+    <th>Confidence</th><th>Status</th><th>Evidence IDs</th></tr></thead>
+    <tbody>{graph_edges}</tbody></table>
+  <h3>Ranked analyst pivots</h3>
+  {graph_pivots or "<p>No evidence-backed pivots were produced.</p>"}
+  {temporal_section}
   <h2>Source coverage</h2>
   <table><thead><tr><th>Source</th><th>Evidence</th><th>Status</th>
     <th>Coverage note</th><th>Evidence IDs</th></tr></thead>

@@ -9,9 +9,9 @@ from uuid import UUID
 
 from celery import Celery
 from celery.signals import worker_ready, worker_shutdown
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import noload, sessionmaker
 
 from config import settings
 from db.models import Base, Investigation, InvestigationStatus, Artifact
@@ -24,7 +24,7 @@ from investigators.geolocation import GeolocationInvestigator
 from investigators.financial import FinancialInvestigator
 from investigators.email_footprint import EmailFootprintInvestigator
 from investigators.person_intelligence import PersonIntelligenceInvestigator
-from intelligence.models import InvestigationTarget
+from intelligence.models import Evidence, InvestigationTarget
 from intelligence.policy import CollectionPolicy
 from intelligence.redaction import redact_sensitive
 from reporting.person_report import PersonReportGenerator
@@ -166,6 +166,8 @@ async def _run_investigation_pipeline(
                 "username": inv.target_username,
                 "email": inv.target_email,
                 "phone": inv.target_phone,
+                "employer": (inv.case_metadata or {}).get("employer"),
+                "location": (inv.case_metadata or {}).get("location"),
                 "depth": inv.depth or "full",
             }
             allowed_sources = _source_scope(inv)
@@ -482,9 +484,16 @@ async def _run_investigation_pipeline(
                 message="Generating the evidence-linked report",
                 percent=90,
             )
+            previous_case_id, previous_evidence = await _previous_report_evidence(
+                session,
+                inv,
+            )
             report = await PersonReportGenerator().generate(
                 target=target,
                 artifacts=all_artifacts,
+                current_case_id=str(inv.id),
+                previous_case_id=previous_case_id,
+                previous_evidence=previous_evidence,
             )
             inv.case_metadata = {
                 **(inv.case_metadata or {}),
@@ -607,6 +616,129 @@ async def _set_progress(
     }
     inv.updated_at = _db_now()
     await session.commit()
+
+
+async def _previous_report_evidence(
+    session: AsyncSession,
+    inv: Investigation,
+) -> tuple[str | None, list[Evidence]]:
+    """Load the latest comparable report without treating absence as evidence.
+
+    Comparison is explicit opt-in. A prior case is comparable only when the
+    normalized target name, preferred operator-supplied identifier, unexpired
+    authorization reference, purpose, and source scope match. Malformed or
+    legacy ledgers are skipped rather than weakening the current report.
+    """
+    metadata = inv.case_metadata or {}
+    if not metadata.get("compare_previous_cases"):
+        return None, []
+    if not metadata.get("authorization_confirmed"):
+        return None, []
+
+    if inv.target_email:
+        identifier_match = (
+            func.lower(Investigation.target_email)
+            == inv.target_email.strip().casefold()
+        )
+    elif inv.target_username:
+        identifier_match = (
+            func.lower(Investigation.target_username)
+            == inv.target_username.strip().casefold()
+        )
+    else:
+        return None, []
+
+    result = await session.execute(
+        select(Investigation)
+        .options(noload(Investigation.artifacts))
+        .where(
+            Investigation.id != inv.id,
+            Investigation.status == InvestigationStatus.COMPLETED,
+            func.lower(Investigation.target_name)
+            == inv.target_name.strip().casefold(),
+            identifier_match,
+        )
+        .order_by(
+            Investigation.completed_at.desc().nullslast(),
+            Investigation.created_at.desc(),
+        )
+        .limit(25)
+    )
+    candidates = result.scalars().all()
+    current_reference = str(metadata.get("authorization_reference") or "").strip()
+    current_purpose = " ".join(
+        str(metadata.get("lawful_purpose") or "").split()
+    ).casefold()
+    current_sources = {
+        str(source).strip().casefold()
+        for source in metadata.get("permitted_sources", [])
+        if str(source).strip()
+    }
+    if not current_reference or not current_purpose or not current_sources:
+        return None, []
+
+    for previous in candidates:
+        previous_metadata = previous.case_metadata or {}
+        if not previous_metadata.get("authorization_confirmed"):
+            continue
+        if (
+            str(previous_metadata.get("authorization_reference") or "").strip()
+            != current_reference
+        ):
+            continue
+        previous_purpose = " ".join(
+            str(previous_metadata.get("lawful_purpose") or "").split()
+        ).casefold()
+        if previous_purpose != current_purpose:
+            continue
+        previous_sources = {
+            str(source).strip().casefold()
+            for source in previous_metadata.get("permitted_sources", [])
+            if str(source).strip()
+        }
+        if previous_sources != current_sources:
+            continue
+        try:
+            previous_expiry = datetime.fromisoformat(
+                str(
+                    previous_metadata.get("authorization_expires_at") or ""
+                ).replace("Z", "+00:00")
+            )
+        except ValueError:
+            continue
+        if previous_expiry.tzinfo is None:
+            previous_expiry = previous_expiry.replace(tzinfo=timezone.utc)
+        if previous_expiry <= datetime.now(timezone.utc):
+            continue
+
+        structured_report = previous_metadata.get("structured_report")
+        if not isinstance(structured_report, dict):
+            continue
+        ledger = structured_report.get("evidence_ledger")
+        if not isinstance(ledger, list):
+            continue
+
+        evidence = []
+        malformed = False
+        for payload in ledger:
+            if not isinstance(payload, dict):
+                malformed = True
+                continue
+            try:
+                evidence.append(
+                    Evidence.model_validate(redact_sensitive(payload))
+                )
+            except Exception:
+                malformed = True
+        if malformed:
+            logger.warning(
+                "Skipping temporal baseline %s because its evidence ledger "
+                "is malformed",
+                previous.id,
+            )
+            continue
+        return str(previous.id), evidence
+    return None, []
 
 
 def _breach_confidence(source: str) -> str:

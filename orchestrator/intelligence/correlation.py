@@ -74,7 +74,14 @@ def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:
             source for source in sources if source != representative.source
         ]
         identity_status = status_from_score(score)
-        if len(sources) == 1 and identity_status in {
+        statuses = {item.identity_status for item in group}
+        if statuses == {IdentityStatus.UNRELATED}:
+            identity_status = IdentityStatus.UNRELATED
+        elif IdentityStatus.UNRELATED in statuses:
+            # Conflicting positive and negative disambiguation signals require
+            # analyst review; they can never be promoted to probable.
+            identity_status = IdentityStatus.POSSIBLE
+        elif len(sources) == 1 and identity_status in {
             IdentityStatus.PROBABLE,
             IdentityStatus.HIGHLY_PROBABLE,
             IdentityStatus.CONFIRMED,

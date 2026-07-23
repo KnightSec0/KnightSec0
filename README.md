@@ -50,8 +50,9 @@ credentials into the dashboard.
 | Data Breaches | Breach names, dates and exposed data classes (no credentials) | HIBP |
 | Passive scanning | Results from an authorized SpiderFoot server | SpiderFoot |
 | Infrastructure | Explicitly authorized literal-IP enrichment | Shodan, Censys |
-| Correlation | Provenance normalization, identity confidence and contradiction detection | Local correlation engine |
-| Reporting | Evidence-linked findings, timeline, contradictions and source coverage | Downloadable JSON and printable HTML |
+| Correlation | Provenance normalization, identity graph, hypotheses and contradiction detection | Local correlation engine |
+| Change tracking | Added, changed, persisting and not-observed evidence between explicitly comparable cases | Local temporal engine |
+| Reporting | Evidence-linked findings, graph, provenance, timeline, contradictions and source coverage | Downloadable JSON and printable HTML |
 | LLM analysis | Optional single-provider or consensus synthesis | OpenAI, Anthropic, Gemini, Ollama, OpenAI-compatible APIs |
 
 ## 🏗 Architecture
@@ -110,9 +111,20 @@ credentials into the dashboard.
 - Raises confidence only when multiple sources corroborate the same observation
 - Preserves provenance, reliability, identity status, and evidence IDs
 
-### 6. Structured Reporting Engine (orchestrator/reporting/person_report.py)
+### 6. Identity Analysis (orchestrator/intelligence/identity_graph.py)
+- Builds a deterministic graph over the normalized evidence ledger
+- Emits conservative hypotheses, provenance chains and authorization-gated analyst pivots
+- Never invents identifiers or executes a recommended pivot automatically
+- Compares a rerun with the latest comparable case without treating a missing
+  observation as proof of account deletion or nonexistence
+
+See [Evidence-first identity analysis](docs/IDENTITY_ANALYSIS.md) for the
+evidence contract and the intentionally excluded prototype behaviors.
+
+### 7. Structured Reporting Engine (orchestrator/reporting/person_report.py)
 - Produces evidence-linked findings with an executive summary and risk level
-- Includes timeline, contradictions, source coverage, limitations, and recommendations
+- Includes identity hypotheses, provenance, temporal changes, timeline,
+  contradictions, source coverage, limitations, and recommendations
 - Exposes machine-readable JSON plus standalone HTML that can be printed to PDF
 
 ## 🔧 Configuration
@@ -152,10 +164,13 @@ persisted and included in reports.
 2. Enter the authorized person's name and at least one known username or email.
 3. Record the lawful purpose, authorization reference, and a future expiry.
 4. Select only sources covered by that authorization and confirm consent.
-5. Start the case and keep the page open to see live progress updates.
-6. Review evidence citations, limitations, contradictions, timeline, and source
-   coverage before accepting any identity match.
-7. Download the completed report as JSON or HTML.
+5. For a repeat scan, explicitly enable comparison and reuse the same unexpired
+   authorization reference, purpose, and source scope.
+6. Start the case and keep the page open to see live progress updates.
+7. Review evidence citations, identity hypotheses, graph provenance, temporal
+   caveats, contradictions, timeline, and source coverage before accepting any
+   identity match.
+8. Download the completed report as JSON or HTML.
 
 The dashboard refreshes case state every few seconds; refreshing the browser
 does not stop the worker. A report is made available only after a structured
@@ -193,7 +208,7 @@ deepvault/
 │   ├── config.py                # Settings & secrets
 │   ├── db/                      # Data models
 │   ├── investigators/           # Investigation modules
-│   ├── correlator/              # Graph & correlation
+│   ├── intelligence/            # Evidence, graph, correlation & temporal analysis
 │   └── reporting/               # Evidence-linked report generation
 ├── dashboard/                   # Local FastAPI dashboard
 │   ├── app.py                   # API server and report downloads

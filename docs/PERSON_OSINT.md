@@ -61,6 +61,24 @@ vote are retained. Provider-only claims are discarded. The baseline report
 also includes an evidence-linked timeline, detected contradictions, source
 coverage, limitations and analyst recommendations.
 
+## Identity graph and case comparison
+
+After source normalization and conservative correlation, DeepVault builds a
+local identity graph. Evidence records become nodes; cross-source agreement and
+explicit provenance become evidence-linked edges. The graph produces reviewable
+hypotheses and ranked analyst pivots, but never launches a new query by itself.
+Every edge, hypothesis and pivot cites the evidence IDs that support it.
+
+Case comparison is disabled by default. When the operator explicitly opts in,
+DeepVault can compare against the latest completed case with the same normalized
+name, matching email (or username fallback), unexpired authorization reference,
+lawful purpose and source scope. The report labels observations as added,
+persisting, changed or not-observed. Not-observed never means deleted or
+disproven and is suppressed when current source coverage was incomplete.
+
+See [Evidence-first identity analysis](IDENTITY_ANALYSIS.md) for the full
+evidence contract and excluded prototype behaviors.
+
 ## Safe defaults
 
 Sensitive pivots such as geolocation, dark-web and financial modules are
@@ -114,6 +132,10 @@ The form enforces the minimum collection policy:
 - at least one username or email must be provided; and
 - every selected connector must appear in the per-case source allowlist.
 
+Repeat-case comparison requires a separate checkbox. Reuse occurs only under
+the same still-valid authorization reference, lawful purpose and exact source
+scope; otherwise the current case remains standalone.
+
 For a consent-based self-test, enter only your own public identifiers and use a
 case reference such as `SELF-TEST-001`. Start with GitHub, Sherlock, Maigret,
 and Holehe, which do not require paid API subscriptions. GitHub may use an
@@ -122,8 +144,9 @@ Censys require provider credentials; SpiderFoot requires a configured local or
 authorized server.
 
 The active case view polls the local API every few seconds and displays the
-worker's current stage, source status, and safe evidence summaries as collection
-finishes. Completed cases expose two report downloads:
+worker's current stage, source status, safe evidence summaries, identity
+hypotheses and temporal comparison as collection finishes. Completed cases
+expose two report downloads:
 
 ```text
 GET /api/investigations/{id}/report.json

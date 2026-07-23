@@ -233,6 +233,9 @@
         <label class="consent"><input id="infra-consent" type="checkbox">
           <span>Permit Shodan/Censys enrichment only for the literal IP addresses entered above. This also requires <code>ALLOW_INFRASTRUCTURE_ENRICHMENT=true</code> in <code>.env</code>.</span>
         </label>
+        <label class="consent"><input id="compare-history" type="checkbox">
+          <span>Compare this run with the latest compatible case under the same unexpired authorization, purpose, and source scope.</span>
+        </label>
         <label class="consent"><input id="consent" type="checkbox" required>
           <span>I confirm that I have explicit written authorization and that the selected sources are within scope.</span>
         </label>
@@ -306,6 +309,26 @@
       const timeline = report?.timeline || [];
       const contradictions = report?.contradictions || [];
       const recommendations = report?.recommendations || [];
+      const identityGraph = report?.identity_graph || {};
+      const graphNodes = Array.isArray(identityGraph.nodes) ? identityGraph.nodes : [];
+      const graphEdges = Array.isArray(identityGraph.edges) ? identityGraph.edges : [];
+      const graphHypotheses = Array.isArray(identityGraph.hypotheses)
+        ? identityGraph.hypotheses : [];
+      const graphPivots = Array.isArray(identityGraph.pivots)
+        ? identityGraph.pivots : [];
+      const graphLabels = Object.fromEntries(
+        graphNodes.map(node => [node.id, node.label || node.id])
+      );
+      const temporal = report?.temporal_comparison || null;
+      const temporalCounts = temporal?.counts || {};
+      const temporalGroups = temporal
+        ? [
+            ["Added", Array.isArray(temporal.added) ? temporal.added : []],
+            ["Changed", Array.isArray(temporal.changed) ? temporal.changed : []],
+            ["Persisting", Array.isArray(temporal.persisting) ? temporal.persisting : []],
+            ["Not observed", Array.isArray(temporal.not_observed) ? temporal.not_observed : []],
+          ]
+        : [];
       const coverage = report
         ? (report.source_coverage || [])
         : (item.source_status?.length
@@ -346,6 +369,71 @@
              item.status === "pending" ? "Waiting for an available worker." :
              "No report is available yet."))}</p>
         </section>
+        <section class="panel"><h3>Evidence-first identity analysis</h3>
+          <div class="coverage">
+            <span class="chip">${escapeHtml(graphNodes.length)} nodes</span>
+            <span class="chip">${escapeHtml(graphEdges.length)} relationships</span>
+            <span class="chip">${escapeHtml(graphHypotheses.length)} hypotheses</span>
+          </div>
+          ${graphHypotheses.map(hypothesis => `<article class="finding">
+            <h4>${escapeHtml(hypothesis.identity_status)} ·
+              ${escapeHtml(Math.round(Number(hypothesis.confidence || 0) * 100))}%</h4>
+            <p>${escapeHtml(hypothesis.claim)}</p>
+            <span class="evidence">${(hypothesis.evidence_ids || []).map(escapeHtml).join(" · ")}</span>
+            ${(hypothesis.limitations || []).length
+              ? `<ul class="report-list">${hypothesis.limitations.map(limit =>
+                  `<li>${escapeHtml(limit)}</li>`).join("")}</ul>`
+              : ""}
+          </article>`).join("") || `<p class="sub">No evidence-backed identity hypothesis is available yet.</p>`}
+          <details class="evidence-item">
+            <summary><strong>Provenance relationships</strong> · ${escapeHtml(graphEdges.length)}</summary>
+            ${graphEdges.slice(0, 60).map(edge => `<article class="finding">
+              <h4>${escapeHtml(edge.relationship)}</h4>
+              <p>${escapeHtml(graphLabels[edge.source_node_id] || edge.source_node_id)} →
+                ${escapeHtml(graphLabels[edge.target_node_id] || edge.target_node_id)}</p>
+              <p class="sub">${escapeHtml(edge.explanation)} ·
+                ${escapeHtml(Math.round(Number(edge.confidence || 0) * 100))}% ·
+                ${escapeHtml(edge.identity_status)}</p>
+              <span class="evidence">${(edge.evidence_ids || []).map(escapeHtml).join(" · ")}</span>
+            </article>`).join("") || `<p class="sub">No graph relationships yet.</p>`}
+            ${graphEdges.length > 60
+              ? `<p class="sub">Showing 60 of ${escapeHtml(graphEdges.length)} relationships. Download JSON for the full graph.</p>`
+              : ""}
+          </details>
+          <h4>Ranked analyst pivots</h4>
+          ${graphPivots.map(pivot => `<article class="finding">
+            <h4>#${escapeHtml(pivot.rank)} · ${escapeHtml(pivot.title)}</h4>
+            <p>${escapeHtml(pivot.rationale)}</p>
+            <p>${escapeHtml(pivot.action)}</p>
+            <p class="sub">${escapeHtml(pivot.priority)} priority · Manual review only ·
+              New authorization required</p>
+            <span class="evidence">${(pivot.evidence_ids || []).map(escapeHtml).join(" · ")}</span>
+          </article>`).join("") || `<p class="sub">No evidence-backed pivots are available.</p>`}
+        </section>
+        ${temporal ? `<section class="panel"><h3>Changes since the previous comparable case</h3>
+          <div class="coverage">
+            <span class="chip">${escapeHtml(temporalCounts.added || 0)} added</span>
+            <span class="chip">${escapeHtml(temporalCounts.changed || 0)} changed</span>
+            <span class="chip">${escapeHtml(temporalCounts.persisting || 0)} persisting</span>
+            <span class="chip">${escapeHtml(temporalCounts.not_observed || 0)} not observed</span>
+          </div>
+          <p class="sub">Baseline case ${escapeHtml(temporal.scope?.previous_case_id || "—")}</p>
+          <div class="notice">${escapeHtml(temporal.scope_note || "")}</div>
+          ${temporalGroups.map(([label, entries]) => entries.length
+            ? `<details class="evidence-item"><summary><strong>${escapeHtml(label)}</strong> · ${escapeHtml(entries.length)}</summary>
+                ${entries.map(entry => `<article class="finding">
+                  <h4>${escapeHtml(entry.type)} · ${escapeHtml(entry.value)}</h4>
+                  ${(entry.changed_fields || []).length
+                    ? `<p class="sub">Changed fields: ${entry.changed_fields.map(escapeHtml).join(" · ")}</p>`
+                    : ""}
+                  <span class="evidence">${[
+                    entry.previous_evidence_id,
+                    entry.current_evidence_id,
+                  ].filter(Boolean).map(escapeHtml).join(" → ")}</span>
+                </article>`).join("")}
+              </details>`
+            : "").join("")}
+        </section>` : ""}
         <section class="panel"><h3>Source coverage</h3>
           <div class="coverage">${coverage.map(source =>
             `<span class="chip">${escapeHtml(source.source)} · ${escapeHtml(source.evidence_count)} · ${escapeHtml(source.status)}</span>`
@@ -437,6 +525,7 @@
         authorized_ips: $("#ips").value.split(",")
           .map(value => value.trim()).filter(Boolean),
         allow_infrastructure_enrichment: $("#infra-consent").checked,
+        compare_previous_cases: $("#compare-history").checked,
         lawful_purpose: $("#purpose").value,
         authorization_reference: $("#reference").value,
         authorization_expires_at: expiryLocal.toISOString(),

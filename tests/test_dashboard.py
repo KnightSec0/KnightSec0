@@ -27,6 +27,16 @@ def valid_request(**overrides):
 
 
 class DashboardRequestValidationTests(unittest.TestCase):
+    def test_temporal_comparison_is_explicit_opt_in(self):
+        self.assertFalse(
+            InvestigationCreate(**valid_request()).compare_previous_cases
+        )
+        self.assertTrue(
+            InvestigationCreate(
+                **valid_request(compare_previous_cases=True)
+            ).compare_previous_cases
+        )
+
     def test_rejects_unconfirmed_authorization(self):
         with self.assertRaisesRegex(
             ValidationError, "Written authorization must be confirmed"
@@ -119,6 +129,69 @@ class DashboardReportRenderingTests(unittest.TestCase):
                     },
                 }
             ],
+            "identity_graph": {
+                "nodes": [
+                    {
+                        "id": "NODE-TARGET",
+                        "label": "Alice Example",
+                    },
+                    {
+                        "id": "NODE-PROFILE",
+                        "label": "<svg onload=alert('graph')>",
+                    },
+                ],
+                "edges": [
+                    {
+                        "relationship": "candidate_identity_association",
+                        "source_node_id": "NODE-TARGET",
+                        "target_node_id": "NODE-PROFILE",
+                        "confidence": 0.62,
+                        "identity_status": "possible",
+                        "evidence_ids": ["EVID-ABC123"],
+                    }
+                ],
+                "hypotheses": [
+                    {
+                        "identity_status": "possible",
+                        "confidence": 0.62,
+                        "claim": "A cited profile is a candidate.",
+                        "evidence_ids": ["EVID-ABC123"],
+                        "limitations": ["Manual verification is required."],
+                    }
+                ],
+                "pivots": [
+                    {
+                        "rank": 1,
+                        "title": "Review public profile",
+                        "rationale": "The profile is a cited candidate.",
+                        "action": "Review the public page without authenticating.",
+                        "priority": "medium",
+                        "evidence_ids": ["EVID-ABC123"],
+                    }
+                ],
+            },
+            "temporal_comparison": {
+                "scope": {"previous_case_id": "CASE-OLD"},
+                "counts": {
+                    "added": 0,
+                    "changed": 1,
+                    "persisting": 0,
+                    "not_observed": 0,
+                },
+                "changed": [
+                    {
+                        "type": "github_profile",
+                        "value": "<iframe src=bad>",
+                        "previous_evidence_id": "EVID-OLD",
+                        "current_evidence_id": "EVID-ABC123",
+                        "changed_fields": ["metadata"],
+                    }
+                ],
+                "added": [],
+                "persisting": [],
+                "not_observed": [],
+                "scope_note": "Snapshot changes do not prove identity.",
+            },
             "recommendations": ["Review <b>manually</b>."],
         }
 
@@ -127,6 +200,8 @@ class DashboardReportRenderingTests(unittest.TestCase):
         self.assertNotIn("<script>", rendered)
         self.assertNotIn("<img src=x", rendered)
         self.assertNotIn("<b>manually</b>", rendered)
+        self.assertNotIn("<svg onload", rendered)
+        self.assertNotIn("<iframe src", rendered)
         self.assertIn("&lt;script&gt;", rendered)
         self.assertIn("&lt;img src=x onerror=alert(1)&gt;", rendered)
         self.assertIn("Review &lt;b&gt;manually&lt;/b&gt;.", rendered)
@@ -134,6 +209,10 @@ class DashboardReportRenderingTests(unittest.TestCase):
         self.assertNotIn("must-not-survive-either", rendered)
         self.assertIn("&lt;redacted&gt;", rendered)
         self.assertIn("Evidence appendix", rendered)
+        self.assertIn("Evidence-first identity analysis", rendered)
+        self.assertIn("Changes since the previous comparable case", rendered)
+        self.assertIn("&lt;svg onload=alert(&#x27;graph&#x27;)&gt;", rendered)
+        self.assertIn("&lt;iframe src=bad&gt;", rendered)
         self.assertGreaterEqual(rendered.count("EVID-ABC123"), 3)
 
 

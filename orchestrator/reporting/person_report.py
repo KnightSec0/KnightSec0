@@ -15,8 +15,13 @@ from intelligence.correlation import (
     correlate_evidence,
     identity_confidence_summary,
 )
+from intelligence.identity_graph import IdentityGraph, build_identity_graph
 from intelligence.models import Evidence, IdentityStatus, SourceReliability
 from intelligence.redaction import redact_sensitive
+from intelligence.temporal import (
+    TemporalComparison,
+    compare_evidence_snapshots,
+)
 
 from .providers import (
     AnthropicReportProvider,
@@ -196,20 +201,44 @@ def _mean_confidence(items: list[Evidence]) -> float:
 
 
 def _grouped_candidate_findings(evidence: list[Evidence]) -> list[Finding]:
-    groups: dict[tuple[str, str], list[Evidence]] = {}
+    groups: dict[tuple[str, str, bool], list[Evidence]] = {}
     for item in evidence:
         if item.type in {"social_profile", "service_registration"}:
-            groups.setdefault((item.type, item.source), []).append(item)
+            groups.setdefault(
+                (
+                    item.type,
+                    item.source,
+                    item.identity_status == IdentityStatus.UNRELATED,
+                ),
+                [],
+            ).append(item)
 
     findings: list[Finding] = []
-    for (evidence_type, source), items in groups.items():
+    for (evidence_type, source, unrelated), items in groups.items():
         for part_number, part in enumerate(_chunks(items), start=1):
             part_suffix = (
                 f" ({part_number}/{len(_chunks(items))})"
                 if len(items) > len(part)
                 else ""
             )
-            if evidence_type == "social_profile":
+            if unrelated:
+                observations = "; ".join(
+                    _candidate_description(item)
+                    if evidence_type == "social_profile"
+                    else _service_label(item)
+                    for item in part
+                )
+                statement = (
+                    f"{source} disambiguated {len(part)} observation(s) as "
+                    f"unrelated to the authorized target: {observations}. "
+                    "DeepVault does not attribute these observations to the person."
+                )
+                title = f"Disambiguated unrelated observations — {source}{part_suffix}"
+                limitations = [
+                    "Retain the negative disambiguation with its evidence IDs.",
+                    "Re-evaluate only if new independent evidence becomes available.",
+                ]
+            elif evidence_type == "social_profile":
                 candidates = "; ".join(_candidate_description(item) for item in part)
                 statement = (
                     f"{source} returned {len(part)} automated public-profile "
@@ -466,6 +495,14 @@ def _baseline_report(
     source_status: list[dict[str, Any]] | None = None,
 ) -> InvestigationReport:
     counts = Counter(item.type for item in evidence)
+    candidate_counts = Counter(
+        item.type
+        for item in evidence
+        if item.identity_status != IdentityStatus.UNRELATED
+    )
+    unrelated_count = sum(
+        item.identity_status == IdentityStatus.UNRELATED for item in evidence
+    )
     identity_status = identity_confidence_summary(evidence)
     risk = _risk_from_counts(counts)
 
@@ -497,15 +534,20 @@ def _baseline_report(
     )
 
     summary_parts = [f"DeepVault normalized {len(evidence)} evidence item(s)."]
-    if counts["social_profile"]:
+    if candidate_counts["social_profile"]:
         summary_parts.append(
-            f"The evidence includes {counts['social_profile']} automated "
+            f"The evidence includes {candidate_counts['social_profile']} automated "
             "public-profile candidate(s)."
         )
-    if counts["service_registration"]:
+    if candidate_counts["service_registration"]:
         summary_parts.append(
-            f"It also includes {counts['service_registration']} possible "
+            f"It also includes {candidate_counts['service_registration']} possible "
             "service-registration signal(s)."
+        )
+    if unrelated_count:
+        summary_parts.append(
+            f"{unrelated_count} observation(s) were explicitly disambiguated as "
+            "unrelated and are not attributed to the person."
         )
     if counts["breach"]:
         summary_parts.append(
@@ -622,13 +664,13 @@ def _baseline_report(
     recommendations = [
         "Document source access dates and analyst decisions in the case record.",
     ]
-    if counts["social_profile"]:
+    if candidate_counts["social_profile"]:
         recommendations.append(
             "Review candidate pages manually and require matching public attributes "
             "such as name, avatar, employer, location, or linked domains before "
             "associating a profile with the person."
         )
-    if counts["service_registration"]:
+    if candidate_counts["service_registration"]:
         recommendations.append(
             "Verify service-registration signals only through the subject's own "
             "account and privacy controls; do not attempt third-party login or "
@@ -820,7 +862,11 @@ def _llm_payload(
         "evidence": safe_evidence,
         "baseline_report": baseline.model_dump(
             mode="json",
-            exclude={"evidence_ledger"},
+            exclude={
+                "evidence_ledger",
+                "identity_graph",
+                "temporal_comparison",
+            },
         ),
         "rules": {
             "evidence_only": True,
@@ -831,7 +877,77 @@ def _llm_payload(
     }
 
 
-def _validate_references(report: InvestigationReport, evidence: list[Evidence]) -> None:
+def _successful_coverage_sources(
+    source_status: list[dict[str, Any]] | None,
+) -> set[str]:
+    return {
+        str(item.get("source") or "").strip().casefold()
+        for item in source_status or []
+        if str(item.get("status") or "").strip().casefold()
+        in {"evidence_collected", "no_results"}
+        and not str(item.get("reason_code") or "").strip()
+    }
+
+
+def _gate_not_observed_by_coverage(
+    comparison: TemporalComparison,
+    source_status: list[dict[str, Any]] | None,
+) -> TemporalComparison:
+    """Suppress absence-like deltas when current source coverage was incomplete."""
+    successful_sources = _successful_coverage_sources(source_status)
+    kept = [
+        item
+        for item in comparison.not_observed
+        if successful_sources.intersection(item.previous_sources)
+    ]
+    suppressed = len(comparison.not_observed) - len(kept)
+    if not suppressed:
+        return comparison
+    counts = comparison.counts.model_copy(
+        update={"not_observed": len(kept)}
+    )
+    note = (
+        f"{comparison.scope_note} DeepVault omitted {suppressed} possible "
+        "not-observed difference(s) because the current run lacked successful "
+        "coverage for the relevant source."
+    )
+    return comparison.model_copy(
+        update={
+            "counts": counts,
+            "not_observed": kept,
+            "scope_note": note,
+        }
+    )
+
+
+def _with_deterministic_analysis(
+    report: InvestigationReport,
+    *,
+    baseline: InvestigationReport,
+) -> InvestigationReport:
+    """Restore local analysis that an external model may neither add nor erase."""
+    return report.model_copy(
+        update={
+            "evidence_ledger": baseline.evidence_ledger,
+            "identity_graph": baseline.identity_graph,
+            "temporal_comparison": baseline.temporal_comparison,
+            "timeline": baseline.timeline,
+            "source_coverage": baseline.source_coverage,
+            "recommendations": baseline.recommendations,
+            "limitations": list(
+                dict.fromkeys([*baseline.limitations, *report.limitations])
+            ),
+            "methodology": baseline.methodology,
+        }
+    )
+
+
+def _validate_references(
+    report: InvestigationReport,
+    evidence: list[Evidence],
+    *,
+    previous_evidence: list[Evidence] | None = None,
+) -> None:
     valid_ids = {item.id for item in evidence}
     for finding in report.findings:
         invalid = set(finding.evidence_ids) - valid_ids
@@ -851,6 +967,56 @@ def _validate_references(report: InvestigationReport, evidence: list[Evidence]) 
         raise ValueError(
             f"Executive summary contains unknown evidence IDs: {sorted(invalid_summary)}"
         )
+
+    graph: IdentityGraph | None = report.identity_graph
+    if graph is not None:
+        graph_ids = {item.id for item in graph.evidence_index}
+        invalid_graph_index = graph_ids - valid_ids
+        if invalid_graph_index:
+            raise ValueError(
+                "Identity graph contains unknown evidence IDs: "
+                f"{sorted(invalid_graph_index)}"
+            )
+        for node in graph.nodes:
+            invalid = set(node.evidence_ids) - valid_ids
+            if invalid:
+                raise ValueError(
+                    f"Identity graph node contains unknown evidence IDs: "
+                    f"{sorted(invalid)}"
+                )
+        for item in [*graph.edges, *graph.hypotheses, *graph.pivots]:
+            invalid = set(item.evidence_ids) - valid_ids
+            if invalid:
+                raise ValueError(
+                    "Identity analysis contains unknown evidence IDs: "
+                    f"{sorted(invalid)}"
+                )
+
+    comparison = report.temporal_comparison
+    if comparison is not None:
+        valid_previous_ids = {item.id for item in previous_evidence or []}
+        for item in [
+            *comparison.added,
+            *comparison.not_observed,
+            *comparison.persisting,
+            *comparison.changed,
+        ]:
+            if (
+                item.current_evidence_id is not None
+                and item.current_evidence_id not in valid_ids
+            ):
+                raise ValueError(
+                    "Temporal comparison contains an unknown current evidence ID: "
+                    f"{item.current_evidence_id}"
+                )
+            if (
+                item.previous_evidence_id is not None
+                and item.previous_evidence_id not in valid_previous_ids
+            ):
+                raise ValueError(
+                    "Temporal comparison contains an unknown previous evidence ID: "
+                    f"{item.previous_evidence_id}"
+                )
 
 
 def _provider(name: str) -> BaseReportProvider:
@@ -930,13 +1096,84 @@ def _consensus(
 
 class PersonReportGenerator:
     async def generate(
-        self, *, target: dict[str, Any], artifacts: list[Any]
+        self,
+        *,
+        target: dict[str, Any],
+        artifacts: list[Any],
+        current_case_id: str | None = None,
+        previous_case_id: str | None = None,
+        previous_evidence: list[Evidence] | None = None,
     ) -> InvestigationReport:
         normalized = [_artifact_to_evidence(artifact) for artifact in artifacts]
         correlated = correlate_evidence(normalized)
         baseline = _baseline_report(
             correlated,
             source_status=target.get("_source_status"),
+        )
+        graph_context = {
+            **target,
+            **({"case_id": current_case_id} if current_case_id else {}),
+        }
+        identity_graph = build_identity_graph(correlated, graph_context)
+        temporal_comparison = None
+        if previous_case_id and previous_evidence is not None:
+            temporal_comparison = compare_evidence_snapshots(
+                previous_evidence,
+                correlated,
+                previous_case_id=previous_case_id,
+                current_case_id=current_case_id,
+            )
+            temporal_comparison = _gate_not_observed_by_coverage(
+                temporal_comparison,
+                target.get("_source_status"),
+            )
+            if not target.get("email") and target.get("username"):
+                temporal_comparison = temporal_comparison.model_copy(
+                    update={
+                        "scope_note": (
+                            f"{temporal_comparison.scope_note} The baseline was "
+                            "matched by normalized name and username because no "
+                            "email was supplied; shared or recycled usernames can "
+                            "make that comparison ambiguous."
+                        )
+                    }
+                )
+        baseline = baseline.model_copy(
+            update={
+                "identity_graph": identity_graph,
+                "temporal_comparison": temporal_comparison,
+                "methodology": baseline.methodology
+                + [
+                    "Build a case-local identity graph whose relationships, "
+                    "hypotheses, and manual pivots cite the normalized evidence "
+                    "ledger.",
+                    "Do not execute graph pivots automatically or create new "
+                    "identifiers from similarity heuristics.",
+                ]
+                + (
+                    [
+                        "Compare stable evidence fingerprints with the latest "
+                        "comparable authorized case while keeping previous and "
+                        "current evidence ID namespaces separate."
+                    ]
+                    if temporal_comparison is not None
+                    else []
+                ),
+                "limitations": baseline.limitations
+                + (
+                    [
+                        "A not-observed temporal item is a collection difference, "
+                        "not proof that an account or fact disappeared."
+                    ]
+                    if temporal_comparison is not None
+                    else []
+                ),
+            }
+        )
+        _validate_references(
+            baseline,
+            correlated,
+            previous_evidence=previous_evidence,
         )
 
         provider_names = [
@@ -955,7 +1192,15 @@ class PersonReportGenerator:
             for name in provider_names:
                 try:
                     report = await _provider(name).generate(payload)
-                    _validate_references(report, correlated)
+                    report = _with_deterministic_analysis(
+                        report,
+                        baseline=baseline,
+                    )
+                    _validate_references(
+                        report,
+                        correlated,
+                        previous_evidence=previous_evidence,
+                    )
                     reports.append(report)
                 except Exception as exc:
                     logger.warning(
@@ -967,8 +1212,9 @@ class PersonReportGenerator:
                 return _consensus(reports, baseline)
             if not reports:
                 return baseline
-            return reports[0].model_copy(
-                update={"evidence_ledger": baseline.evidence_ledger}
+            return _with_deterministic_analysis(
+                reports[0],
+                baseline=baseline,
             )
         except Exception as exc:
             logger.warning(

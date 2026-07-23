@@ -15,6 +15,31 @@ from reporting.person_report import _baseline_report  # noqa: E402
 
 
 class TruthfulBaselineReportTests(unittest.TestCase):
+    def test_unrelated_profile_is_reported_as_negative_disambiguation(self):
+        evidence = Evidence(
+            id="EVID-UNRELATED",
+            type="social_profile",
+            value="https://example.test/not-alice",
+            source="brave",
+            confidence=0.91,
+            reliability=SourceReliability.HIGH,
+            identity_status=IdentityStatus.UNRELATED,
+        )
+
+        report = _baseline_report([evidence])
+
+        self.assertEqual(report.identity_confidence, "unrelated")
+        self.assertEqual(len(report.findings), 1)
+        self.assertIn("Disambiguated unrelated", report.findings[0].title)
+        self.assertIn(
+            "does not attribute",
+            report.findings[0].statement,
+        )
+        self.assertIn(
+            "explicitly disambiguated as unrelated",
+            report.executive_summary,
+        )
+
     def test_groups_candidates_and_does_not_invent_a_person_timeline(self):
         observed_at = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
         evidence = [

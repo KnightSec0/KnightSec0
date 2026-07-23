@@ -106,6 +106,29 @@ class CorrelationConfidenceTests(unittest.TestCase):
             identity_confidence_summary(evidence), IdentityStatus.POSSIBLE
         )
 
+    def test_explicit_unrelated_status_survives_correlation(self):
+        correlated = correlate_evidence(
+            [
+                Evidence(
+                    type="social_profile",
+                    value="https://example.test/not-alice",
+                    source="brave",
+                    confidence=0.91,
+                    reliability=SourceReliability.HIGH,
+                    identity_status=IdentityStatus.UNRELATED,
+                )
+            ]
+        )
+
+        self.assertEqual(
+            correlated[0].identity_status,
+            IdentityStatus.UNRELATED,
+        )
+        self.assertEqual(
+            identity_confidence_summary(correlated),
+            IdentityStatus.UNRELATED,
+        )
+
     def test_identity_summary_prefers_defensible_cross_source_status(self):
         uncorroborated = Evidence(
             type="github_profile",

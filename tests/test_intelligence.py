@@ -17,12 +17,13 @@ from intelligence.models import InvestigationTarget
 from intelligence.policy import CollectionPolicy
 from intelligence.redaction import redact_sensitive
 from investigators.person_intelligence import PersonIntelligenceInvestigator
-from main import app, _running_task_is_stale
+from main import app, _previous_report_evidence, _running_task_is_stale
 from reporting.person_report import (
     PersonReportGenerator,
     _baseline_report,
     _consensus,
     _llm_payload,
+    _with_deterministic_analysis,
 )
 from reporting.schemas import Finding, InvestigationReport, RiskLevel
 
@@ -34,6 +35,21 @@ class FakeArtifact:
         self.identifier_value = value
         self.context = context or {}
         self.confidence = confidence
+
+
+def comparison_metadata(**overrides):
+    metadata = {
+        "compare_previous_cases": True,
+        "authorization_confirmed": True,
+        "authorization_reference": "AUTH-COMPARE-1",
+        "authorization_expires_at": (
+            datetime.now(timezone.utc) + timedelta(hours=2)
+        ).isoformat(),
+        "lawful_purpose": "Authorized repeat self-assessment",
+        "permitted_sources": ["github", "sherlock"],
+    }
+    metadata.update(overrides)
+    return metadata
 
 
 class IntelligenceTests(unittest.TestCase):
@@ -106,6 +122,8 @@ class IntelligenceTests(unittest.TestCase):
         serialized = report.model_dump_json()
         self.assertNotIn("must-not-survive", serialized)
         self.assertEqual(len(report.evidence_ledger), 1)
+        self.assertIsNotNone(report.identity_graph)
+        self.assertTrue(report.identity_graph.edges)
         self.assertEqual(
             report.evidence_ledger[0]["id"],
             report.findings[0].evidence_ids[0],
@@ -114,6 +132,149 @@ class IntelligenceTests(unittest.TestCase):
         self.assertTrue(valid_ids)
         for event in report.timeline:
             self.assertTrue(set(event.evidence_ids).issubset(valid_ids))
+        for item in [
+            *report.identity_graph.edges,
+            *report.identity_graph.hypotheses,
+            *report.identity_graph.pivots,
+        ]:
+            self.assertTrue(set(item.evidence_ids).issubset(valid_ids))
+
+    def test_report_gates_not_observed_for_partial_failed_coverage(self):
+        previous = Evidence(
+            id="EVID-OLD",
+            type="social_profile",
+            value="https://example.test/alice",
+            source="sherlock",
+        )
+        report = asyncio.run(
+            PersonReportGenerator().generate(
+                target={
+                    "name": "Alice Example",
+                    "_source_status": [
+                        {
+                            "source": "sherlock",
+                            "status": "evidence_collected",
+                            "evidence_count": 1,
+                            "reason_code": "timeout",
+                        }
+                    ],
+                },
+                artifacts=[],
+                current_case_id="CURRENT",
+                previous_case_id="PREVIOUS",
+                previous_evidence=[previous],
+            )
+        )
+        comparison = report.temporal_comparison
+        self.assertIsNotNone(comparison)
+        self.assertEqual(comparison.scope.previous_case_id, "PREVIOUS")
+        self.assertEqual(comparison.scope.current_case_id, "CURRENT")
+        self.assertEqual(comparison.counts.not_observed, 0)
+        self.assertEqual(comparison.not_observed, [])
+        self.assertIn("omitted 1", comparison.scope_note)
+
+    def test_successful_no_results_keeps_not_observed_with_username_caveat(self):
+        previous = Evidence(
+            id="EVID-OLD",
+            type="social_profile",
+            value="https://example.test/alice",
+            source="sherlock",
+        )
+        report = asyncio.run(
+            PersonReportGenerator().generate(
+                target={
+                    "name": "Alice Example",
+                    "username": "alice",
+                    "_source_status": [
+                        {
+                            "source": "sherlock",
+                            "status": "no_results",
+                            "evidence_count": 0,
+                        }
+                    ],
+                },
+                artifacts=[],
+                current_case_id="CURRENT",
+                previous_case_id="PREVIOUS",
+                previous_evidence=[previous],
+            )
+        )
+        comparison = report.temporal_comparison
+        self.assertEqual(comparison.counts.not_observed, 1)
+        self.assertEqual(
+            comparison.not_observed[0].previous_evidence_id,
+            "EVID-OLD",
+        )
+        self.assertIn("matched by normalized name and username", comparison.scope_note)
+
+    def test_external_report_cannot_replace_deterministic_analysis(self):
+        evidence = Evidence(
+            id="EVID-GRAPH",
+            type="github_profile",
+            value="https://github.com/alice",
+            source="github",
+        )
+        baseline = asyncio.run(
+            PersonReportGenerator().generate(
+                target={"name": "Alice Example"},
+                artifacts=[
+                    FakeArtifact(
+                        "github",
+                        "github_profile",
+                        evidence.value,
+                        {"evidence": evidence.model_dump(mode="json")},
+                    )
+                ],
+            )
+        )
+        external = baseline.model_copy(
+            update={
+                "identity_graph": None,
+                "temporal_comparison": None,
+                "evidence_ledger": [],
+            }
+        )
+        restored = _with_deterministic_analysis(external, baseline=baseline)
+        self.assertEqual(restored.identity_graph, baseline.identity_graph)
+        self.assertEqual(restored.evidence_ledger, baseline.evidence_ledger)
+
+    def test_report_graph_is_case_local_and_keeps_supplied_context(self):
+        artifact = FakeArtifact(
+            "github",
+            "github_profile",
+            "https://github.com/alice",
+        )
+        target = {
+            "name": "Alice Example",
+            "employer": "Example Corp",
+            "location": "Paris",
+        }
+        first = asyncio.run(
+            PersonReportGenerator().generate(
+                target=target,
+                artifacts=[artifact],
+                current_case_id="CASE-ONE",
+            )
+        )
+        second = asyncio.run(
+            PersonReportGenerator().generate(
+                target=target,
+                artifacts=[artifact],
+                current_case_id="CASE-TWO",
+            )
+        )
+
+        self.assertNotEqual(
+            first.identity_graph.target_node_id,
+            second.identity_graph.target_node_id,
+        )
+        first_target = next(
+            node
+            for node in first.identity_graph.nodes
+            if node.id == first.identity_graph.target_node_id
+        )
+        self.assertEqual(first_target.attributes["employer"], "Example Corp")
+        self.assertEqual(first_target.attributes["location"], "Paris")
 
     def test_report_includes_selected_sources_without_evidence(self):
         report = asyncio.run(
@@ -164,6 +325,8 @@ class IntelligenceTests(unittest.TestCase):
         self.assertNotIn("haveibeenpwned.com/account/alice", serialized)
         self.assertIn("Example Breach", serialized)
         self.assertNotIn("evidence_ledger", payload["baseline_report"])
+        self.assertNotIn("identity_graph", payload["baseline_report"])
+        self.assertNotIn("temporal_comparison", payload["baseline_report"])
         self.assertEqual(payload["evidence"][0]["id"], "EVID-ABC123")
 
     def test_running_task_staleness_uses_progress_heartbeat(self):
@@ -187,6 +350,145 @@ class IntelligenceTests(unittest.TestCase):
         )
         self.assertFalse(_running_task_is_stale(recent))
         self.assertTrue(_running_task_is_stale(stale))
+
+    def test_previous_report_evidence_requires_a_matching_identifier(self):
+        class SessionThatMustNotRun:
+            async def execute(self, _statement):
+                raise AssertionError("A history query should not run")
+
+        investigation = SimpleNamespace(
+            id="CURRENT",
+            target_name="Alice Example",
+            target_email=None,
+            target_username=None,
+            case_metadata=comparison_metadata(),
+        )
+        case_id, evidence = asyncio.run(
+            _previous_report_evidence(
+                SessionThatMustNotRun(),
+                investigation,
+            )
+        )
+        self.assertIsNone(case_id)
+        self.assertEqual(evidence, [])
+
+    def test_previous_report_evidence_requires_explicit_comparison_opt_in(self):
+        class SessionThatMustNotRun:
+            async def execute(self, _statement):
+                raise AssertionError("A history query should not run")
+
+        investigation = SimpleNamespace(
+            id="CURRENT",
+            target_name="Alice Example",
+            target_email="alice@example.test",
+            target_username="alice",
+            case_metadata=comparison_metadata(compare_previous_cases=False),
+        )
+        case_id, evidence = asyncio.run(
+            _previous_report_evidence(
+                SessionThatMustNotRun(),
+                investigation,
+            )
+        )
+        self.assertIsNone(case_id)
+        self.assertEqual(evidence, [])
+
+    def test_previous_report_evidence_rejects_a_partially_malformed_ledger(self):
+        previous_evidence = Evidence(
+            id="EVID-PREVIOUS",
+            type="social_profile",
+            value="https://example.test/alice",
+            source="sherlock",
+            metadata={"platform": "Example", "password": "must-not-survive"},
+        ).model_dump(mode="json")
+
+        class FakeResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return [
+                    SimpleNamespace(
+                        id="INCOMPATIBLE-CASE",
+                        case_metadata=comparison_metadata(
+                            authorization_reference="OTHER-AUTHORIZATION",
+                            structured_report={
+                                "evidence_ledger": [previous_evidence]
+                            },
+                        ),
+                    ),
+                    SimpleNamespace(
+                        id="PREVIOUS-CASE",
+                        case_metadata=comparison_metadata(
+                            structured_report={
+                                "evidence_ledger": [
+                                    previous_evidence,
+                                    {"not": "evidence"},
+                                ]
+                            }
+                        ),
+                    )
+                ]
+
+        class FakeSession:
+            async def execute(self, _statement):
+                return FakeResult()
+
+        investigation = SimpleNamespace(
+            id="CURRENT-CASE",
+            target_name="Alice Example",
+            target_email="alice@example.test",
+            target_username=None,
+            case_metadata=comparison_metadata(),
+        )
+        case_id, evidence = asyncio.run(
+            _previous_report_evidence(FakeSession(), investigation)
+        )
+        self.assertIsNone(case_id)
+        self.assertEqual(evidence, [])
+
+    def test_previous_report_evidence_loads_a_valid_redacted_ledger(self):
+        previous_evidence = Evidence(
+            id="EVID-PREVIOUS",
+            type="social_profile",
+            value="https://example.test/alice",
+            source="sherlock",
+            metadata={"platform": "Example", "password": "must-not-survive"},
+        ).model_dump(mode="json")
+
+        class FakeResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return [
+                    SimpleNamespace(
+                        id="PREVIOUS-CASE",
+                        case_metadata=comparison_metadata(
+                            structured_report={
+                                "evidence_ledger": [previous_evidence]
+                            }
+                        ),
+                    )
+                ]
+
+        class FakeSession:
+            async def execute(self, _statement):
+                return FakeResult()
+
+        investigation = SimpleNamespace(
+            id="CURRENT-CASE",
+            target_name="Alice Example",
+            target_email="alice@example.test",
+            target_username=None,
+            case_metadata=comparison_metadata(),
+        )
+        case_id, evidence = asyncio.run(
+            _previous_report_evidence(FakeSession(), investigation)
+        )
+        self.assertEqual(case_id, "PREVIOUS-CASE")
+        self.assertEqual([item.id for item in evidence], ["EVID-PREVIOUS"])
+        self.assertNotIn("must-not-survive", evidence[0].model_dump_json())
 
     def test_policy_requires_scoped_source(self):
         target = InvestigationTarget(
