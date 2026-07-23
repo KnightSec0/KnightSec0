@@ -26,6 +26,10 @@ _SENSITIVE_KEY_PARTS = {
 }
 
 _BEARER_PATTERN = re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]{12,}")
+_BASIC_AUTH_PATTERN = re.compile(r"(?i)basic\s+[a-z0-9+/=]{8,}")
+_QUERY_SECRET_PATTERN = re.compile(
+    r"(?i)([?&](?:api[_-]?key|access[_-]?token|key|password|secret|token)=)[^&\s]+"
+)
 _LONG_SECRET_PATTERN = re.compile(r"\b[a-zA-Z0-9_\-]{40,}\b")
 
 
@@ -56,6 +60,8 @@ def redact_sensitive(value: Any, *, max_string_length: int = 4000) -> Any:
 
     if isinstance(value, str):
         cleaned = _BEARER_PATTERN.sub("Bearer <redacted>", value)
+        cleaned = _BASIC_AUTH_PATTERN.sub("Basic <redacted>", cleaned)
+        cleaned = _QUERY_SECRET_PATTERN.sub(r"\1<redacted>", cleaned)
         cleaned = _LONG_SECRET_PATTERN.sub("<redacted-long-value>", cleaned)
         if len(cleaned) > max_string_length:
             return cleaned[:max_string_length] + "…<truncated>"

@@ -101,6 +101,10 @@ class Artifact(Base):
 _EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _USERNAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _BEARER = re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]{12,}")
+_BASIC_AUTH = re.compile(r"(?i)basic\s+[a-z0-9+/=]{8,}")
+_QUERY_SECRET = re.compile(
+    r"(?i)([?&](?:api[_-]?key|access[_-]?token|key|password|secret|token)=)[^&\s]+"
+)
 _LONG_SECRET = re.compile(r"\b[a-zA-Z0-9_-]{40,}\b")
 _SENSITIVE_KEY_PARTS = {
     "api_key",
@@ -148,9 +152,16 @@ def _redact_for_display(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_redact_for_display(item) for item in value]
     if isinstance(value, str):
+        cleaned = _QUERY_SECRET.sub(
+            r"\1<redacted>",
+            _BASIC_AUTH.sub(
+                "Basic <redacted>",
+                _BEARER.sub("Bearer <redacted>", value),
+            ),
+        )
         cleaned = _LONG_SECRET.sub(
             "<redacted-long-value>",
-            _BEARER.sub("Bearer <redacted>", value),
+            cleaned,
         )
         return cleaned[:4000] + ("…<truncated>" if len(cleaned) > 4000 else "")
     return value
@@ -504,7 +515,9 @@ async def create_investigation(payload: InvestigationCreate) -> dict[str, Any]:
             )
         except Exception as exc:
             failed_metadata = dict(metadata)
-            failed_metadata["error"] = f"Unable to queue worker task: {exc}"
+            failed_metadata["error"] = (
+                f"{type(exc).__name__}: unable to queue worker task"
+            )
             investigation.status = InvestigationStatus.FAILED
             investigation.case_metadata = failed_metadata
             await session.commit()

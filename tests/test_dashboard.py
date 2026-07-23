@@ -112,6 +112,10 @@ class DashboardReportRenderingTests(unittest.TestCase):
                     "metadata": {
                         "public_profile": {"login": "alice"},
                         "password": "must-not-survive",
+                        "error_url": (
+                            "https://provider.test/query?"
+                            "access_token=must-not-survive-either"
+                        ),
                     },
                 }
             ],
@@ -127,6 +131,7 @@ class DashboardReportRenderingTests(unittest.TestCase):
         self.assertIn("&lt;img src=x onerror=alert(1)&gt;", rendered)
         self.assertIn("Review &lt;b&gt;manually&lt;/b&gt;.", rendered)
         self.assertNotIn("must-not-survive", rendered)
+        self.assertNotIn("must-not-survive-either", rendered)
         self.assertIn("&lt;redacted&gt;", rendered)
         self.assertIn("Evidence appendix", rendered)
         self.assertGreaterEqual(rendered.count("EVID-ABC123"), 3)

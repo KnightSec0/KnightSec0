@@ -410,7 +410,8 @@ async def run_connectors(
                 return await connector.search(identifier)
             except Exception as exc:
                 return ConnectorResult(
-                    connector=connector.name, errors=[str(exc)[:500]]
+                    connector=connector.name,
+                    errors=[f"{type(exc).__name__}: connector request failed"],
                 )
 
     return await asyncio.gather(*(run(connector) for connector in connectors))

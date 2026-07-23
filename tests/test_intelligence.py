@@ -42,12 +42,18 @@ class IntelligenceTests(unittest.TestCase):
                 "password": "secret-value",
                 "nested": {"api_token": "abcdef"},
                 "raw_leak": {"hash": "deadbeef", "message_body": "private"},
+                "error": (
+                    "request failed at "
+                    "https://provider.test/query?api_key=must-not-survive"
+                ),
             }
         )
         self.assertEqual(result["username"], "alice")
         self.assertEqual(result["password"], "<redacted>")
         self.assertEqual(result["nested"]["api_token"], "<redacted>")
         self.assertEqual(result["raw_leak"], "<redacted>")
+        self.assertNotIn("must-not-survive", result["error"])
+        self.assertIn("api_key=<redacted>", result["error"])
 
     def test_independent_sources_raise_confidence(self):
         items = [

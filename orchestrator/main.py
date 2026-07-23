@@ -510,7 +510,11 @@ async def _run_investigation_pipeline(
             )
 
         except Exception as e:
-            logger.exception(f"Investigation {investigation_id} FAILED: {e}")
+            logger.error(
+                "Investigation %s FAILED (%s)",
+                investigation_id,
+                type(e).__name__,
+            )
             await session.rollback()
             inv = await session.get(Investigation, inv_uuid)
             if inv is None:
@@ -518,7 +522,7 @@ async def _run_investigation_pipeline(
             inv.status = InvestigationStatus.FAILED
             inv.case_metadata = {
                 **(inv.case_metadata or {}),
-                "error": str(e),
+                "error": f"{type(e).__name__}: investigation pipeline failed",
             }
             await _set_progress(
                 session,
@@ -718,9 +722,12 @@ async def _collect_person_intelligence(
             status["status"] = "unavailable"
         elif status["status"] == "not_queried":
             status["status"] = "no_results"
-        for error in result.errors:
-            if error:
-                logger.warning("%s: %s", result.connector, error)
+        if result.errors:
+            logger.warning(
+                "%s reported %s collection error(s)",
+                result.connector,
+                len(result.errors),
+            )
         for evidence in result.evidence:
             artifacts.append(
                 Artifact(

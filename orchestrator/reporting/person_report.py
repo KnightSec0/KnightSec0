@@ -510,7 +510,11 @@ class PersonReportGenerator:
                     _validate_references(report, correlated)
                     reports.append(report)
                 except Exception as exc:
-                    logger.warning("%s report provider failed: %s", name, exc)
+                    logger.warning(
+                        "%s report provider failed (%s)",
+                        name,
+                        type(exc).__name__,
+                    )
             if len(provider_names) > 1:
                 return _consensus(reports, baseline)
             if not reports:
@@ -519,5 +523,8 @@ class PersonReportGenerator:
                 update={"evidence_ledger": baseline.evidence_ledger}
             )
         except Exception as exc:
-            logger.warning("LLM report generation failed; using baseline: %s", exc)
+            logger.warning(
+                "LLM report generation failed; using baseline (%s)",
+                type(exc).__name__,
+            )
             return baseline
