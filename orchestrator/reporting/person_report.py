@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 import hashlib
 import logging
+import re
 from typing import Any
 
 from config import settings
@@ -115,7 +116,10 @@ def _finding_statement(item: Evidence) -> str:
     )
 
 
-def _baseline_report(evidence: list[Evidence]) -> InvestigationReport:
+def _baseline_report(
+    evidence: list[Evidence],
+    source_status: list[dict[str, Any]] | None = None,
+) -> InvestigationReport:
     counts = Counter(item.type for item in evidence)
     identity_status = identity_confidence_summary(evidence)
     risk = _risk_from_counts(counts)
@@ -149,14 +153,34 @@ def _baseline_report(evidence: list[Evidence]) -> InvestigationReport:
         )
         for item in sorted(evidence, key=lambda entry: entry.observed_at)
     ]
+    evidence_ids_by_source: dict[str, list[str]] = {}
+    for item in evidence:
+        for source in {item.source, *item.corroborated_by}:
+            evidence_ids_by_source.setdefault(source, []).append(item.id)
+    collected_counts = Counter(
+        {
+            source: len(evidence_ids)
+            for source, evidence_ids in evidence_ids_by_source.items()
+        }
+    )
+    status_by_source = {
+        str(item.get("source")): str(item.get("status") or "not_queried")
+        for item in source_status or []
+        if item.get("source")
+    }
+    coverage_sources = sorted(set(collected_counts) | set(status_by_source))
     coverage = [
         SourceCoverage(
             source=source,
-            evidence_count=count,
-            status="evidence_collected",
-            evidence_ids=[item.id for item in evidence if item.source == source],
+            evidence_count=collected_counts[source],
+            status=(
+                "evidence_collected"
+                if collected_counts[source]
+                else status_by_source.get(source, "no_results")
+            ),
+            evidence_ids=evidence_ids_by_source.get(source, []),
         )
-        for source, count in sorted(Counter(item.source for item in evidence).items())
+        for source in coverage_sources
     ]
     contradictions: list[Contradiction] = []
     by_type: dict[str, list[Evidence]] = {}
@@ -185,6 +209,7 @@ def _baseline_report(evidence: list[Evidence]) -> InvestigationReport:
         timeline=timeline,
         contradictions=contradictions,
         source_coverage=coverage,
+        evidence_ledger=[item.safe_dump() for item in evidence],
         recommendations=[
             "Manually verify possible identity matches using independent public attributes.",
             "Prioritize remediation for verified breach exposure and rotate affected credentials outside DeepVault.",
@@ -207,8 +232,121 @@ def _baseline_report(evidence: list[Evidence]) -> InvestigationReport:
 
 
 def _pseudonymize(value: str, category: str) -> str:
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
-    return f"[{category.upper()}-{digest}]"
+    digest = hashlib.sha256(value.strip().casefold().encode("utf-8")).hexdigest()[:10]
+    label = re.sub(r"[^A-Z0-9]+", "_", category.upper()).strip("_") or "IDENTIFIER"
+    return f"[{label}-{digest}]"
+
+
+_EXTERNAL_IDENTIFIER_KEYS = {
+    "address",
+    "aliases",
+    "bio",
+    "blog",
+    "company",
+    "description",
+    "discovered_emails",
+    "discovered_phones",
+    "discovered_usernames",
+    "domain",
+    "domains",
+    "email",
+    "emails",
+    "employer",
+    "hostnames",
+    "identifier",
+    "location",
+    "login",
+    "name",
+    "names",
+    "org",
+    "phone",
+    "phones",
+    "profile",
+    "query",
+    "source_url",
+    "target",
+    "title",
+    "url",
+    "username",
+    "usernames",
+    "value",
+}
+_EMAIL_VALUE = re.compile(r"(?i)[^\s@]+@[^\s@]+\.[^\s@]+")
+_URL_VALUE = re.compile(r"(?i)^https?://")
+
+
+def _target_identifier_values(target: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in (
+        "name",
+        "email",
+        "phone",
+        "username",
+        "employer",
+        "location",
+    ):
+        value = target.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    for key in (
+        "aliases",
+        "domains",
+        "discovered_emails",
+        "discovered_phones",
+        "discovered_usernames",
+    ):
+        value = target.get(key)
+        if isinstance(value, list):
+            values.extend(str(item).strip() for item in value if str(item).strip())
+    return sorted(set(values), key=len, reverse=True)
+
+
+def _pseudonymize_external_payload(
+    value: Any,
+    *,
+    key: str = "",
+    target_identifiers: list[str],
+) -> Any:
+    """Remove target identifiers from payloads sent to external LLMs."""
+    normalized_key = key.strip().lower()
+    if isinstance(value, dict):
+        return {
+            str(item_key): _pseudonymize_external_payload(
+                item,
+                key=str(item_key),
+                target_identifiers=target_identifiers,
+            )
+            for item_key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _pseudonymize_external_payload(
+                item,
+                key=normalized_key,
+                target_identifiers=target_identifiers,
+            )
+            for item in value
+        ]
+    if not isinstance(value, str) or not value:
+        return value
+    if (
+        normalized_key in _EXTERNAL_IDENTIFIER_KEYS
+        or _EMAIL_VALUE.search(value)
+        or _URL_VALUE.match(value)
+    ):
+        return _pseudonymize(value, normalized_key or "identifier")
+
+    scrubbed = value
+    for identifier in target_identifiers:
+        if identifier.casefold() not in scrubbed.casefold():
+            continue
+        scrubbed = re.sub(
+            re.escape(identifier),
+            _pseudonymize(identifier, normalized_key or "identifier"),
+            scrubbed,
+            flags=re.IGNORECASE,
+        )
+    return scrubbed
 
 
 def _llm_payload(
@@ -217,20 +355,25 @@ def _llm_payload(
     baseline: InvestigationReport,
 ) -> dict[str, Any]:
     safe_target = redact_sensitive(target)
+    safe_evidence = [item.safe_dump() for item in evidence]
     if not settings.llm_include_identifiers:
-        for key in ("email", "phone", "username", "name"):
-            value = safe_target.get(key)
-            if isinstance(value, str) and value:
-                safe_target[key] = _pseudonymize(value, key)
-        for key in ("aliases", "discovered_emails", "discovered_usernames"):
-            values = safe_target.get(key)
-            if isinstance(values, list):
-                safe_target[key] = [_pseudonymize(str(value), key) for value in values]
+        target_identifiers = _target_identifier_values(safe_target)
+        safe_target = _pseudonymize_external_payload(
+            safe_target,
+            target_identifiers=target_identifiers,
+        )
+        safe_evidence = _pseudonymize_external_payload(
+            safe_evidence,
+            target_identifiers=target_identifiers,
+        )
 
     return {
         "target": safe_target,
-        "evidence": [item.safe_dump() for item in evidence],
-        "baseline_report": baseline.model_dump(mode="json"),
+        "evidence": safe_evidence,
+        "baseline_report": baseline.model_dump(
+            mode="json",
+            exclude={"evidence_ledger"},
+        ),
         "rules": {
             "evidence_only": True,
             "all_findings_require_evidence_ids": True,
@@ -343,7 +486,10 @@ class PersonReportGenerator:
     ) -> InvestigationReport:
         normalized = [_artifact_to_evidence(artifact) for artifact in artifacts]
         correlated = correlate_evidence(normalized)
-        baseline = _baseline_report(correlated)
+        baseline = _baseline_report(
+            correlated,
+            source_status=target.get("_source_status"),
+        )
 
         provider_names = [
             item.strip().lower()
@@ -367,7 +513,11 @@ class PersonReportGenerator:
                     logger.warning("%s report provider failed: %s", name, exc)
             if len(provider_names) > 1:
                 return _consensus(reports, baseline)
-            return reports[0] if reports else baseline
+            if not reports:
+                return baseline
+            return reports[0].model_copy(
+                update={"evidence_ledger": baseline.evidence_ledger}
+            )
         except Exception as exc:
             logger.warning("LLM report generation failed; using baseline: %s", exc)
             return baseline

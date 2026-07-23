@@ -81,16 +81,70 @@ enrichment additionally requires:
 
 ```env
 ALLOW_INFRASTRUCTURE_ENRICHMENT=true
-AUTHORIZATION_REFERENCE=CASE-2025-001
 ```
 
-The target IP must be a literal authorized IP. DeepVault does not perform broad
-Shodan or Censys discovery from a person's name or email.
+The case itself must contain a written authorization reference, infrastructure
+consent, and literal authorized IPs. DeepVault does not perform broad Shodan or
+Censys discovery from a person's name or email.
 
 Do not put API keys in targets, evidence, logs or reports. Store them only in
 environment variables or a secrets manager. Raw breach records, passwords,
 hashes, tokens, cookies, private communications and leaked credentials are
 redacted before persistence or model processing.
+
+## Local dashboard
+
+Start the local stack from the repository root:
+
+```bash
+cp .env.example .env
+# Add optional provider keys to .env, never to the web form.
+docker compose up --build
+```
+
+Open **http://127.0.0.1:8080**. The dashboard is intentionally bound to
+localhost. Do not change the bind address unless you have separately designed
+authentication, TLS, network access controls, and data-retention safeguards.
+
+The form enforces the minimum collection policy:
+
+- written authorization must be confirmed;
+- the authorization reference and lawful purpose are required;
+- the authorization expiry must be in the future;
+- at least one username or email must be provided; and
+- every selected connector must appear in the per-case source allowlist.
+
+For a consent-based self-test, enter only your own public identifiers and use a
+case reference such as `SELF-TEST-001`. Start with GitHub, Sherlock, Maigret,
+and Holehe, which do not require paid API subscriptions. GitHub may use an
+optional token to raise public API limits. HIBP, Hunter, Brave, Shodan, and
+Censys require provider credentials; SpiderFoot requires a configured local or
+authorized server.
+
+The active case view polls the local API every few seconds and displays the
+worker's current stage, source status, and safe evidence summaries as collection
+finishes. Completed cases expose two report downloads:
+
+```text
+GET /api/investigations/{id}/report.json
+GET /api/investigations/{id}/report.html
+```
+
+JSON is intended for further authorized analysis. HTML is a standalone,
+printable report and can be saved as PDF from the browser. Both formats include
+a redacted evidence appendix with the source, observation, confidence, URL, and
+metadata behind each cited evidence ID. A report is unavailable until
+processing finishes. Treat all results as leads until the cited evidence IDs
+and identity context have been reviewed by an analyst.
+
+When `LLM_INCLUDE_IDENTIFIERS=false` (the default), DeepVault pseudonymizes
+identifiers in the target and evidence payload before contacting an external
+LLM provider. The local stored report and evidence appendix remain auditable.
+
+API keys and other secrets belong in `.env` or a secrets manager only. Never
+put passwords, API tokens, session cookies, private communications, raw breach
+records, or leaked credentials into form fields: form data and reports may be
+persisted.
 
 ## Connector configuration
 
@@ -142,7 +196,7 @@ safe and prevents a name alone from triggering global collection.
 Configure the deployment-wide ceiling separately:
 
 ```env
-PERSON_OSINT_SOURCES=github,hibp,hunter,brave,sherlock,maigret,holehe
+PERSON_OSINT_SOURCES=github,hibp,hunter,brave,sherlock,maigret,holehe,spiderfoot,shodan,censys
 ```
 
 The case allowlist can only narrow that ceiling. SpiderFoot, Shodan and Censys

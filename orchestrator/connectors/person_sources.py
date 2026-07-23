@@ -262,10 +262,15 @@ class SpiderFootConnector(HTTPConnector):
         )
 
 
-def _authorized_ip(identifier: str) -> str:
-    if not settings.allow_infrastructure_enrichment:
+def _authorized_ip(
+    identifier: str,
+    *,
+    infrastructure_enrichment: bool,
+    authorization_reference: str | None,
+) -> str:
+    if not infrastructure_enrichment:
         raise PermissionError("ALLOW_INFRASTRUCTURE_ENRICHMENT is not enabled")
-    if not settings.authorization_reference:
+    if not authorization_reference:
         raise PermissionError("AUTHORIZATION_REFERENCE is required")
     return str(ipaddress.ip_address(identifier))
 
@@ -274,8 +279,27 @@ class ShodanConnector(HTTPConnector):
     name = "shodan"
     identifier_type = "authorized_ip"
 
+    def __init__(
+        self,
+        *,
+        authorization_reference: str | None = None,
+        infrastructure_enrichment: bool | None = None,
+    ) -> None:
+        self.authorization_reference = (
+            authorization_reference or settings.authorization_reference
+        )
+        self.infrastructure_enrichment = (
+            settings.allow_infrastructure_enrichment
+            if infrastructure_enrichment is None
+            else infrastructure_enrichment
+        )
+
     async def search(self, identifier: str) -> ConnectorResult:
-        ip = _authorized_ip(identifier)
+        ip = _authorized_ip(
+            identifier,
+            infrastructure_enrichment=self.infrastructure_enrichment,
+            authorization_reference=self.authorization_reference,
+        )
         if not settings.shodan_api_key:
             return ConnectorResult(
                 connector=self.name, errors=["SHODAN_API_KEY is not configured"]
@@ -296,7 +320,7 @@ class ShodanConnector(HTTPConnector):
                     confidence=0.8,
                     reliability=SourceReliability.HIGH,
                     metadata={
-                        "authorization_reference": settings.authorization_reference,
+                        "authorization_reference": self.authorization_reference,
                         "hostnames": data.get("hostnames", []),
                         "domains": data.get("domains", []),
                         "ports": data.get("ports", []),
@@ -313,8 +337,27 @@ class CensysConnector(HTTPConnector):
     name = "censys"
     identifier_type = "authorized_ip"
 
+    def __init__(
+        self,
+        *,
+        authorization_reference: str | None = None,
+        infrastructure_enrichment: bool | None = None,
+    ) -> None:
+        self.authorization_reference = (
+            authorization_reference or settings.authorization_reference
+        )
+        self.infrastructure_enrichment = (
+            settings.allow_infrastructure_enrichment
+            if infrastructure_enrichment is None
+            else infrastructure_enrichment
+        )
+
     async def search(self, identifier: str) -> ConnectorResult:
-        ip = _authorized_ip(identifier)
+        ip = _authorized_ip(
+            identifier,
+            infrastructure_enrichment=self.infrastructure_enrichment,
+            authorization_reference=self.authorization_reference,
+        )
         if not settings.censys_api_id or not settings.censys_api_secret:
             return ConnectorResult(
                 connector=self.name, errors=["Censys credentials are not configured"]
@@ -339,7 +382,7 @@ class CensysConnector(HTTPConnector):
                     confidence=0.8,
                     reliability=SourceReliability.HIGH,
                     metadata={
-                        "authorization_reference": settings.authorization_reference,
+                        "authorization_reference": self.authorization_reference,
                         "names": result.get("dns", {}).get("names", []),
                         "service_ports": sorted(
                             {

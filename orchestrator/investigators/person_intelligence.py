@@ -41,8 +41,14 @@ class PersonIntelligenceInvestigator:
                 HunterConnector(),
                 BravePersonSearchConnector(),
                 SpiderFootConnector(),
-                ShodanConnector(),
-                CensysConnector(),
+                ShodanConnector(
+                    authorization_reference=policy.authorization_reference,
+                    infrastructure_enrichment=policy.infrastructure_enrichment,
+                ),
+                CensysConnector(
+                    authorization_reference=policy.authorization_reference,
+                    infrastructure_enrichment=policy.infrastructure_enrichment,
+                ),
                 SherlockConnector(),
                 MaigretConnector(),
                 HoleheConnector(),
@@ -119,10 +125,15 @@ class PersonIntelligenceInvestigator:
                         source=request.source,
                         identifier=request.identifier,
                     )
-                except Exception as exc:
+                except PermissionError as exc:
                     result = ConnectorResult(
                         connector=request.source,
                         errors=[str(exc)[:500]],
+                    )
+                except Exception as exc:
+                    result = ConnectorResult(
+                        connector=request.source,
+                        errors=[f"{type(exc).__name__}: connector request failed"],
                     )
                 return request, result
 

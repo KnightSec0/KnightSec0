@@ -1,8 +1,10 @@
 import asyncio
+import json
 import os
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "orchestrator"))
@@ -13,7 +15,13 @@ from intelligence.models import InvestigationTarget
 from intelligence.policy import CollectionPolicy
 from intelligence.redaction import redact_sensitive
 from investigators.person_intelligence import PersonIntelligenceInvestigator
-from reporting.person_report import PersonReportGenerator, _consensus
+from main import _running_task_is_stale
+from reporting.person_report import (
+    PersonReportGenerator,
+    _baseline_report,
+    _consensus,
+    _llm_payload,
+)
 from reporting.schemas import Finding, InvestigationReport, RiskLevel
 
 
@@ -84,10 +92,88 @@ class IntelligenceTests(unittest.TestCase):
         self.assertTrue(report.findings[0].evidence_ids)
         serialized = report.model_dump_json()
         self.assertNotIn("must-not-survive", serialized)
+        self.assertEqual(len(report.evidence_ledger), 1)
+        self.assertEqual(
+            report.evidence_ledger[0]["id"],
+            report.findings[0].evidence_ids[0],
+        )
         valid_ids = {finding.evidence_ids[0] for finding in report.findings}
         self.assertTrue(valid_ids)
         for event in report.timeline:
             self.assertTrue(set(event.evidence_ids).issubset(valid_ids))
+
+    def test_report_includes_selected_sources_without_evidence(self):
+        report = asyncio.run(
+            PersonReportGenerator().generate(
+                target={
+                    "name": "Alice Example",
+                    "_source_status": [
+                        {
+                            "source": "github",
+                            "status": "no_results",
+                            "evidence_count": 0,
+                        }
+                    ],
+                },
+                artifacts=[],
+            )
+        )
+        self.assertEqual(len(report.source_coverage), 1)
+        self.assertEqual(report.source_coverage[0].source, "github")
+        self.assertEqual(report.source_coverage[0].status, "no_results")
+        self.assertEqual(report.source_coverage[0].evidence_count, 0)
+
+    def test_external_llm_payload_pseudonymizes_evidence_identifiers(self):
+        evidence = Evidence(
+            id="EVID-ABC123",
+            type="breach",
+            value="alice@example.test",
+            source="hibp",
+            source_url="https://haveibeenpwned.com/account/alice",
+            metadata={
+                "email": "alice@example.test",
+                "breach_name": "Example Breach",
+            },
+        )
+        baseline = _baseline_report([evidence])
+        payload = _llm_payload(
+            {
+                "name": "Alice Example",
+                "email": "alice@example.test",
+                "username": "alice",
+            },
+            [evidence],
+            baseline,
+        )
+        serialized = json.dumps(payload)
+        self.assertNotIn("Alice Example", serialized)
+        self.assertNotIn("alice@example.test", serialized)
+        self.assertNotIn("haveibeenpwned.com/account/alice", serialized)
+        self.assertIn("Example Breach", serialized)
+        self.assertNotIn("evidence_ledger", payload["baseline_report"])
+        self.assertEqual(payload["evidence"][0]["id"], "EVID-ABC123")
+
+    def test_running_task_staleness_uses_progress_heartbeat(self):
+        recent = SimpleNamespace(
+            case_metadata={
+                "progress": {"updated_at": datetime.now(timezone.utc).isoformat()}
+            },
+            updated_at=None,
+            created_at=None,
+        )
+        stale = SimpleNamespace(
+            case_metadata={
+                "progress": {
+                    "updated_at": (
+                        datetime.now(timezone.utc) - timedelta(hours=2)
+                    ).isoformat()
+                }
+            },
+            updated_at=None,
+            created_at=None,
+        )
+        self.assertFalse(_running_task_is_stale(recent))
+        self.assertTrue(_running_task_is_stale(stale))
 
     def test_policy_requires_scoped_source(self):
         target = InvestigationTarget(
@@ -139,6 +225,32 @@ class IntelligenceTests(unittest.TestCase):
         self.assertIn(("spiderfoot", "example.test", "passive_target"), routed)
         self.assertIn(("shodan", "203.0.113.10", "authorized_ip"), routed)
         self.assertFalse(any(item.source == "censys" for item in plan))
+
+    def test_connector_exception_does_not_expose_secret_url(self):
+        class BrokenConnector:
+            async def search(self, identifier):
+                raise RuntimeError(
+                    "https://provider.test/query?api_key=must-not-survive"
+                )
+
+        target = InvestigationTarget(
+            name="Alice Example",
+            usernames=["alice"],
+            lawful_purpose="Authorized defensive review",
+            authorization_confirmed=True,
+        )
+        policy = CollectionPolicy(
+            authorization_reference="AUTH-123",
+            purpose=target.lawful_purpose,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+            permitted_sources=frozenset({"github"}),
+        )
+        investigator = PersonIntelligenceInvestigator(policy)
+        investigator.connectors["github"] = BrokenConnector()
+        results = asyncio.run(investigator.collect_plan(target=target))
+        errors = " ".join(error for _, result in results for error in result.errors)
+        self.assertNotIn("must-not-survive", errors)
+        self.assertIn("connector request failed", errors)
 
     def test_consensus_excludes_single_provider_claim(self):
         evidence_id = "EVID-ABC"

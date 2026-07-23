@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
@@ -57,6 +58,7 @@ class InvestigationReport(BaseModel):
     timeline: list[TimelineEvent] = Field(default_factory=list)
     contradictions: list[Contradiction] = Field(default_factory=list)
     source_coverage: list[SourceCoverage] = Field(default_factory=list)
+    evidence_ledger: list[dict[str, Any]] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     methodology: list[str] = Field(default_factory=list)

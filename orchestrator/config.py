@@ -5,6 +5,7 @@ DeepVault configuration — loaded from environment variables.
 import os
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote_plus
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -18,7 +19,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
 class Settings:
     # Database
     db_url: str = os.getenv(
-        "DB_URL", "postgresql+asyncpg://deepvault:changeme@postgres:5432/deepvault"
+        "DB_URL",
+        "postgresql+asyncpg://deepvault:"
+        f"{quote_plus(os.getenv('DB_PASSWORD', 'changeme'))}"
+        "@postgres:5432/deepvault",
     )
     neo4j_uri: str = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
     neo4j_user: str = os.getenv("NEO4J_USER", "neo4j")
@@ -63,6 +67,9 @@ class Settings:
     # Connector safety / resource controls
     connector_timeout: int = int(os.getenv("CONNECTOR_TIMEOUT", "30"))
     max_osint_concurrency: int = int(os.getenv("MAX_OSINT_CONCURRENCY", "4"))
+    running_task_stale_seconds: int = int(
+        os.getenv("RUNNING_TASK_STALE_SECONDS", "3600")
+    )
     allow_sensitive_pivots: bool = _env_bool("ALLOW_SENSITIVE_PIVOTS", False)
     allow_infrastructure_enrichment: bool = _env_bool(
         "ALLOW_INFRASTRUCTURE_ENRICHMENT", False
@@ -70,7 +77,7 @@ class Settings:
     authorization_reference: Optional[str] = os.getenv("AUTHORIZATION_REFERENCE")
     person_osint_sources: str = os.getenv(
         "PERSON_OSINT_SOURCES",
-        "github,hibp,hunter,brave,sherlock,maigret,holehe",
+        "github,hibp,hunter,brave,sherlock,maigret,holehe,spiderfoot,shodan,censys",
     )
 
     # Celery / Redis
