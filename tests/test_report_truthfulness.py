@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(ROOT, "orchestrator"))
 sys.path.insert(0, ROOT)
 
 from dashboard.app import render_report_html  # noqa: E402
+from intelligence.correlation import correlate_evidence  # noqa: E402
 from intelligence.models import Evidence, IdentityStatus, SourceReliability  # noqa: E402
 from reporting.person_report import _baseline_report  # noqa: E402
 
@@ -197,6 +198,33 @@ class TruthfulBaselineReportTests(unittest.TestCase):
         self.assertIn(
             "not independently corroborated by a single profile source",
             report.executive_summary,
+        )
+
+    def test_correlation_preserves_public_profile_fields_for_reporting(self):
+        evidence = Evidence(
+            id="EVID-GRAVATAR-CORRELATED",
+            type="public_profile",
+            value="https://gravatar.com/alice-example",
+            source="gravatar",
+            source_url="https://gravatar.com/alice-example",
+            confidence=0.64,
+            reliability=SourceReliability.MEDIUM,
+            metadata={
+                "display_name": "Alice Example",
+                "profile_url": "https://gravatar.com/alice-example",
+            },
+        )
+
+        correlated = correlate_evidence([evidence])
+        report = _baseline_report(correlated)
+
+        self.assertEqual(
+            correlated[0].metadata["display_name"],
+            "Alice Example",
+        )
+        self.assertIn(
+            "display name: Alice Example",
+            report.findings[0].statement,
         )
 
 

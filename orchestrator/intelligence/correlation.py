@@ -91,7 +91,10 @@ def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:
             f"Correlated from {len(group)} observation(s) across "
             f"{len(sources)} independent source(s)."
         )
+        # Preserve the representative's normalized public fields for report
+        # rendering while retaining the full observation ledger for provenance.
         merged_metadata = {
+            **representative.metadata,
             "observations": [item.safe_dump() for item in group],
             "source_count": len(sources),
         }
