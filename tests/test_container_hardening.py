@@ -25,6 +25,16 @@ class ContainerHardeningTests(unittest.TestCase):
         self.assertGreaterEqual(compose.count("no-new-privileges:true"), 2)
         self.assertGreaterEqual(compose.count("cap_drop:"), 2)
 
+    def test_celery_beat_schedule_uses_writable_data_volume(self):
+        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        dockerfile = (ROOT / "orchestrator/Dockerfile").read_text(
+            encoding="utf-8"
+        )
+
+        schedule_option = "--schedule=/data/celerybeat-schedule"
+        self.assertIn(schedule_option, compose)
+        self.assertIn(schedule_option, dockerfile)
+
 
 if __name__ == "__main__":
     unittest.main()

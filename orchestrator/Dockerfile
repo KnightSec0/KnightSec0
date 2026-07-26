@@ -41,4 +41,4 @@ RUN groupadd --gid 10001 deepvault && \
 
 USER deepvault:deepvault
 
-CMD ["celery", "-A", "main", "worker", "--beat", "--loglevel=info"]
+CMD ["celery", "-A", "main", "worker", "--beat", "--loglevel=info", "--schedule=/data/celerybeat-schedule"]
