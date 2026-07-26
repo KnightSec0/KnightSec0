@@ -30,9 +30,9 @@ class TruthfulBaselineReportTests(unittest.TestCase):
 
         self.assertEqual(report.identity_confidence, "unrelated")
         self.assertEqual(len(report.findings), 1)
-        self.assertIn("Disambiguated unrelated", report.findings[0].title)
+        self.assertIn("Rejected observations", report.findings[0].title)
         self.assertIn(
-            "does not attribute",
+            "excluded from identity conclusions",
             report.findings[0].statement,
         )
         self.assertIn(
@@ -106,14 +106,14 @@ class TruthfulBaselineReportTests(unittest.TestCase):
 
         self.assertEqual(len(report.findings), 2)
         social = next(
-            item for item in report.findings if "Public-profile" in item.title
+            item for item in report.findings if "Possible public profiles" in item.title
         )
         services = next(
             item for item in report.findings if "service-registration" in item.title
         )
         self.assertIn("instagram.com", social.statement)
         self.assertIn("https://www.youtube.com/@alice-example", social.statement)
-        self.assertIn("do not prove", social.statement)
+        self.assertIn("possible associations", social.statement)
         self.assertIn("gravatar.com", services.statement)
         self.assertIn("spotify.com", services.statement)
         self.assertIn("do not verify account ownership", services.statement)
@@ -126,6 +126,9 @@ class TruthfulBaselineReportTests(unittest.TestCase):
             "do not establish independently corroborated biographical facts",
             report.executive_summary,
         )
+        self.assertEqual(report.overall_risk.value, "unknown")
+        self.assertEqual(report.coverage_assessment, "insufficient")
+        self.assertIn("inconclusive rather than low", report.executive_summary)
 
         coverage = {item.source: item for item in report.source_coverage}
         self.assertIn("not proof", coverage["github"].detail)

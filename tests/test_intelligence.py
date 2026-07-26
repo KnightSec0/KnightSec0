@@ -119,7 +119,7 @@ class IntelligenceTests(unittest.TestCase):
         self.assertNotIn("must-not-survive", result["error"])
         self.assertIn("api_key=<redacted>", result["error"])
 
-    def test_independent_sources_raise_confidence(self):
+    def test_username_catalogue_sources_do_not_raise_confidence(self):
         items = [
             Evidence(
                 type="social_profile",
@@ -138,9 +138,9 @@ class IntelligenceTests(unittest.TestCase):
         ]
         correlated = correlate_evidence(items)
         self.assertEqual(len(correlated), 1)
-        self.assertGreater(correlated[0].confidence, 0.70)
+        self.assertEqual(correlated[0].confidence, 0.565)
         self.assertEqual(correlated[0].source, "sherlock")
-        self.assertEqual(set(correlated[0].corroborated_by), {"maigret"})
+        self.assertEqual(correlated[0].corroborated_by, [])
 
     def test_report_findings_reference_real_evidence(self):
         artifacts = [
@@ -570,7 +570,7 @@ class IntelligenceTests(unittest.TestCase):
         )
         plan = PersonIntelligenceInvestigator(policy).build_plan(
             target=target,
-            authorized_ips=["203.0.113.10"],
+            authorized_ips=["8.8.8.8"],
         )
         routed = {(item.source, item.identifier, item.identifier_type) for item in plan}
         self.assertIn(("github", "alice", "username"), routed)
@@ -580,7 +580,7 @@ class IntelligenceTests(unittest.TestCase):
             routed,
         )
         self.assertIn(("spiderfoot", "example.test", "passive_target"), routed)
-        self.assertIn(("shodan", "203.0.113.10", "authorized_ip"), routed)
+        self.assertIn(("shodan", "8.8.8.8", "authorized_ip"), routed)
         self.assertFalse(any(item.source == "censys" for item in plan))
 
     def test_connector_exception_does_not_expose_secret_url(self):

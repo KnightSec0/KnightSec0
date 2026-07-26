@@ -87,11 +87,20 @@ class DashboardRequestValidationTests(unittest.TestCase):
         request = InvestigationCreate(
             **valid_request(
                 permitted_sources=["github", "shodan"],
-                authorized_ips=["203.0.113.10"],
+                authorized_ips=["8.8.8.8"],
                 allow_infrastructure_enrichment=True,
             )
         )
-        self.assertEqual(request.authorized_ips, ["203.0.113.10"])
+        self.assertEqual(request.authorized_ips, ["8.8.8.8"])
+
+        with self.assertRaisesRegex(ValidationError, "only literal public IP"):
+            InvestigationCreate(
+                **valid_request(
+                    permitted_sources=["github", "shodan"],
+                    authorized_ips=["172.20.10.11"],
+                    allow_infrastructure_enrichment=True,
+                )
+            )
 
     def test_active_and_authenticated_transforms_require_separate_scope(self):
         with self.assertRaisesRegex(ValidationError, "authorized domain"):
@@ -108,12 +117,31 @@ class DashboardRequestValidationTests(unittest.TestCase):
         request = InvestigationCreate(
             **valid_request(
                 permitted_sources=["github", "httpx", "ghunt"],
-                authorized_domains=["example.com"],
+                authorized_domains=["authorized-domain.com"],
                 allow_infrastructure_enrichment=True,
                 allow_authenticated_transforms=True,
             )
         )
         self.assertTrue(request.allow_authenticated_transforms)
+
+        with self.assertRaisesRegex(ValidationError, "Reserved demonstration domain"):
+            InvestigationCreate(
+                **valid_request(
+                    permitted_sources=["github", "httpx"],
+                    authorized_domains=["example.com"],
+                    allow_infrastructure_enrichment=True,
+                )
+            )
+
+    def test_accepts_and_deduplicates_additional_usernames(self):
+        request = InvestigationCreate(
+            **valid_request(
+                target_username="alice",
+                additional_usernames=["Alice", "KnightSec0", "KnightSec0"],
+            )
+        )
+
+        self.assertEqual(request.additional_usernames, ["KnightSec0"])
 
     def test_transform_request_validates_input_contract(self):
         request = TransformRequest(

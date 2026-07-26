@@ -145,6 +145,13 @@ _ALLOWED_SOURCES = {
     "tesseract",
     "poppler",
 }
+_RESERVED_OSINT_DOMAINS = {
+    "example.com",
+    "example.net",
+    "example.org",
+    "localhost",
+}
+_RESERVED_OSINT_SUFFIXES = (".example", ".invalid", ".local", ".localhost", ".test")
 _TRANSFORM_CATALOG = {
     "spiderfoot": {
         "title": "SpiderFoot passive scan",
@@ -267,6 +274,7 @@ class InvestigationCreate(BaseModel):
     target_name: str = Field(min_length=1, max_length=255)
     target_aliases: list[str] = Field(default_factory=list, max_length=20)
     target_username: str | None = Field(default=None, max_length=64)
+    additional_usernames: list[str] = Field(default_factory=list, max_length=20)
     target_email: str | None = Field(default=None, max_length=320)
     employer: str | None = Field(default=None, max_length=255)
     location: str | None = Field(default=None, max_length=255)
@@ -301,6 +309,22 @@ class InvestigationCreate(BaseModel):
                 "Username may contain only letters, numbers, dots, dashes, and underscores"
             )
         return cleaned
+
+    @field_validator("additional_usernames")
+    @classmethod
+    def validate_additional_usernames(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            cleaned = value.strip()
+            if not cleaned:
+                continue
+            if not _USERNAME.fullmatch(cleaned):
+                raise ValueError(
+                    "Additional usernames may contain only letters, numbers, "
+                    "dots, dashes, and underscores"
+                )
+            normalized.append(cleaned)
+        return list(dict.fromkeys(normalized))
 
     @field_validator("target_email")
     @classmethod
@@ -347,6 +371,13 @@ class InvestigationCreate(BaseModel):
                 )
             ):
                 raise ValueError(f"Invalid authorized domain: {value}")
+            if (
+                domain in _RESERVED_OSINT_DOMAINS
+                or any(domain.endswith(suffix) for suffix in _RESERVED_OSINT_SUFFIXES)
+            ):
+                raise ValueError(
+                    f"Reserved demonstration domain cannot be used for OSINT: {value}"
+                )
             normalized.append(domain)
         return list(dict.fromkeys(normalized))
 
@@ -378,8 +409,18 @@ class InvestigationCreate(BaseModel):
             self.authorization_expires_at = expiry
         if expiry <= datetime.now(timezone.utc):
             raise ValueError("Authorization expiry must be in the future")
-        if not self.target_username and not self.target_email:
+        if (
+            not self.target_username
+            and not self.additional_usernames
+            and not self.target_email
+        ):
             raise ValueError("Provide at least one username or email")
+        if self.target_username:
+            self.additional_usernames = [
+                value
+                for value in self.additional_usernames
+                if value.casefold() != self.target_username.casefold()
+            ]
         infrastructure_sources = {"shodan", "censys"} & set(self.permitted_sources)
         if infrastructure_sources and (
             not self.allow_infrastructure_enrichment or not self.authorized_ips
@@ -387,6 +428,17 @@ class InvestigationCreate(BaseModel):
             raise ValueError(
                 "Shodan and Censys require infrastructure consent and an authorized IP"
             )
+        if infrastructure_sources:
+            non_public_ips = [
+                value
+                for value in self.authorized_ips
+                if not ipaddress.ip_address(value).is_global
+            ]
+            if non_public_ips:
+                raise ValueError(
+                    "Shodan and Censys accept only literal public IP addresses; "
+                    f"non-public values: {non_public_ips}"
+                )
         if "httpx" in self.permitted_sources and (
             not self.authorized_domains
             or not self.allow_infrastructure_enrichment
@@ -584,6 +636,7 @@ async def _serialize(
         "id": str(investigation.id),
         "target_name": investigation.target_name,
         "target_username": investigation.target_username,
+        "additional_usernames": metadata.get("additional_usernames", []),
         "target_email": investigation.target_email,
         "status": _status_value(investigation.status),
         "depth": investigation.depth,
@@ -1021,6 +1074,7 @@ async def create_investigation(payload: InvestigationCreate) -> dict[str, Any]:
         "location": payload.location,
         "authorized_domains": payload.authorized_domains,
         "authorized_ips": payload.authorized_ips,
+        "additional_usernames": payload.additional_usernames,
         "allow_infrastructure_enrichment": payload.allow_infrastructure_enrichment,
         "allow_authenticated_transforms": payload.allow_authenticated_transforms,
         "compare_previous_cases": payload.compare_previous_cases,
@@ -1271,6 +1325,7 @@ async def download_json_report(investigation_id: UUID) -> Response:
                 "case_id": str(investigation.id),
                 "target_name": investigation.target_name,
                 "target_username": investigation.target_username,
+                "additional_usernames": metadata.get("additional_usernames", []),
                 "target_email": investigation.target_email,
                 "authorization_reference": metadata.get("authorization_reference"),
                 "permitted_sources": metadata.get("permitted_sources", []),
@@ -1299,23 +1354,41 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             return f"{score * 100:.0f}%"
         return str(value)
 
-    finding_parts = []
+    finding_groups: dict[str, list[str]] = {}
     for item in report.get("findings", []):
         finding_limitations = "".join(
             f"<li>{safe(limitation)}</li>"
             for limitation in item.get("limitations", [])
         )
-        finding_parts.append(
+        category = str(item.get("category") or "other_observations")
+        finding_groups.setdefault(category, []).append(
             "<article class='finding'>"
             f"<h3>{safe(item.get('title'))}</h3>"
             f"<p>{safe(item.get('statement'))}</p>"
-            f"<p class='meta'>Confidence "
-            f"{safe(confidence_label(item.get('confidence')))} · "
+            f"<p class='meta'>Status "
+            f"{safe(item.get('verification_status') or 'unverified')} · "
+            f"Confidence {safe(confidence_label(item.get('confidence')))} · "
             f"Evidence {safe(', '.join(item.get('evidence_ids', [])))}</p>"
             f"{f'<ul>{finding_limitations}</ul>' if finding_limitations else ''}"
             "</article>"
         )
-    findings = "".join(finding_parts)
+    finding_labels = {
+        "corroborated_facts": "Corroborated facts",
+        "probable_profiles": "Probable profiles",
+        "possible_profiles": "Possible profiles",
+        "defensive_exposure": "Defensive exposure",
+        "service_signals": "Service-presence signals",
+        "unverified_profiles": "Unverified username leads",
+        "quarantined_candidates": "Quarantined sensitive candidates",
+        "rejected_observations": "Rejected observations",
+        "other_observations": "Other observations",
+    }
+    findings = "".join(
+        f"<h3>{safe(finding_labels.get(category, category))}</h3>"
+        + "".join(finding_groups.get(category, []))
+        for category in finding_labels
+        if finding_groups.get(category)
+    )
     coverage = "".join(
         (
             "<tr>"
@@ -1369,6 +1442,29 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
         for item in graph_nodes
         if isinstance(item, dict) and item.get("id")
     }
+    node_by_id = {
+        str(item.get("id")): item
+        for item in graph_nodes
+        if isinstance(item, dict) and item.get("id")
+    }
+    reviewable_statuses = {"confirmed", "highly_probable", "probable", "possible"}
+
+    def graph_item_is_reviewable(item: dict[str, Any], node_key: str) -> bool:
+        node = node_by_id.get(str(item.get(node_key)), {})
+        attributes = node.get("attributes")
+        attributes = attributes if isinstance(attributes, dict) else {}
+        status = attributes.get("verification_status") or item.get("identity_status")
+        return str(status or "").casefold() in reviewable_statuses
+
+    primary_graph_hypotheses = [
+        item
+        for item in graph_hypothesis_items
+        if isinstance(item, dict)
+        and graph_item_is_reviewable(item, "object_node_id")
+    ]
+    secondary_graph_hypothesis_count = (
+        len(graph_hypothesis_items) - len(primary_graph_hypotheses)
+    )
     graph_hypotheses = "".join(
         (
             "<article class='finding'>"
@@ -1389,8 +1485,7 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             )
             + "</article>"
         )
-        for item in graph_hypothesis_items
-        if isinstance(item, dict)
+        for item in primary_graph_hypotheses
     )
     graph_edges = "".join(
         (
@@ -1406,6 +1501,11 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
         for item in graph_edge_items
         if isinstance(item, dict)
     )
+    primary_graph_pivots = [
+        item
+        for item in graph_pivot_items
+        if isinstance(item, dict) and graph_item_is_reviewable(item, "node_id")
+    ]
     graph_pivots = "".join(
         (
             "<article class='finding'>"
@@ -1418,8 +1518,7 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
             "</article>"
         )
-        for item in graph_pivot_items
-        if isinstance(item, dict)
+        for item in primary_graph_pivots
     )
     temporal = report.get("temporal_comparison")
     temporal = temporal if isinstance(temporal, dict) else {}
@@ -1541,6 +1640,7 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
     <p><strong>Identity confidence:</strong>
       {safe(report.get("identity_confidence"))} ·
       <strong>Risk:</strong> {safe(report.get("overall_risk"))} ·
+      <strong>Coverage:</strong> {safe(report.get("coverage_assessment"))} ·
       <strong>Evidence:</strong> {safe(report.get("evidence_count"))}</p>
     <p class="meta">Evidence citations:
       {safe(", ".join(report.get("executive_summary_evidence_ids", [])))}</p>
@@ -1550,7 +1650,8 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
   <h2>Evidence-first identity analysis</h2>
   <p><strong>Graph:</strong> {safe(len(graph_nodes))} nodes ·
     {safe(len(graph_edge_items))} relationships ·
-    {safe(len(graph_hypothesis_items))} hypotheses</p>
+    {safe(len(primary_graph_hypotheses))} reviewable hypotheses ·
+    {safe(secondary_graph_hypothesis_count)} low-signal hypotheses retained in JSON</p>
   {graph_hypotheses or "<p>No evidence-backed identity hypotheses were produced.</p>"}
   <h3>Provenance relationships</h3>
   <table><thead><tr><th>Relation</th><th>From</th><th>To</th>
