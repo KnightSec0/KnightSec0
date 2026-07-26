@@ -1,15 +1,15 @@
 """
 Identity Investigator — expands a name into emails, phones, usernames, addresses.
 """
+
 import asyncio
 import logging
 import re
 from typing import Optional
 
 import aiohttp
-from bs4 import BeautifulSoup
 
-from ..config import settings
+from config import settings
 
 logger = logging.getLogger("deepvault.investigators.identity")
 
@@ -20,8 +20,12 @@ class IdentityInvestigator:
     public sources for associated identifiers (emails, phones, addresses).
     """
 
-    def __init__(self):
+    def __init__(self, allowed_sources: set[str] | None = None):
         self.session: Optional[aiohttp.ClientSession] = None
+        self.allowed_sources = allowed_sources
+
+    def _source_allowed(self, source: str) -> bool:
+        return self.allowed_sources is None or source in self.allowed_sources
 
     # ------------------------------------------------------------------
     # Name permutations
@@ -30,18 +34,28 @@ class IdentityInvestigator:
     def generate_email_permutations(first: str, last: str) -> list[str]:
         """Generate common email local-part patterns from a name."""
         f = first.lower().strip()
-        l = last.lower().strip()
+        last_part = last.lower().strip()
         fi = f[0] if f else ""
-        li = l[0] if l else ""
+        li = last_part[0] if last_part else ""
 
         patterns = [
-            f, l,
-            f"{f}.{l}", f"{f}{l}", f"{f}_{l}",
-            f"{fi}{l}", f"{f}.{li}", f"{fi}.{l}",
-            f"{l}.{f}", f"{l}{f}", f"{l}_{f}",
-            f"{f}-{l}", f"{fi}{li}",
-            f"{f}{li}", f"{fi}{l}123",
-            f"{f}.{l}1", f"{f}1",
+            f,
+            last_part,
+            f"{f}.{last_part}",
+            f"{f}{last_part}",
+            f"{f}_{last_part}",
+            f"{fi}{last_part}",
+            f"{f}.{li}",
+            f"{fi}.{last_part}",
+            f"{last_part}.{f}",
+            f"{last_part}{f}",
+            f"{last_part}_{f}",
+            f"{f}-{last_part}",
+            f"{fi}{li}",
+            f"{f}{li}",
+            f"{fi}{last_part}123",
+            f"{f}.{last_part}1",
+            f"{f}1",
         ]
         return list(set(patterns))
 
@@ -49,23 +63,33 @@ class IdentityInvestigator:
     def generate_username_permutations(first: str, last: str) -> list[str]:
         """Generate likely usernames from a name."""
         f = first.lower().strip()
-        l = last.lower().strip()
-        fi = f[0]
-        li = l[0]
+        last_part = last.lower().strip()
+        fi = f[0] if f else ""
+        li = last_part[0] if last_part else ""
         patterns = [
-            f, l,
-            f"{f}{l}", f"{f}.{l}", f"{f}_{l}",
-            f"{fi}{l}", f"{l}{fi}", f"{l}{f}",
-            f"{f}{li}", f"{fi}{li}",
-            f"{f}.{li}", f"{fi}.{l}",
-            f"{l}.{fi}", f"{fi}{l}123",
+            f,
+            last_part,
+            f"{f}{last_part}",
+            f"{f}.{last_part}",
+            f"{f}_{last_part}",
+            f"{fi}{last_part}",
+            f"{last_part}{fi}",
+            f"{last_part}{f}",
+            f"{f}{li}",
+            f"{fi}{li}",
+            f"{f}.{li}",
+            f"{fi}.{last_part}",
+            f"{last_part}.{fi}",
+            f"{fi}{last_part}123",
         ]
         return list(set(patterns))
 
     # ------------------------------------------------------------------
     # Hunter.io email finder
     # ------------------------------------------------------------------
-    async def search_hunter_io(self, first: str, last: str, domain: str = "gmail.com") -> list[dict]:
+    async def search_hunter_io(
+        self, first: str, last: str, domain: str = "gmail.com"
+    ) -> list[dict]:
         if not settings.hunter_api_key:
             logger.debug("No Hunter API key configured, skipping Hunter.io lookup")
             return []
@@ -81,13 +105,33 @@ class IdentityInvestigator:
             async with self.session.get(url, params=params, timeout=15) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    emails = data.get("data", {}).get("emails", [])
-                    return [{"email": e.get("value"), "type": e.get("type", "unknown"),
-                             "confidence": e.get("confidence", 0)} for e in emails]
+                    record = data.get("data", {})
+                    emails = record.get("emails") or []
+                    if record.get("email"):
+                        emails = [
+                            {
+                                "value": record.get("email"),
+                                "type": record.get("type", "unknown"),
+                                "confidence": record.get(
+                                    "score", record.get("confidence", 0)
+                                ),
+                            }
+                        ]
+                    return [
+                        {
+                            "email": e.get("value"),
+                            "type": e.get("type", "unknown"),
+                            "confidence": e.get("confidence", 0),
+                        }
+                        for e in emails
+                        if e.get("value")
+                    ]
                 elif resp.status == 404:
                     return []
                 else:
-                    logger.warning("Hunter.io returned %s: %s", resp.status, await resp.text())
+                    logger.warning(
+                        "Hunter.io returned %s: %s", resp.status, await resp.text()
+                    )
                     return []
         except asyncio.TimeoutError:
             logger.warning("Hunter.io request timed out")
@@ -112,30 +156,31 @@ class IdentityInvestigator:
         }
 
         queries = [
-            f'intitle:"{name}" "email" "contact"',
-            f'intitle:"{name}" "phone" OR "tel"',
             f'"{name}" site:linkedin.com/in/',
-            f'"{name}" site:facebook.com/',
             f'"{name}" site:github.com',
-            f'"{name}" site:twitter.com',
             f'"{name}" "resume" OR "CV" filetype:pdf',
+            f'"{name}" "security" OR "cybersecurity" OR "engineer"',
         ]
 
         results = []
         for q in queries:
             try:
                 params = {"q": q, "count": 10}
-                async with self.session.get(url, headers=headers, params=params, timeout=20) as resp:
+                async with self.session.get(
+                    url, headers=headers, params=params, timeout=20
+                ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         for item in data.get("web", {}).get("results", []):
-                            results.append({
-                                "url": item.get("url"),
-                                "title": item.get("title"),
-                                "description": item.get("description"),
-                                "search_query": q,
-                                "source": "brave_search",
-                            })
+                            results.append(
+                                {
+                                    "url": item.get("url"),
+                                    "title": item.get("title"),
+                                    "description": item.get("description"),
+                                    "search_query": q,
+                                    "source": "brave_search",
+                                }
+                            )
                     await asyncio.sleep(0.5)  # rate limit
             except Exception as e:
                 logger.debug("Search query failed '%s': %s", q, e)
@@ -147,7 +192,9 @@ class IdentityInvestigator:
     # ------------------------------------------------------------------
     @staticmethod
     def extract_emails(text: str) -> list[str]:
-        return list(set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)))
+        return list(
+            set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text))
+        )
 
     @staticmethod
     def extract_phones(text: str) -> list[str]:
@@ -164,47 +211,62 @@ class IdentityInvestigator:
     # ------------------------------------------------------------------
     # Main pipeline
     # ------------------------------------------------------------------
-    async def run(self, first_name: str, last_name: str) -> dict:
+    async def run(
+        self, first_name: str, last_name: str, domains: Optional[list[str]] = None
+    ) -> dict:
         """Full identity expansion pipeline."""
         logger.info("Identity investigation for %s %s", first_name, last_name)
 
         self.session = aiohttp.ClientSession(
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                    "Chrome/125.0.0.0 Safari/537.36"}
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            }
         )
 
         try:
             email_perms = self.generate_email_permutations(first_name, last_name)
             username_perms = self.generate_username_permutations(first_name, last_name)
 
-            # Hunter.io for each permutation on common domains
+            # Hunter is meaningful for known organizational domains only.
+            # Do not enumerate consumer-mail domains from a person's name.
             hunter_results = []
-            for domain in ["gmail.com", "outlook.com", "yahoo.com", "protonmail.com",
-                           "icloud.com", "hotmail.com", "live.com", "mail.com"]:
-                h = await self.search_hunter_io(first_name, last_name, domain)
-                hunter_results.extend(h)
+            if self._source_allowed("hunter"):
+                for domain in domains or []:
+                    h = await self.search_hunter_io(first_name, last_name, domain)
+                    hunter_results.extend(h)
 
             # Brave/Google search
             name_full = f"{first_name} {last_name}"
-            search_results = await self.google_dork_person(name_full)
+            search_results = (
+                await self.google_dork_person(name_full)
+                if self._source_allowed("brave")
+                else []
+            )
 
             # Extract identifiers from search results
             all_text = " ".join(
-                [r.get("title", "") + " " + r.get("description", "") for r in search_results]
+                [
+                    r.get("title", "") + " " + r.get("description", "")
+                    for r in search_results
+                ]
             )
             found_emails = self.extract_emails(all_text)
             # Add hunter results
             found_emails.extend([h["email"] for h in hunter_results if h.get("email")])
             found_emails = list(set(found_emails))
 
-            found_phones = self.extract_phones(all_text)
+            found_phones = []  # Disabled by default: avoid aggregating personal phone data.
 
             # Common usernames from social URLs
             found_usernames = []
             for r in search_results:
                 url = r.get("url", "")
-                for match in re.finditer(r"(?:linkedin\.com/in/|github\.com/|twitter\.com/|facebook\.com/)([^/?#]+)", url):
+                for match in re.finditer(
+                    r"(?:linkedin\.com/in/|github\.com/|twitter\.com/|facebook\.com/)([^/?#]+)",
+                    url,
+                ):
                     found_usernames.append(match.group(1))
             found_usernames = list(set(found_usernames))
 

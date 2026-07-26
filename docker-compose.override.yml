@@ -1,5 +1,3 @@
-version: '3.9'
-
 # Override for production/OpSec use — enables network isolation
 # Apply with: docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
 

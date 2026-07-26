@@ -38,6 +38,7 @@ downloads/
 # Logs
 *.log
 logs/
+celerybeat-schedule*
 
 # Virtual environments
 venv/

@@ -1,6 +1,9 @@
 # 🕵️ DeepVault — The OSINT Investigation Framework
 
-**DeepVault** is a locally-deployed, Docker-orchestrated open-source intelligence (OSINT) platform designed for **deep-dive background investigations** on individuals. It automates the collection, correlation, and reporting of digital artifacts across the surface web, deep web, data breaches, and the Tor dark web — all within a single, auditable pipeline.
+**DeepVault** is a locally deployed, Docker-orchestrated open-source
+intelligence (OSINT) platform for authorized investigations of individuals. It
+collects and correlates public-profile, person-search, breach-metadata, and
+authorized infrastructure evidence in a single auditable pipeline.
 
 > ⚠️ **This tool is for authorized security professionals conducting lawful investigations only.** Authorization is your responsibility. DeepVault provides the engine; you provide the legal mandate.
 
@@ -13,32 +16,44 @@
 git clone https://github.com/KnightSec0/KnightSec0.git
 cd KnightSec0
 cp .env.example .env
-# Edit .env with your API keys
-docker compose up -d --build
-
-# Queue your first investigation
-curl -X POST http://localhost:8080/api/investigations \
-  -H "Content-Type: application/json" \
-  -d '{"target_name": "Jane Smith", "target_email": "jane@example.com", "depth": "full"}'
-
-# Open the dashboard
-open http://localhost:8080
+# Add optional API keys to .env, then start the local stack
+docker compose up --build
 ```
+
+Open **http://127.0.0.1:8080** in your browser. The dashboard is bound to the
+local machine: it is not a public hosting service. Create a case only after
+entering a lawful purpose, written authorization reference, future
+authorization expiry, explicit source allowlist, and a username or email.
+The default Compose stack starts only PostgreSQL, Redis, the worker, and the
+dashboard. Unused legacy data/proxy services are isolated behind the optional
+`legacy` Compose profile and are not required for person reports.
+
+The case view polls the local API for live stage progress, source status, and
+safe evidence summaries. When processing is complete, use **Download JSON** for
+machine-readable evidence or **Download HTML** for a portable, printable
+report. The HTML report can be saved as PDF from the browser's print dialog.
+Both downloads include a redacted evidence appendix so every cited evidence ID
+can be audited against its source, observation, confidence, and metadata.
+
+For a first run, select only the keyless public connectors: GitHub, Sherlock,
+Maigret, and Holehe. API-backed sources can be enabled later through `.env`.
+Never paste API keys, passwords, cookies, tokens, private messages, or leaked
+credentials into the dashboard.
 
 ## 📋 Features
 
 | Layer | Capability | Tools Integrated |
 |-------|-----------|------------------|
-| Surface Web | Email/Domain harvesting, public documents | theHarvester, Recon-ng, Brave/Bing APIs |
-| Identity Expansion | Name → email/phone/address permutations | Hunter.io, social-analyzer, holehe, custom dorking |
-| Social Media | Profile discovery across 400+ platforms | Sherlock, Maigret, WhatsMyName |
-| Data Breaches | Credential exposure, stealer logs, paste sites | HIBP, DeHashed, IntelX |
-| Dark Web | Tor hidden service crawling, .onion mentions | TorBot, Ahmia, OnionScan |
-| Geolocation | IP history, Wi-Fi networks, physical addresses | Shodan, ipinfo.io, WiGLE |
-| Crypto | Bitcoin/Ethereum wallet discovery | Blockchain explorers, WalletExplorer |
-| Correlation | Knowledge graph linking all artifacts | Neo4j graph database |
-| Reporting | PDF dossier with risk scoring, timeline, evidence | WeasyPrint, Jinja2 |
-| Visualization | Interactive graph explorer, timeline view | Neo4j Browser + custom D3.js |
+| Public profiles | Public account metadata and person-search results | GitHub, Brave Search |
+| Identity enrichment | Email verification and public registration signals | Hunter, Holehe |
+| Social media | Username-based public-profile discovery | Sherlock, Maigret |
+| Data Breaches | Breach names, dates and exposed data classes (no credentials) | HIBP |
+| Passive scanning | Results from an authorized SpiderFoot server | SpiderFoot |
+| Infrastructure | Explicitly authorized literal-IP enrichment | Shodan, Censys |
+| Correlation | Provenance normalization, identity graph, hypotheses and contradiction detection | Local correlation engine |
+| Change tracking | Added, changed, persisting and not-observed evidence between explicitly comparable cases | Local temporal engine |
+| Reporting | Evidence-linked findings, graph, provenance, timeline, contradictions and source coverage | Downloadable JSON and printable HTML |
+| LLM analysis | Optional single-provider or consensus synthesis | OpenAI, Anthropic, Gemini, Ollama, OpenAI-compatible APIs |
 
 ## 🏗 Architecture
 
@@ -61,103 +76,110 @@ open http://localhost:8080
    └──────────────────────────────────────────────────────────────────┘
          ▼
    ┌──────────────────────────────────────────────────────────────────┐
-   │                      WEB DASHBOARD (FastAPI + React)              │
+   │                    LOCAL WEB DASHBOARD (FastAPI)                  │
    │  - Create investigation / enter identifiers                      │
-   │  - Live progress / logs                                          │
-   │  - Interactive graph explorer                                    │
-   │  - Automated dossier generation (PDF)                            │
-   │  - Timeline view (historical artifact correlation)               │
+   │  - Live stage progress                                            │
+   │  - Evidence-linked findings and source coverage                  │
+   │  - Downloadable JSON and printable HTML reports                  │
    └──────────────────────────────────────────────────────────────────┘
 ```
 
 ## 🧩 Modules Deep Dive
 
 ### 1. Identity Investigator (orchestrator/investigators/identity.py)
-- Takes a name and generates 50+ email username permutations
-- Searches Hunter.io, Google dorks, and public people-search APIs
-- Returns associated emails, phones, addresses, and potential usernames
+- Generates deterministic email and username candidates from a supplied name
+- Uses only the sources allowed by the case policy
+- Leaves every unverified candidate clearly marked as a lead
 
 ### 2. Social Media Investigator (orchestrator/investigators/social.py)
-- Executes Sherlock, Maigret, and WhatsMyName in parallel
-- Discovers profiles on 400+ platforms from a single username
-- Automatically pivots: every new username found gets re-scanned
+- Executes Sherlock and Maigret for supplied usernames
+- Normalizes public-profile results into evidence records
+- Treats a username match as a possible identity until corroborated
 
 ### 3. Breach Investigator (orchestrator/investigators/breach.py)
-- Checks Have I Been Pwned, DeHashed, and Intelligence X
-- Reveals exposed passwords, credential pairs, and sensitive data classes
-- Cross-references email, username, and phone across all breach databases
+- Checks Have I Been Pwned for breach metadata
+- Retains breach names, dates and data classes, never passwords or hashes
+- Treats breach association as an exposure signal, not proof of account ownership
 
 ### 4. Dark Web Investigator (orchestrator/investigators/darkweb.py)
-- Routes all traffic through Tor SOCKS5 proxy
-- Searches Ahmia (.onion search engine) for target mentions
-- Crawls dark web paste sites and forums via TorBot
+- Legacy opt-in module for Ahmia's public search endpoint and public paste checks
+- Not enabled for source-scoped dashboard cases
+- Does not claim to crawl hidden services or private forums
 
-### 5. Correlation Engine (orchestrator/correlator/graph_builder.py)
-- Builds a Neo4j knowledge graph linking every artifact to the target
-- Creates relationship chains: email → breach → password → other accounts
-- Confidence-scored connections with source provenance
+### 5. Correlation Engine (orchestrator/intelligence/correlation.py)
+- Normalizes and de-duplicates evidence from independent sources
+- Raises confidence only when multiple sources corroborate the same observation
+- Preserves provenance, reliability, identity status, and evidence IDs
 
-### 6. Reporting Engine (orchestrator/reporting/pdf_generator.py)
-- Generates professional PDF dossiers with executive summary
-- Risk scoring based on breach severity, dark web exposure, and data sensitivity
-- Complete artifact timeline and evidence chain
+### 6. Identity Analysis (orchestrator/intelligence/identity_graph.py)
+- Builds a deterministic graph over the normalized evidence ledger
+- Emits conservative hypotheses, provenance chains and authorization-gated analyst pivots
+- Never invents identifiers or executes a recommended pivot automatically
+- Compares a rerun with the latest comparable case without treating a missing
+  observation as proof of account deletion or nonexistence
+
+See [Evidence-first identity analysis](docs/IDENTITY_ANALYSIS.md) for the
+evidence contract and the intentionally excluded prototype behaviors.
+
+### 7. Structured Reporting Engine (orchestrator/reporting/person_report.py)
+- Produces evidence-linked findings with an executive summary and risk level
+- Includes identity hypotheses, provenance, temporal changes, timeline,
+  contradictions, source coverage, limitations, and recommendations
+- Exposes machine-readable JSON plus standalone HTML that can be printed to PDF
 
 ## 🔧 Configuration
 
-Copy `.env.example` to `.env` and populate API keys:
+Copy `.env.example` to `.env`. The following person-intelligence sources can be
+used without a paid API subscription when their local command-line tools are
+installed in the worker image:
 
-```bash
-# Required for breach detection
-INTELX_API_KEY=your_key        # intelx.io
-DEHASHED_API_KEY=your_key      # dehashed.com  
-DEHASHED_API_LOGIN=your_email
+- GitHub public profiles (a `GITHUB_TOKEN` is optional for higher rate limits)
+- Gravatar public profiles (a `GRAVATAR_API_KEY` is optional)
+- Sherlock public username discovery
+- Maigret public username discovery
+- Holehe public service-registration signals
 
-# Strongly recommended
-HIBP_API_KEY=your_key          # haveibeenpwned.com
-HUNTER_API_KEY=your_key        # hunter.io (email discovery)
-SHODAN_API_KEY=your_key        # shodan.io (IP/device recon)
-BRAVE_API_KEY=your_key         # brave.com/search (web search)
+The following connectors require their own service or API configuration:
 
-# Optional but powerful
-SOCIALLINKS_API_KEY=your_key   # sociallinks.io (dark + social)
-```
+- HIBP: `HIBP_API_KEY`
+- Hunter: `HUNTER_API_KEY`
+- Brave Search: `BRAVE_API_KEY`
+- SpiderFoot: `SPIDERFOOT_URL`
+- Shodan: `SHODAN_API_KEY`
+- Censys: `CENSYS_API_ID` and `CENSYS_API_SECRET`
+
+Shodan and Censys are restricted to literal IP addresses already included in
+the written authorization scope; they are not person-search sources. Missing
+keys are handled as unavailable sources rather than fabricated results.
+
+Secrets belong only in the local `.env` file or a secrets manager. Do not enter
+them in target, purpose, authorization, or context fields: those fields can be
+persisted and included in reports.
 
 ## 📖 Usage Guide
 
-### Creating an Investigation
+### Local dashboard workflow
 
-```bash
-# Minimal — just a name
-curl -X POST http://localhost:8080/api/investigations \
-  -d '{"target_name": "John Doe"}'
+1. Visit **http://127.0.0.1:8080**.
+2. Enter the authorized person's name and at least one known username or email.
+3. Record the lawful purpose, authorization reference, and a future expiry.
+4. Select only sources covered by that authorization and confirm consent.
+5. For a repeat scan, explicitly enable comparison and reuse the same unexpired
+   authorization reference, purpose, and source scope.
+6. Start the case and keep the page open to see live progress updates.
+7. Review evidence citations, identity hypotheses, graph provenance, temporal
+   caveats, contradictions, timeline, and source coverage before accepting any
+   identity match.
+8. Download the completed report as JSON or HTML.
 
-# Full surface
-curl -X POST http://localhost:8080/api/investigations \
-  -d '{
-    "target_name": "Jane Smith",
-    "target_aliases": ["Jane Doe", "Janet Smith"],
-    "target_username": "janesmith92",
-    "target_email": "jane.smith@example.com",
-    "target_phone": "+1-555-0123",
-    "depth": "full"
-  }'
-```
+The dashboard refreshes case state every few seconds; refreshing the browser
+does not stop the worker. A report is made available only after a structured
+report has been stored. Every report claim must cite one or more valid evidence
+IDs.
 
-### Retrieving Results
-
-```bash
-# Get investigation status
-curl http://localhost:8080/api/investigations/{id}
-
-# Download PDF dossier
-curl -o dossier.pdf http://localhost:8080/api/investigations/{id}/report
-
-# Export raw artifacts as JSON
-curl http://localhost:8080/api/investigations/{id}/artifacts > artifacts.json
-
-# Get knowledge graph data (Neo4j JSON)
-curl http://localhost:8080/api/investigations/{id}/graph > graph.json
-```
+Use your own identifiers for the first test, for example with an authorization
+reference such as `SELF-TEST-001`. A name match or username match alone does
+not establish identity.
 
 ## 📁 Repository Structure
 
@@ -186,17 +208,12 @@ deepvault/
 │   ├── config.py                # Settings & secrets
 │   ├── db/                      # Data models
 │   ├── investigators/           # Investigation modules
-│   ├── correlator/              # Graph & correlation
-│   └── reporting/               # PDF generation
-├── dashboard/                   # FastAPI web frontend
-│   ├── app/
-│   │   ├── main.py             # API server
-│   │   └── routes/             # API endpoints
-│   └── templates/
-├── workers/                     # Specialized service workers
-│   ├── tor_worker/              # Tor proxy + controller
-│   └── screenshot_worker/       # Playwright screenshots
-├── scripts/                     # Utility scripts
+│   ├── intelligence/            # Evidence, graph, correlation & temporal analysis
+│   └── reporting/               # Evidence-linked report generation
+├── dashboard/                   # Local FastAPI dashboard
+│   ├── app.py                   # API server and report downloads
+│   ├── static/index.html        # Live local browser interface
+│   └── Dockerfile
 └── tests/                       # Test suite
 ```
 
@@ -204,7 +221,6 @@ deepvault/
 
 - Docker 24+ & Docker Compose 2.24+
 - 8 GB RAM minimum (16 GB recommended for full stack)
-- Tor (bundled in the tor_worker container)
 - API keys for paid services (optional, degrades gracefully)
 
 ### Without Docker (bare metal)
@@ -212,7 +228,7 @@ deepvault/
 ```bash
 pip install -r orchestrator/requirements.txt
 pip install -r dashboard/requirements.txt
-./scripts/seed_tools.sh
+pip install sherlock-project maigret holehe
 # Install PostgreSQL 16, Neo4j 5, Elasticsearch 8, Redis 7, MinIO
 ```
 
@@ -220,11 +236,11 @@ pip install -r dashboard/requirements.txt
 
 | Risk | Mitigation |
 |------|------------|
-| IP leakage | All outbound traffic via Tor SOCKS5 |
-| DNS leaks | Tor worker on isolated network namespace |
-| Data at rest | LUKS-encrypted Docker volumes |
+| Network exposure | Dashboard and data services bind to localhost by default |
+| Provider traffic | API and CLI connectors contact their named public providers directly |
+| Data at rest | Use host-level disk encryption and define a retention policy for Docker volumes |
 | API key exposure | Keys in .env only, never in code |
-| Tool fingerprinting | Randomized User-Agents, request throttling |
+| Browser caching | Dashboard responses use `no-store` and restrictive security headers |
 
 ## 🔒 Legal & Ethical Use
 

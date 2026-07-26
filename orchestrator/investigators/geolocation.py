@@ -6,7 +6,7 @@ import logging
 from typing import Optional
 import aiohttp
 
-from ..config import settings
+from config import settings
 
 logger = logging.getLogger("deepvault.investigators.geolocation")
 

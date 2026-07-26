@@ -5,6 +5,7 @@ from .darkweb import DarkWebInvestigator
 from .documents import DocumentInvestigator
 from .geolocation import GeolocationInvestigator
 from .financial import FinancialInvestigator
+from .email_footprint import EmailFootprintInvestigator
 
 __all__ = [
     "IdentityInvestigator",
@@ -14,4 +15,5 @@ __all__ = [
     "DocumentInvestigator",
     "GeolocationInvestigator",
     "FinancialInvestigator",
+    "EmailFootprintInvestigator",
 ]
