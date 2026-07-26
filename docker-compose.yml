@@ -156,7 +156,8 @@ services:
     command: >
       sh -c "celery -A main worker --beat --loglevel=info
       --concurrency=4 --max-tasks-per-child=50
-      --pidfile=/tmp/celery.pid"
+      --pidfile=/tmp/celery.pid
+      --schedule=/data/celerybeat-schedule"
     logging: *default-logging
 
   dashboard:
