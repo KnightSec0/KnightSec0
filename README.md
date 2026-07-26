@@ -52,6 +52,7 @@ credentials into the dashboard.
 | Analyst transforms | Bounded, authorization-gated pivots with shared evidence normalization | Blackbird, theHarvester, Subfinder, httpx, GHunt, ExifTool, Tesseract, Poppler |
 | Interactive mapping | Live graph/SSE APIs and evidence-preserving Mapping Tool schema v2 export | OSINT-Mapping-Tool |
 | Infrastructure | Explicitly authorized literal-IP enrichment | Shodan, Censys |
+| Result quality | Content-aware confidence gates, catalogue-family deduplication, sensitive-result quarantine and coverage-aware conclusions | Local quality engine |
 | Correlation | Provenance normalization, identity graph, hypotheses and contradiction detection | Local correlation engine |
 | Change tracking | Added, changed, persisting and not-observed evidence between explicitly comparable cases | Local temporal engine |
 | Reporting | Evidence-linked findings, graph, provenance, timeline, contradictions and source coverage | Downloadable JSON and printable HTML |
@@ -113,7 +114,17 @@ credentials into the dashboard.
 - Raises confidence only when multiple sources corroborate the same observation
 - Preserves provenance, reliability, identity status, and evidence IDs
 
-### 6. Identity Analysis (orchestrator/intelligence/identity_graph.py)
+### 6. Result Quality (orchestrator/intelligence/quality.py)
+- Separates collector observation confidence from identity attribution
+- Collapses profile URL variants and prevents username-catalogue vote inflation
+- Quarantines sensitive unverified candidates and rejects invalid profile endpoints
+- Reports incomplete source coverage as inconclusive instead of low risk
+
+See [Result quality and identity attribution](docs/RESULT_QUALITY.md) for the
+presentation categories, confidence rules, and remaining public-page validation
+work.
+
+### 7. Identity Analysis (orchestrator/intelligence/identity_graph.py)
 - Builds a deterministic graph over the normalized evidence ledger
 - Emits conservative hypotheses, provenance chains and authorization-gated analyst pivots
 - Never invents identifiers or executes a recommended pivot automatically
@@ -127,7 +138,7 @@ See [Evidence-backed transforms and mapping](docs/TRANSFORMS.md) for the
 transform contract, SpiderFoot result ingestion, mapping APIs, and the macOS
 collector workflow.
 
-### 7. Structured Reporting Engine (orchestrator/reporting/person_report.py)
+### 8. Structured Reporting Engine (orchestrator/reporting/person_report.py)
 - Produces evidence-linked findings with an executive summary and risk level
 - Includes identity hypotheses, provenance, temporal changes, timeline,
   contradictions, source coverage, limitations, and recommendations
@@ -247,6 +258,17 @@ pip install sherlock-project maigret holehe
 | Data at rest | Use host-level disk encryption and define a retention policy for Docker volumes |
 | API key exposure | Keys in .env only, never in code |
 | Browser caching | Dashboard responses use `no-store` and restrictive security headers |
+| Container privilege | Dashboard and Celery run as UID/GID 10001 with all Linux capabilities dropped and read-only source mounts |
+
+When upgrading an existing installation whose `shared_data` volume was created
+by an older root-running image, migrate its ownership once before starting the
+new containers:
+
+```bash
+docker compose run --rm --no-deps --user 0:0 --cap-add CHOWN \
+  orchestrator chown -R 10001:10001 /data
+docker compose up -d --build
+```
 
 ## 🔒 Legal & Ethical Use
 

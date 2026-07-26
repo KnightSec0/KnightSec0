@@ -27,6 +27,9 @@ class Finding(BaseModel):
     evidence_ids: list[str] = Field(min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
     severity: RiskLevel = RiskLevel.LOW
+    category: str = Field(default="other_observations", max_length=80)
+    verification_status: str = Field(default="unverified", max_length=80)
+    sensitive: bool = False
     limitations: list[str] = Field(default_factory=list)
 
 
@@ -58,6 +61,8 @@ class InvestigationReport(BaseModel):
     identity_confidence: str
     overall_risk: RiskLevel
     evidence_count: int = Field(ge=0)
+    result_quality: dict[str, int] = Field(default_factory=dict)
+    coverage_assessment: str = Field(default="unknown", max_length=40)
     findings: list[Finding] = Field(default_factory=list)
     timeline: list[TimelineEvent] = Field(default_factory=list)
     contradictions: list[Contradiction] = Field(default_factory=list)

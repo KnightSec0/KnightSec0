@@ -17,6 +17,11 @@ from intelligence.correlation import (
 )
 from intelligence.identity_graph import IdentityGraph, build_identity_graph
 from intelligence.models import Evidence, IdentityStatus, SourceReliability
+from intelligence.quality import (
+    evidence_quality,
+    quality_summary,
+    refine_evidence_quality,
+)
 from intelligence.redaction import redact_sensitive
 from intelligence.temporal import (
     TemporalComparison,
@@ -59,6 +64,17 @@ _RELIABILITY_MAP = {
     "holehe": SourceReliability.MEDIUM,
 }
 
+_FINDING_CATEGORY_ORDER = {
+    "corroborated_facts": 0,
+    "probable_profiles": 1,
+    "possible_profiles": 2,
+    "defensive_exposure": 3,
+    "service_signals": 4,
+    "unverified_profiles": 5,
+    "quarantined_candidates": 6,
+    "rejected_observations": 7,
+}
+
 
 def _artifact_to_evidence(artifact: Any) -> Evidence:
     context = redact_sensitive(getattr(artifact, "context", {}) or {})
@@ -87,13 +103,38 @@ def _artifact_to_evidence(artifact: Any) -> Evidence:
     )
 
 
-def _risk_from_counts(counts: Counter[str]) -> RiskLevel:
+def _coverage_assessment(
+    source_status: list[dict[str, Any]] | None,
+) -> str:
+    statuses = [
+        str(item.get("status") or "").strip().casefold()
+        for item in source_status or []
+        if item.get("source")
+    ]
+    if not statuses:
+        return "not_reported"
+    missing = sum(
+        status in {"failed", "not_queried", "unavailable"} for status in statuses
+    )
+    if not missing:
+        return "complete"
+    if missing / len(statuses) >= 0.30:
+        return "insufficient"
+    return "partial"
+
+
+def _risk_from_counts(
+    counts: Counter[str],
+    source_status: list[dict[str, Any]] | None = None,
+) -> RiskLevel:
     breaches = counts.get("breach", 0)
     darkweb = counts.get("darkweb", 0)
     if breaches and darkweb:
         return RiskLevel.HIGH
     if breaches:
         return RiskLevel.MODERATE
+    if _coverage_assessment(source_status) in {"insufficient", "partial"}:
+        return RiskLevel.UNKNOWN
     return RiskLevel.LOW
 
 
@@ -201,27 +242,42 @@ def _mean_confidence(items: list[Evidence]) -> float:
 
 
 def _grouped_candidate_findings(evidence: list[Evidence]) -> list[Finding]:
-    groups: dict[tuple[str, str, bool], list[Evidence]] = {}
+    groups: dict[tuple[str, str, str, bool], list[Evidence]] = {}
     for item in evidence:
         if item.type in {"social_profile", "service_registration"}:
+            quality = evidence_quality(item)
             groups.setdefault(
                 (
                     item.type,
-                    item.source,
-                    item.identity_status == IdentityStatus.UNRELATED,
+                    str(quality.get("category") or "other_observations"),
+                    str(
+                        quality.get("verification_status")
+                        or item.identity_status.value
+                    ),
+                    bool(quality.get("sensitive")),
                 ),
                 [],
             ).append(item)
 
     findings: list[Finding] = []
-    for (evidence_type, source, unrelated), items in groups.items():
-        for part_number, part in enumerate(_chunks(items), start=1):
+    for (
+        evidence_type,
+        category,
+        verification_status,
+        sensitive,
+    ), items in groups.items():
+        chunk_size = 12 if verification_status in {"unverified", "rejected"} else 6
+        chunks = _chunks(items, size=chunk_size)
+        for part_number, part in enumerate(chunks, start=1):
             part_suffix = (
-                f" ({part_number}/{len(_chunks(items))})"
+                f" ({part_number}/{len(chunks)})"
                 if len(items) > len(part)
                 else ""
             )
-            if unrelated:
+            sources = ", ".join(
+                sorted({item.source for item in part}, key=str.casefold)
+            )
+            if verification_status == "rejected":
                 observations = "; ".join(
                     _candidate_description(item)
                     if evidence_type == "social_profile"
@@ -229,37 +285,59 @@ def _grouped_candidate_findings(evidence: list[Evidence]) -> list[Finding]:
                     for item in part
                 )
                 statement = (
-                    f"{source} disambiguated {len(part)} observation(s) as "
-                    f"unrelated to the authorized target: {observations}. "
-                    "DeepVault does not attribute these observations to the person."
+                    f"{len(part)} observation(s) from {sources} failed an identity "
+                    f"or profile-quality gate: {observations}. They remain in the "
+                    "audit ledger but are excluded from identity conclusions."
                 )
-                title = f"Disambiguated unrelated observations — {source}{part_suffix}"
+                title = f"Rejected observations{part_suffix}"
                 limitations = [
-                    "Retain the negative disambiguation with its evidence IDs.",
-                    "Re-evaluate only if new independent evidence becomes available.",
+                    "A rejected observation is not attributed to the person.",
+                    "Re-evaluate only when new public, independently cited evidence exists.",
                 ]
             elif evidence_type == "social_profile":
                 candidates = "; ".join(_candidate_description(item) for item in part)
-                statement = (
-                    f"{source} returned {len(part)} automated public-profile "
-                    f"candidate(s): {candidates}. These are username-existence "
-                    "leads only; they do not prove that any profile belongs to the "
-                    "investigated person."
-                )
-                title = f"Public-profile candidates — {source}{part_suffix}"
+                if verification_status == "quarantined":
+                    title = f"Quarantined sensitive candidates{part_suffix}"
+                    statement = (
+                        f"{sources} returned {len(part)} sensitive-profile candidate(s): "
+                        f"{candidates}. They have no sufficient contextual match and "
+                        "must not appear as attributed findings."
+                    )
+                elif verification_status == "probable":
+                    title = f"Probable public profiles{part_suffix}"
+                    statement = (
+                        f"{len(part)} profile candidate(s) contain multiple matching "
+                        f"public attributes: {candidates}. Analyst review is still "
+                        "required before confirmation."
+                    )
+                elif verification_status == "possible":
+                    title = f"Possible public profiles{part_suffix}"
+                    statement = (
+                        f"{len(part)} profile candidate(s) contain limited matching "
+                        f"context: {candidates}. They remain possible associations."
+                    )
+                else:
+                    title = f"Unverified username leads{part_suffix}"
+                    statement = (
+                        f"{sources} returned {len(part)} username-only candidate(s): "
+                        f"{candidates}. No independently observed name, employer, "
+                        "location, or profile-content match currently links them to "
+                        "the investigated person."
+                    )
                 limitations = [
                     "Candidate ownership requires content-level corroboration.",
                     "Shared or recycled usernames can produce false positives.",
+                    "Agreement between username-catalogue tools is not independent corroboration.",
                 ]
             else:
                 services = "; ".join(_service_label(item) for item in part)
                 statement = (
-                    f"{source} returned possible registration indicators for "
+                    f"{sources} returned possible registration indicators for "
                     f"{len(part)} service(s): {services}. These provider responses "
                     "are leads for the authorized email query; they do not verify "
                     "account ownership, activity, or present control."
                 )
-                title = f"Possible service-registration signals — {source}{part_suffix}"
+                title = f"Unverified service-registration signals{part_suffix}"
                 limitations = [
                     "Registration signals can be stale or ambiguous.",
                     "Do not attempt login or account recovery to verify a signal.",
@@ -271,10 +349,20 @@ def _grouped_candidate_findings(evidence: list[Evidence]) -> list[Finding]:
                     evidence_ids=[item.id for item in part],
                     confidence=_mean_confidence(part),
                     severity=RiskLevel.LOW,
+                    category=category,
+                    verification_status=verification_status,
+                    sensitive=sensitive,
                     limitations=limitations,
                 )
             )
-    return findings
+    return sorted(
+        findings,
+        key=lambda item: (
+            _FINDING_CATEGORY_ORDER.get(item.category, 8),
+            -item.confidence,
+            item.title.casefold(),
+        ),
+    )
 
 
 def _finding_statement(item: Evidence) -> str:
@@ -504,7 +592,9 @@ def _baseline_report(
         item.identity_status == IdentityStatus.UNRELATED for item in evidence
     )
     identity_status = identity_confidence_summary(evidence)
-    risk = _risk_from_counts(counts)
+    coverage_assessment = _coverage_assessment(source_status)
+    risk = _risk_from_counts(counts, source_status)
+    result_quality = quality_summary(evidence)
 
     findings = _grouped_candidate_findings(evidence)
     findings.extend(
@@ -516,6 +606,14 @@ def _baseline_report(
             severity=(
                 RiskLevel.MODERATE if item.type == "breach" else RiskLevel.LOW
             ),
+            category=str(
+                evidence_quality(item).get("category") or "other_observations"
+            ),
+            verification_status=str(
+                evidence_quality(item).get("verification_status")
+                or item.identity_status.value
+            ),
+            sensitive=bool(evidence_quality(item).get("sensitive")),
             limitations=(
                 [
                     "Breach metadata identifies reported exposure, not present "
@@ -533,7 +631,35 @@ def _baseline_report(
         if item.type not in {"social_profile", "service_registration"}
     )
 
-    summary_parts = [f"DeepVault normalized {len(evidence)} evidence item(s)."]
+    summary_parts = [
+        f"DeepVault normalized {len(evidence)} source observation(s)."
+    ]
+    actionable_count = (
+        result_quality["confirmed"]
+        + result_quality["highly_probable"]
+        + result_quality["probable"]
+        + result_quality["possible"]
+        + result_quality["observed"]
+    )
+    summary_parts.append(
+        f"{actionable_count} observation(s) currently meet the threshold for "
+        "prominent analyst review."
+    )
+    if result_quality["unverified"]:
+        summary_parts.append(
+            f"{result_quality['unverified']} observation(s) remain unverified and "
+            "are separated from identity findings."
+        )
+    if result_quality["quarantined"]:
+        summary_parts.append(
+            f"{result_quality['quarantined']} sensitive candidate(s) were "
+            "quarantined pending stronger corroboration."
+        )
+    if result_quality["rejected"]:
+        summary_parts.append(
+            f"{result_quality['rejected']} observation(s) failed a quality or "
+            "disambiguation gate."
+        )
     if candidate_counts["social_profile"]:
         summary_parts.append(
             f"The evidence includes {candidate_counts['social_profile']} automated "
@@ -598,11 +724,17 @@ def _baseline_report(
             f"{no_results_count} selected source(s) completed without normalized "
             "evidence; this is not evidence of absence."
         )
-    summary_parts.append(
-        f"The correlation model labels identity confidence as "
-        f"{identity_status.value.replace('_', ' ')} and defensive exposure as "
-        f"{risk.value}; neither label confirms profile ownership."
-    )
+    if coverage_assessment in {"insufficient", "partial"}:
+        summary_parts.append(
+            f"Source coverage is {coverage_assessment}; defensive exposure is "
+            "therefore inconclusive rather than low."
+        )
+    else:
+        summary_parts.append(
+            f"The correlation model labels identity confidence as "
+            f"{identity_status.value.replace('_', ' ')} and defensive exposure as "
+            f"{risk.value}; neither label confirms profile ownership."
+        )
     summary = " ".join(summary_parts)
     timeline = _evidence_timeline(evidence)
 
@@ -686,6 +818,13 @@ def _baseline_report(
             "Restore missing connector configuration or runtime dependencies, then "
             "rerun the authorized case before drawing a coverage conclusion."
         )
+    findings.sort(
+        key=lambda item: (
+            _FINDING_CATEGORY_ORDER.get(item.category, 8),
+            -item.confidence,
+            item.title.casefold(),
+        )
+    )
 
     return InvestigationReport(
         executive_summary=summary,
@@ -693,6 +832,8 @@ def _baseline_report(
         identity_confidence=identity_status.value,
         overall_risk=risk,
         evidence_count=len(evidence),
+        result_quality=result_quality,
+        coverage_assessment=coverage_assessment,
         findings=findings,
         timeline=timeline,
         contradictions=contradictions,
@@ -716,6 +857,8 @@ def _baseline_report(
             "Remove credential-like fields before persistence or LLM processing.",
             "Deduplicate observations and increase confidence only for independent "
             "corroboration.",
+            "Apply a quality gate that separates observation confidence from "
+            "identity attribution and quarantines sensitive unverified candidates.",
             "Require every report finding to reference one or more evidence IDs.",
         ],
     )
@@ -1105,7 +1248,8 @@ class PersonReportGenerator:
         previous_evidence: list[Evidence] | None = None,
     ) -> InvestigationReport:
         normalized = [_artifact_to_evidence(artifact) for artifact in artifacts]
-        correlated = correlate_evidence(normalized)
+        quality_gated = refine_evidence_quality(normalized, target)
+        correlated = correlate_evidence(quality_gated)
         baseline = _baseline_report(
             correlated,
             source_status=target.get("_source_status"),

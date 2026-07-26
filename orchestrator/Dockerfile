@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 # System dependencies
@@ -30,7 +33,12 @@ RUN pip install --no-cache-dir \
 
 RUN python -m pip check
 
-# Create data directories
-RUN mkdir -p /data/reports /data/screenshots /data/artifacts
+# Create a fixed, unprivileged runtime identity and writable data directories.
+RUN groupadd --gid 10001 deepvault && \
+    useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin deepvault && \
+    mkdir -p /data/reports /data/screenshots /data/artifacts && \
+    chown -R deepvault:deepvault /app /data
+
+USER deepvault:deepvault
 
 CMD ["celery", "-A", "main", "worker", "--beat", "--loglevel=info"]

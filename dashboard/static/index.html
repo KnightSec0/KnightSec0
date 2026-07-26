@@ -200,14 +200,18 @@
           <div><label for="username">Username</label><input id="username" maxlength="64" autocomplete="off"></div>
           <div><label for="email">Email</label><input id="email" type="email" maxlength="320" autocomplete="off"></div>
         </div>
+        <label for="additional-usernames">Additional known usernames</label>
+        <input id="additional-usernames" placeholder="KnightSec0, another-handle" autocomplete="off">
+        <p class="sub">Comma-separated handles already known to belong to the authorized subject. They are searched independently and are not treated as corroboration.</p>
         <div class="grid-2">
           <div><label for="employer">Employer context</label><input id="employer" maxlength="255"></div>
           <div><label for="location">Location context</label><input id="location" maxlength="255"></div>
         </div>
         <div class="grid-2">
-          <div><label for="domains">Authorized domains</label><input id="domains" placeholder="example.com" autocomplete="off"></div>
-          <div><label for="ips">Authorized IPs</label><input id="ips" placeholder="203.0.113.10" autocomplete="off"></div>
+          <div><label for="domains">Authorized domains</label><input id="domains" placeholder="your-owned-domain.com" autocomplete="off"></div>
+          <div><label for="ips">Authorized public IPs</label><input id="ips" placeholder="Public Internet IP only" autocomplete="off"></div>
         </div>
+        <p class="sub">Leave these fields empty unless the subject owns or is explicitly authorized to assess the assets. Reserved example domains and private IPs are rejected.</p>
         <label for="purpose">Lawful purpose</label>
         <textarea id="purpose" required>Consent-based self-assessment of public OSINT exposure</textarea>
         <div class="grid-2">
@@ -303,6 +307,70 @@
       return `<span class="badge ${escapeHtml(status)}">${escapeHtml(status)}</span>`;
     }
 
+    const findingCategoryOrder = [
+      "corroborated_facts",
+      "probable_profiles",
+      "possible_profiles",
+      "defensive_exposure",
+      "service_signals",
+      "unverified_profiles",
+      "quarantined_candidates",
+      "rejected_observations",
+      "other_observations",
+    ];
+    const findingCategoryLabels = {
+      corroborated_facts: "Corroborated facts",
+      probable_profiles: "Probable profiles",
+      possible_profiles: "Possible profiles",
+      defensive_exposure: "Defensive exposure",
+      service_signals: "Service-presence signals",
+      unverified_profiles: "Unverified username leads",
+      quarantined_candidates: "Quarantined sensitive candidates",
+      rejected_observations: "Rejected observations",
+      other_observations: "Other observations",
+    };
+    const secondaryFindingCategories = new Set([
+      "service_signals",
+      "unverified_profiles",
+      "quarantined_candidates",
+      "rejected_observations",
+      "other_observations",
+    ]);
+
+    function findingCard(finding) {
+      return `<article class="finding">
+        <h4>${escapeHtml(finding.title)}</h4>
+        <p>${escapeHtml(finding.statement)}</p>
+        <p class="sub">${escapeHtml(finding.verification_status || "unverified")} ·
+          ${escapeHtml(Math.round(Number(finding.confidence || 0) * 100))}% identity confidence
+          ${finding.sensitive ? " · quarantined sensitive result" : ""}</p>
+        <span class="evidence">${(finding.evidence_ids || []).map(escapeHtml).join(" · ")}</span>
+      </article>`;
+    }
+
+    function renderFindingGroups(findings) {
+      const grouped = Object.groupBy
+        ? Object.groupBy(findings, item => item.category || "other_observations")
+        : findings.reduce((result, item) => {
+            const category = item.category || "other_observations";
+            (result[category] ||= []).push(item);
+            return result;
+          }, {});
+      return findingCategoryOrder.map(category => {
+        const entries = grouped[category] || [];
+        if (!entries.length) return "";
+        const content = entries.map(findingCard).join("");
+        const label = findingCategoryLabels[category] || category;
+        if (secondaryFindingCategories.has(category)) {
+          return `<details class="evidence-item">
+            <summary><strong>${escapeHtml(label)}</strong> · ${escapeHtml(entries.length)}</summary>
+            ${content}
+          </details>`;
+        }
+        return `<h4>${escapeHtml(label)} · ${escapeHtml(entries.length)}</h4>${content}`;
+      }).join("");
+    }
+
     function renderCases() {
       $("#case-list").innerHTML = state.cases.map(item => `
         <button class="case ${state.selected === item.id ? "active" : ""}" data-id="${item.id}">
@@ -328,7 +396,11 @@
     function transformActions(item) {
       if (item.status !== "completed") return [];
       const values = {
-        username: item.target_username ? [item.target_username] : [],
+        username: [
+          ...(item.target_username ? [item.target_username] : []),
+          ...(Array.isArray(item.additional_usernames)
+            ? item.additional_usernames : []),
+        ],
         email: item.target_email ? [item.target_email] : [],
         domain: Array.isArray(item.authorized_domains) ? item.authorized_domains : [],
       };
@@ -390,9 +462,32 @@
         ? identityGraph.hypotheses : [];
       const graphPivots = Array.isArray(identityGraph.pivots)
         ? identityGraph.pivots : [];
+      const graphNodeById = Object.fromEntries(
+        graphNodes.map(node => [node.id, node])
+      );
       const graphLabels = Object.fromEntries(
         graphNodes.map(node => [node.id, node.label || node.id])
       );
+      const primaryGraphHypotheses = graphHypotheses.filter(hypothesis => {
+        const node = graphNodeById[hypothesis.object_node_id] || {};
+        const verification = node.attributes?.verification_status;
+        return ["confirmed", "highly_probable", "probable", "possible"].includes(
+          verification || hypothesis.identity_status
+        );
+      });
+      const secondaryGraphHypotheses = graphHypotheses.filter(
+        hypothesis => !primaryGraphHypotheses.includes(hypothesis)
+      );
+      const primaryGraphPivots = graphPivots.filter(pivot => {
+        const node = graphNodeById[pivot.node_id] || {};
+        return ["confirmed", "highly_probable", "probable", "possible"].includes(
+          node.attributes?.verification_status
+        );
+      });
+      const secondaryGraphPivots = graphPivots.filter(
+        pivot => !primaryGraphPivots.includes(pivot)
+      );
+      const resultQuality = report?.result_quality || {};
       const temporal = report?.temporal_comparison || null;
       const temporalCounts = temporal?.counts || {};
       const temporalGroups = temporal
@@ -428,9 +523,15 @@
         </div>
         <div class="cards">
           <div class="card"><span>Status</span><strong>${badge(item.status)}</strong></div>
-          <div class="card"><span>Evidence</span><strong>${report?.evidence_count ?? item.artifact_count}</strong></div>
+          <div class="card"><span>Observations</span><strong>${report?.evidence_count ?? item.artifact_count}</strong></div>
+          <div class="card"><span>Actionable</span><strong>${escapeHtml(
+            (resultQuality.confirmed || 0) + (resultQuality.highly_probable || 0) +
+            (resultQuality.probable || 0) + (resultQuality.possible || 0) +
+            (resultQuality.observed || 0)
+          )}</strong></div>
           <div class="card"><span>Identity</span><strong>${escapeHtml(report?.identity_confidence || "—")}</strong></div>
-          <div class="card"><span>Risk</span><strong>${escapeHtml(risk)}</strong></div>
+          <div class="card"><span>Exposure</span><strong>${escapeHtml(risk)}</strong></div>
+          <div class="card"><span>Coverage</span><strong>${escapeHtml(report?.coverage_assessment || "—")}</strong></div>
         </div>
         ${item.error ? `<div class="notice">${escapeHtml(item.error)}</div>` : ""}
         <section class="panel"><h3>Live progress · ${progressPercent}%</h3>
@@ -448,9 +549,10 @@
           <div class="coverage">
             <span class="chip">${escapeHtml(graphNodes.length)} nodes</span>
             <span class="chip">${escapeHtml(graphEdges.length)} relationships</span>
-            <span class="chip">${escapeHtml(graphHypotheses.length)} hypotheses</span>
+            <span class="chip">${escapeHtml(primaryGraphHypotheses.length)} reviewable</span>
+            <span class="chip">${escapeHtml(secondaryGraphHypotheses.length)} low-signal</span>
           </div>
-          ${graphHypotheses.map(hypothesis => `<article class="finding">
+          ${primaryGraphHypotheses.map(hypothesis => `<article class="finding">
             <h4>${escapeHtml(hypothesis.identity_status)} ·
               ${escapeHtml(Math.round(Number(hypothesis.confidence || 0) * 100))}%</h4>
             <p>${escapeHtml(hypothesis.claim)}</p>
@@ -459,7 +561,17 @@
               ? `<ul class="report-list">${hypothesis.limitations.map(limit =>
                   `<li>${escapeHtml(limit)}</li>`).join("")}</ul>`
               : ""}
-          </article>`).join("") || `<p class="sub">No evidence-backed identity hypothesis is available yet.</p>`}
+          </article>`).join("") || `<p class="sub">No profile currently meets the threshold for prominent identity review.</p>`}
+          ${secondaryGraphHypotheses.length ? `<details class="evidence-item">
+            <summary><strong>Unverified, quarantined and rejected graph hypotheses</strong> ·
+              ${escapeHtml(secondaryGraphHypotheses.length)}</summary>
+            ${secondaryGraphHypotheses.map(hypothesis => `<article class="finding">
+              <h4>${escapeHtml(hypothesis.identity_status)} ·
+                ${escapeHtml(Math.round(Number(hypothesis.confidence || 0) * 100))}%</h4>
+              <p>${escapeHtml(hypothesis.claim)}</p>
+              <span class="evidence">${(hypothesis.evidence_ids || []).map(escapeHtml).join(" · ")}</span>
+            </article>`).join("")}
+          </details>` : ""}
           <details class="evidence-item">
             <summary><strong>Provenance relationships</strong> · ${escapeHtml(graphEdges.length)}</summary>
             ${graphEdges.slice(0, 60).map(edge => `<article class="finding">
@@ -476,14 +588,23 @@
               : ""}
           </details>
           <h4>Ranked analyst pivots</h4>
-          ${graphPivots.map(pivot => `<article class="finding">
+          ${primaryGraphPivots.map(pivot => `<article class="finding">
             <h4>#${escapeHtml(pivot.rank)} · ${escapeHtml(pivot.title)}</h4>
             <p>${escapeHtml(pivot.rationale)}</p>
             <p>${escapeHtml(pivot.action)}</p>
             <p class="sub">${escapeHtml(pivot.priority)} priority · Manual review only ·
               New authorization required</p>
             <span class="evidence">${(pivot.evidence_ids || []).map(escapeHtml).join(" · ")}</span>
-          </article>`).join("") || `<p class="sub">No evidence-backed pivots are available.</p>`}
+          </article>`).join("") || `<p class="sub">No high-value evidence-backed pivots are available.</p>`}
+          ${secondaryGraphPivots.length ? `<details class="evidence-item">
+            <summary><strong>Low-signal manual-review queue</strong> ·
+              ${escapeHtml(secondaryGraphPivots.length)}</summary>
+            ${secondaryGraphPivots.map(pivot => `<article class="finding">
+              <h4>#${escapeHtml(pivot.rank)} · ${escapeHtml(pivot.title)}</h4>
+              <p>${escapeHtml(pivot.rationale)}</p>
+              <span class="evidence">${(pivot.evidence_ids || []).map(escapeHtml).join(" · ")}</span>
+            </article>`).join("")}
+          </details>` : ""}
         </section>
         ${temporal ? `<section class="panel"><h3>Changes since the previous comparable case</h3>
           <div class="coverage">
@@ -539,11 +660,7 @@
           </details>`).join("") || `<p class="sub">Evidence appears here as each collection stage finishes.</p>`}
         </section>
         <section class="panel"><h3>Evidence-linked findings</h3>
-          ${findings.map(finding => `<article class="finding">
-            <h4>${escapeHtml(finding.title)}</h4>
-            <p>${escapeHtml(finding.statement)}</p>
-            <span class="evidence">${finding.evidence_ids.map(escapeHtml).join(" · ")}</span>
-          </article>`).join("") || `<p class="sub">No evidence-backed findings yet.</p>`}
+          ${renderFindingGroups(findings) || `<p class="sub">No evidence-backed findings yet.</p>`}
         </section>
         <section class="panel"><h3>Timeline</h3>
           ${timeline.map(event => `<article class="finding">
@@ -606,6 +723,8 @@
       const payload = {
         target_name: $("#name").value,
         target_username: $("#username").value || null,
+        additional_usernames: $("#additional-usernames").value.split(",")
+          .map(value => value.trim()).filter(Boolean),
         target_email: $("#email").value || null,
         employer: $("#employer").value || null,
         location: $("#location").value || null,

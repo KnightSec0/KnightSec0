@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from statistics import mean
-from urllib.parse import urlsplit, urlunsplit
-
 from .models import Evidence, IdentityStatus, SourceReliability
+from .quality import canonical_profile_url, profile_source_family
 
 _RELIABILITY_BONUS = {
     SourceReliability.HIGH: 0.12,
@@ -18,22 +17,16 @@ _RELIABILITY_BONUS = {
 
 def _canonical_value(evidence_type: str, value: str) -> str:
     text = value.strip()
-    if evidence_type in {"social_profile", "web_profile", "source_url"}:
-        try:
-            parsed = urlsplit(text)
-            if parsed.scheme and parsed.netloc:
-                path = parsed.path.rstrip("/")
-                return urlunsplit(
-                    (
-                        parsed.scheme.lower(),
-                        parsed.netloc.lower(),
-                        path,
-                        "",
-                        "",
-                    )
-                )
-        except ValueError:
-            pass
+    if evidence_type in {
+        "github_profile",
+        "public_profile",
+        "social_profile",
+        "web_profile",
+        "source_url",
+    }:
+        canonical = canonical_profile_url(text)
+        if canonical is not None:
+            return canonical
     return text.casefold()
 
 
@@ -56,7 +49,7 @@ def _independence_key(item: Evidence) -> str:
     Blackbird and a direct WhatsMyName adapter must not increase identity
     confidence as though they were independent publishers.
     """
-    return (item.independence_group or item.source).strip().casefold()
+    return profile_source_family(item)
 
 
 def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:

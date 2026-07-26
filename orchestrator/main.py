@@ -206,6 +206,7 @@ def _validate_transform_entity(
         str(value).strip().casefold()
         for value in (
             inv.target_username,
+            *(metadata.get("additional_usernames", []) or []),
             inv.target_email,
             *(metadata.get("authorized_domains", []) or []),
             *(metadata.get("authorized_ips", []) or []),
@@ -413,6 +414,14 @@ async def _run_transform(
             "name": inv.target_name,
             "aliases": inv.target_aliases or [],
             "username": inv.target_username,
+            "usernames": [
+                value
+                for value in (
+                    inv.target_username,
+                    *(metadata.get("additional_usernames", []) or []),
+                )
+                if value
+            ],
             "email": inv.target_email,
             "employer": metadata.get("employer"),
             "location": metadata.get("location"),
@@ -510,6 +519,14 @@ async def _run_investigation_pipeline(
                 "name": inv.target_name,
                 "aliases": inv.target_aliases or [],
                 "username": inv.target_username,
+                "usernames": [
+                    value
+                    for value in (
+                        inv.target_username,
+                        *((inv.case_metadata or {}).get("additional_usernames", []) or []),
+                    )
+                    if value
+                ],
                 "email": inv.target_email,
                 "phone": inv.target_phone,
                 "employer": (inv.case_metadata or {}).get("employer"),
@@ -1144,7 +1161,11 @@ async def _collect_person_intelligence(
     names = [target["name"], *target.get("aliases", [])]
     usernames = [
         value
-        for value in [target.get("username"), *target.get("discovered_usernames", [])]
+        for value in [
+            target.get("username"),
+            *metadata.get("additional_usernames", []),
+            *target.get("discovered_usernames", []),
+        ]
         if value
     ]
     emails = [

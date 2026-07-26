@@ -489,6 +489,24 @@ def _allowlisted_attributes(item: Evidence) -> dict[str, Any]:
         "observation_type": item.type,
         "source": item.source,
     }
+    quality = metadata.get("quality")
+    if isinstance(quality, dict):
+        for field in (
+            "category",
+            "verification_status",
+            "matched_attributes",
+            "flags",
+            "sensitive",
+        ):
+            value = quality.get(field)
+            if isinstance(value, (str, bool)):
+                attributes[field] = value
+            elif isinstance(value, list):
+                attributes[field] = [
+                    cleaned
+                    for member in value[:25]
+                    if (cleaned := _clean_text(member, maximum=255)) is not None
+                ]
     for field in sorted(fields):
         value = public_metadata.get(field)
         if isinstance(value, str):

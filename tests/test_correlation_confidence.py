@@ -63,7 +63,7 @@ class CorrelationConfidenceTests(unittest.TestCase):
             identity_confidence_summary(correlated), IdentityStatus.POSSIBLE
         )
 
-    def test_corroborated_by_contains_only_other_independent_sources(self):
+    def test_username_catalogue_collectors_are_not_independent_sources(self):
         correlated = correlate_evidence(
             [
                 Evidence(
@@ -84,11 +84,34 @@ class CorrelationConfidenceTests(unittest.TestCase):
         )
 
         self.assertEqual(correlated[0].source, "sherlock")
-        self.assertEqual(correlated[0].corroborated_by, ["maigret"])
-        self.assertEqual(correlated[0].identity_status, IdentityStatus.PROBABLE)
+        self.assertEqual(correlated[0].corroborated_by, [])
+        self.assertEqual(correlated[0].identity_status, IdentityStatus.POSSIBLE)
         self.assertEqual(
-            identity_confidence_summary(correlated), IdentityStatus.PROBABLE
+            identity_confidence_summary(correlated), IdentityStatus.POSSIBLE
         )
+
+    def test_independent_primary_publishers_can_corroborate(self):
+        correlated = correlate_evidence(
+            [
+                Evidence(
+                    type="public_profile",
+                    value="https://example.test/alice",
+                    source="github",
+                    confidence=0.45,
+                    reliability=SourceReliability.HIGH,
+                ),
+                Evidence(
+                    type="public_profile",
+                    value="https://example.test/alice/",
+                    source="brave",
+                    confidence=0.47,
+                    reliability=SourceReliability.HIGH,
+                ),
+            ]
+        )
+
+        self.assertEqual(correlated[0].corroborated_by, ["brave"])
+        self.assertEqual(correlated[0].identity_status, IdentityStatus.PROBABLE)
 
     def test_overlapping_catalog_adapters_are_not_independent(self):
         correlated = correlate_evidence(
@@ -184,7 +207,7 @@ class CorrelationConfidenceTests(unittest.TestCase):
 
         self.assertEqual(
             identity_confidence_summary([uncorroborated, correlated]),
-            IdentityStatus.PROBABLE,
+            IdentityStatus.POSSIBLE,
         )
 
 
