@@ -49,6 +49,16 @@ def status_from_score(score: float) -> IdentityStatus:
     return IdentityStatus.INSUFFICIENT_EVIDENCE
 
 
+def _independence_key(item: Evidence) -> str:
+    """Return the underlying collection family, not merely the adapter name.
+
+    Multiple adapters can depend on the same upstream catalogue.  For example,
+    Blackbird and a direct WhatsMyName adapter must not increase identity
+    confidence as though they were independent publishers.
+    """
+    return (item.independence_group or item.source).strip().casefold()
+
+
 def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:
     """Merge duplicate observations and reward independent corroboration."""
     grouped: dict[tuple[str, str], list[Evidence]] = defaultdict(list)
@@ -59,20 +69,27 @@ def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:
     for group in grouped.values():
         representative = group[0]
         sources = sorted({item.source for item in group})
+        independence_groups = sorted({_independence_key(item) for item in group})
         avg_confidence = mean(item.confidence for item in group)
         # Reliability describes the quality of a source, but it is not independent
         # identity corroboration. Applying it to a lone observation can otherwise
         # promote a merely possible match to probable (or beyond).
         reliability_bonus = (
             max(_RELIABILITY_BONUS.get(item.reliability, 0.0) for item in group)
-            if len(sources) > 1
+            if len(independence_groups) > 1
             else 0.0
         )
-        corroboration_bonus = min(max(len(sources) - 1, 0) * 0.10, 0.25)
+        corroboration_bonus = min(
+            max(len(independence_groups) - 1, 0) * 0.10,
+            0.25,
+        )
         score = min(avg_confidence + reliability_bonus + corroboration_bonus, 0.99)
         independent_sources = [
-            source for source in sources if source != representative.source
+            item.source
+            for item in group
+            if _independence_key(item) != _independence_key(representative)
         ]
+        independent_sources = sorted(set(independent_sources))
         identity_status = status_from_score(score)
         statuses = {item.identity_status for item in group}
         if statuses == {IdentityStatus.UNRELATED}:
@@ -81,7 +98,7 @@ def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:
             # Conflicting positive and negative disambiguation signals require
             # analyst review; they can never be promoted to probable.
             identity_status = IdentityStatus.POSSIBLE
-        elif len(sources) == 1 and identity_status in {
+        elif len(independence_groups) == 1 and identity_status in {
             IdentityStatus.PROBABLE,
             IdentityStatus.HIGHLY_PROBABLE,
             IdentityStatus.CONFIRMED,
@@ -96,14 +113,16 @@ def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:
         )
         merged_notes.append(
             f"Correlated from {len(group)} observation(s) across "
-            f"{len(sources)} independent source(s)."
+            f"{len(independence_groups)} independent source group(s)."
         )
         # Preserve the representative's normalized public fields for report
         # rendering while retaining the full observation ledger for provenance.
         merged_metadata = {
             **representative.metadata,
             "observations": [item.safe_dump() for item in group],
-            "source_count": len(sources),
+            "source_count": len(independence_groups),
+            "collector_count": len(sources),
+            "independence_groups": independence_groups,
         }
 
         correlated.append(

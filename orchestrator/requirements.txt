@@ -10,6 +10,13 @@ redis>=5.0.7
 neo4j>=5.22.0
 elasticsearch>=8.14.0
 elastic-transport>=8.13.0
+networkx>=3.3
+rapidfuzz>=3.9.0
+tldextract>=5.1.2
+phonenumbers>=8.13.39
+dnspython>=2.6.1
+stix2>=3.0.1
+jsonschema>=4.22.0
 
 # HTTP
 aiohttp>=3.9.5

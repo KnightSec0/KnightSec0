@@ -19,7 +19,13 @@ from intelligence.models import InvestigationTarget
 from intelligence.policy import CollectionPolicy
 from intelligence.redaction import redact_sensitive
 from investigators.person_intelligence import PersonIntelligenceInvestigator
-from main import app, engine, _previous_report_evidence, _running_task_is_stale
+from main import (
+    _previous_report_evidence,
+    _running_task_is_stale,
+    _transform_run_is_active,
+    app,
+    engine,
+)
 from reporting.person_report import (
     PersonReportGenerator,
     _baseline_report,
@@ -57,7 +63,38 @@ def comparison_metadata(**overrides):
 class IntelligenceTests(unittest.TestCase):
     def test_celery_registers_stable_task_names(self):
         self.assertIn("deepvault.run_investigation", app.tasks)
+        self.assertIn("deepvault.run_transform", app.tasks)
         self.assertIn("deepvault.periodic_healthcheck", app.tasks)
+
+    def test_transform_run_idempotency_allows_only_stale_recovery(self):
+        recent = datetime.now(timezone.utc).isoformat()
+        stale = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        self.assertTrue(
+            _transform_run_is_active(
+                {"transform_runs": [{"id": "RUN-1", "status": "completed"}]},
+                "RUN-1",
+            )
+        )
+        self.assertTrue(
+            _transform_run_is_active(
+                {
+                    "transform_runs": [
+                        {"id": "RUN-2", "status": "running", "started_at": recent}
+                    ]
+                },
+                "RUN-2",
+            )
+        )
+        self.assertFalse(
+            _transform_run_is_active(
+                {
+                    "transform_runs": [
+                        {"id": "RUN-3", "status": "running", "started_at": stale}
+                    ]
+                },
+                "RUN-3",
+            )
+        )
 
     def test_async_database_connections_are_not_reused_across_task_loops(self):
         self.assertIsInstance(engine.sync_engine.pool, NullPool)

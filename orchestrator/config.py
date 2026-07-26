@@ -68,6 +68,36 @@ class Settings:
     # Connector safety / resource controls
     connector_timeout: int = int(os.getenv("CONNECTOR_TIMEOUT", "30"))
     max_osint_concurrency: int = int(os.getenv("MAX_OSINT_CONCURRENCY", "4"))
+    max_parallel_transforms: int = int(
+        os.getenv("MAX_PARALLEL_TRANSFORMS", "6")
+    )
+    max_results_per_transform: int = int(
+        os.getenv("MAX_RESULTS_PER_TRANSFORM", "200")
+    )
+    max_graph_nodes: int = int(os.getenv("MAX_GRAPH_NODES", "3000"))
+    max_pivot_depth: int = int(os.getenv("MAX_PIVOT_DEPTH", "2"))
+    transform_timeout: int = int(os.getenv("TRANSFORM_TIMEOUT", "120"))
+    transform_cache_ttl_seconds: int = int(
+        os.getenv("CACHE_TTL_SECONDS", "86400")
+    )
+    max_transform_input_bytes: int = int(
+        os.getenv("MAX_TRANSFORM_INPUT_BYTES", str(25 * 1024 * 1024))
+    )
+    max_transform_output_bytes: int = int(
+        os.getenv("MAX_TRANSFORM_OUTPUT_BYTES", str(5 * 1024 * 1024))
+    )
+    transform_upload_root: str = os.getenv(
+        "TRANSFORM_UPLOAD_ROOT",
+        "/data/uploads",
+    )
+    allow_authenticated_transforms: bool = _env_bool(
+        "ALLOW_AUTHENTICATED_TRANSFORMS",
+        False,
+    )
+    spiderfoot_poll_interval: float = float(
+        os.getenv("SPIDERFOOT_POLL_INTERVAL", "2")
+    )
+    spiderfoot_max_wait: int = int(os.getenv("SPIDERFOOT_MAX_WAIT", "120"))
     running_task_stale_seconds: int = int(
         os.getenv("RUNNING_TASK_STALE_SECONDS", "3600")
     )
@@ -79,7 +109,8 @@ class Settings:
     person_osint_sources: str = os.getenv(
         "PERSON_OSINT_SOURCES",
         "github,gravatar,hibp,hunter,brave,sherlock,maigret,holehe,"
-        "spiderfoot,shodan,censys",
+        "spiderfoot,shodan,censys,blackbird,theharvester,subfinder,httpx,"
+        "ghunt,exiftool,tesseract,poppler",
     )
 
     # Celery / Redis

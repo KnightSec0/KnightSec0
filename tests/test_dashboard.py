@@ -8,7 +8,15 @@ from pydantic import ValidationError
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
-from dashboard.app import InvestigationCreate, render_report_html  # noqa: E402
+from dashboard.app import (  # noqa: E402
+    Investigation,
+    InvestigationCreate,
+    TransformRequest,
+    _active_transform_run_count,
+    _graph_document,
+    _mapping_document,
+    render_report_html,
+)
 
 
 def valid_request(**overrides):
@@ -84,6 +92,150 @@ class DashboardRequestValidationTests(unittest.TestCase):
             )
         )
         self.assertEqual(request.authorized_ips, ["203.0.113.10"])
+
+    def test_active_and_authenticated_transforms_require_separate_scope(self):
+        with self.assertRaisesRegex(ValidationError, "authorized domain"):
+            InvestigationCreate(
+                **valid_request(permitted_sources=["github", "httpx"])
+            )
+        with self.assertRaisesRegex(
+            ValidationError,
+            "authenticated-transform consent",
+        ):
+            InvestigationCreate(
+                **valid_request(permitted_sources=["github", "ghunt"])
+            )
+        request = InvestigationCreate(
+            **valid_request(
+                permitted_sources=["github", "httpx", "ghunt"],
+                authorized_domains=["example.com"],
+                allow_infrastructure_enrichment=True,
+                allow_authenticated_transforms=True,
+            )
+        )
+        self.assertTrue(request.allow_authenticated_transforms)
+
+    def test_transform_request_validates_input_contract(self):
+        request = TransformRequest(
+            transform="blackbird",
+            entity_type="username",
+            value="alice",
+            evidence_ids=["EVID-1", "EVID-1"],
+        )
+        self.assertEqual(request.evidence_ids, ["EVID-1"])
+        with self.assertRaisesRegex(ValidationError, "does not accept"):
+            TransformRequest(
+                transform="subfinder",
+                entity_type="email",
+                value="alice@example.com",
+            )
+
+    def test_parallel_transform_count_ignores_terminal_runs(self):
+        self.assertEqual(
+            _active_transform_run_count(
+                {
+                    "transform_runs": [
+                        {"status": "queued"},
+                        {"status": "running"},
+                        {"status": "completed"},
+                        {"status": "failed"},
+                    ]
+                }
+            ),
+            2,
+        )
+
+
+class DashboardGraphExportTests(unittest.TestCase):
+    def investigation(self):
+        return Investigation(
+            target_name="Alice Example",
+            target_username="alice",
+            status="COMPLETED",
+            case_metadata={
+                "authorization_reference": "SELF-TEST-001",
+                "permitted_sources": ["github", "blackbird"],
+                "structured_report": {
+                    "evidence_ledger": [
+                        {
+                            "id": "EVID-1",
+                            "source": "github",
+                            "type": "github_profile",
+                            "value": "https://github.com/alice",
+                            "observed_at": "2026-07-26T10:00:00Z",
+                            "confidence": 0.62,
+                            "identity_status": "possible",
+                            "independence_group": "publisher:github.com",
+                        }
+                    ],
+                    "identity_graph": {
+                        "nodes": [
+                            {
+                                "id": "NODE-TARGET",
+                                "kind": "authorized_target",
+                                "label": "Alice Example",
+                                "attributes": {},
+                                "evidence_ids": [],
+                            },
+                            {
+                                "id": "NODE-PROFILE",
+                                "kind": "public_profile",
+                                "label": "https://github.com/alice",
+                                "attributes": {"login": "alice"},
+                                "evidence_ids": ["EVID-1"],
+                            },
+                        ],
+                        "edges": [
+                            {
+                                "id": "EDGE-1",
+                                "source_node_id": "NODE-TARGET",
+                                "target_node_id": "NODE-PROFILE",
+                                "relationship": "candidate_profile",
+                                "confidence": 0.62,
+                                "identity_status": "possible",
+                                "evidence_ids": ["EVID-1"],
+                                "independent_source_count": 1,
+                                "provenance_chain": [
+                                    {
+                                        "evidence_id": "EVID-1",
+                                        "source": "github",
+                                        "role": "direct_observation",
+                                        "independence_key": "publisher:github.com",
+                                        "explanation": "Public observation.",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+            },
+        )
+
+    def test_graph_api_and_mapping_export_keep_evidence_provenance(self):
+        investigation = self.investigation()
+        graph = _graph_document(investigation)
+        mapping = _mapping_document(investigation)
+
+        self.assertEqual(graph["schemaVersion"], 2)
+        self.assertEqual(
+            [item["name"] for item in graph["transforms"]],
+            ["blackbird"],
+        )
+        self.assertEqual(mapping["schemaVersion"], 2)
+        profile = next(
+            item
+            for item in mapping["identifiers"]
+            if item["id"] == "NODE-PROFILE"
+        )
+        self.assertEqual(profile["evidenceIds"], ["EVID-1"])
+        self.assertEqual(profile["confidence"], 0.62)
+        self.assertEqual(profile["identityStatus"], "possible")
+        self.assertEqual(profile["independentSourceCount"], 1)
+        self.assertEqual(mapping["connections"][0]["confidence"], 0.62)
+        self.assertEqual(
+            mapping["connections"][0]["provenanceChain"][0]["source"],
+            "github",
+        )
 
 
 class DashboardReportRenderingTests(unittest.TestCase):

@@ -6,9 +6,11 @@ import asyncio
 import base64
 from datetime import datetime, timezone
 import ipaddress
+import json
 import time
 from typing import Any
 from urllib.parse import quote
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -19,6 +21,7 @@ from intelligence.models import (
     IdentityStatus,
     SourceReliability,
 )
+from intelligence.redaction import redact_sensitive
 
 from .base import BaseConnector
 
@@ -221,13 +224,150 @@ class BravePersonSearchConnector(HTTPConnector):
         return ConnectorResult(connector=self.name, evidence=evidence)
 
 
+_SPIDERFOOT_BLOCKED_EVENT_PARTS = {
+    "PASSWORD",
+    "CREDIT_CARD",
+    "IBAN",
+    "COOKIE",
+    "HASH",
+    "PRIVATE_KEY",
+    "RAW_DATA",
+    "RAW_RIR",
+    "DARKNET",
+    "ONION",
+}
+_SPIDERFOOT_EVENT_TYPES = {
+    "EMAILADDR": "email_observation",
+    "EMAILADDR_GENERIC": "email_observation",
+    "USERNAME": "username_observation",
+    "SOCIAL_MEDIA": "social_profile",
+    "SOCIAL_MEDIA_OWNED": "social_profile",
+    "INTERNET_NAME": "domain_observation",
+    "DOMAIN_NAME": "domain_observation",
+    "PARENT_DOMAIN": "domain_observation",
+    "IP_ADDRESS": "infrastructure_observation",
+    "IPV6_ADDRESS": "infrastructure_observation",
+    "PHONE_NUMBER": "phone_observation",
+    "HUMAN_NAME": "person_name_observation",
+    "COMPANY_NAME": "organization_observation",
+    "LINKED_URL_INTERNAL": "web_observation",
+    "LINKED_URL_EXTERNAL": "web_observation",
+    "URL_FORM": "web_observation",
+    "WEB_ANALYTICS_ID": "web_observation",
+    "PROVIDER_DNS": "service",
+    "PROVIDER_EMAIL": "service",
+    "ACCOUNT_EXTERNAL_OWNED": "service",
+}
+
+
+def _spiderfoot_start_id(payload: Any) -> str | None:
+    if (
+        isinstance(payload, list)
+        and len(payload) >= 2
+        and str(payload[0]).upper() == "SUCCESS"
+    ):
+        value = str(payload[1]).strip()
+        return value[:200] if value else None
+    if isinstance(payload, str):
+        value = payload.strip().strip('"')
+        return value[:200] if value else None
+    return None
+
+
+def _spiderfoot_status(payload: Any) -> str | None:
+    if isinstance(payload, list) and len(payload) >= 6:
+        return str(payload[5]).strip().upper()
+    if isinstance(payload, dict):
+        value = payload.get("status")
+        return str(value).strip().upper() if value else None
+    return None
+
+
+def _spiderfoot_source_url(value: str) -> str | None:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return value
+    return None
+
+
+def _spiderfoot_evidence(
+    payload: Any,
+    *,
+    scan_id: str,
+    target: str,
+) -> list[Evidence]:
+    """Normalize a bounded SpiderFoot JSON export without sensitive payloads."""
+    if not isinstance(payload, list):
+        return []
+    evidence: list[Evidence] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in payload[: settings.max_results_per_transform * 4]:
+        if not isinstance(item, dict):
+            continue
+        event_type = str(item.get("event_type") or "").strip().upper()
+        if not event_type or any(
+            part in event_type for part in _SPIDERFOOT_BLOCKED_EVENT_PARTS
+        ):
+            continue
+        false_positive = item.get("false_positive")
+        if false_positive in {True, 1, "1", "true", "True", "yes"}:
+            continue
+        normalized_type = _SPIDERFOOT_EVENT_TYPES.get(event_type)
+        if normalized_type is None:
+            continue
+        value = str(item.get("data") or "").strip()
+        if not value or len(value) > 2000 or "<redacted" in value.casefold():
+            continue
+        module = str(item.get("module") or "unknown").strip()[:120]
+        key = (normalized_type, value.casefold(), module.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        metadata = redact_sensitive(
+            {
+                "spiderfoot_scan_id": scan_id,
+                "spiderfoot_event_type": event_type,
+                "module": module,
+                "scan_target": target,
+                "last_seen": str(item.get("last_seen") or "")[:50] or None,
+                "collection_mode": "passive",
+            }
+        )
+        evidence.append(
+            Evidence(
+                type=normalized_type,
+                value=value,
+                source="spiderfoot",
+                source_url=_spiderfoot_source_url(value),
+                confidence=0.48,
+                reliability=SourceReliability.MEDIUM,
+                identity_status=IdentityStatus.POSSIBLE
+                if normalized_type in {"social_profile", "username_observation"}
+                else IdentityStatus.INSUFFICIENT_EVIDENCE,
+                independence_group=f"spiderfoot:{module.casefold()}",
+                notes=[
+                    "SpiderFoot returned a passive source observation.",
+                    "The observation requires source-level validation before attribution.",
+                ],
+                metadata=metadata,
+            )
+        )
+        if len(evidence) >= settings.max_results_per_transform:
+            break
+    return evidence
+
+
 class SpiderFootConnector(HTTPConnector):
-    """Submit a passive scan to an explicitly configured local SpiderFoot API."""
+    """Run and import an explicitly configured passive SpiderFoot scan."""
 
     name = "spiderfoot"
     identifier_type = "target"
 
     async def search(self, identifier: str) -> ConnectorResult:
+        started = time.monotonic()
         if not settings.spiderfoot_url:
             return ConnectorResult(
                 connector=self.name, errors=["SPIDERFOOT_URL is not configured"]
@@ -235,30 +375,88 @@ class SpiderFootConnector(HTTPConnector):
         async with httpx.AsyncClient(timeout=settings.connector_timeout) as client:
             response = await client.post(
                 f"{settings.spiderfoot_url.rstrip('/')}/startscan",
+                headers={"Accept": "application/json"},
                 data={
                     "scanname": f"DeepVault passive {datetime.now(timezone.utc).isoformat()}",
                     "scantarget": identifier,
+                    "modulelist": "",
+                    "typelist": "",
                     "usecase": "passive",
                 },
             )
-        response.raise_for_status()
-        scan_id = response.text.strip().strip('"')
+            response.raise_for_status()
+            try:
+                start_payload = response.json()
+            except (json.JSONDecodeError, ValueError):
+                start_payload = response.text
+            scan_id = _spiderfoot_start_id(start_payload)
+            if not scan_id:
+                return ConnectorResult(
+                    connector=self.name,
+                    errors=["SpiderFoot rejected the passive scan request"],
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+
+            deadline = time.monotonic() + max(1, settings.spiderfoot_max_wait)
+            terminal_status = None
+            while time.monotonic() < deadline:
+                status_response = await client.get(
+                    f"{settings.spiderfoot_url.rstrip('/')}/scanstatus",
+                    params={"id": scan_id},
+                )
+                status_response.raise_for_status()
+                terminal_status = _spiderfoot_status(status_response.json())
+                if terminal_status == "FINISHED":
+                    break
+                if terminal_status in {
+                    "ABORTED",
+                    "ERROR-FAILED",
+                    "FAILED",
+                    "ERROR",
+                }:
+                    return ConnectorResult(
+                        connector=self.name,
+                        errors=[f"SpiderFoot scan ended in state {terminal_status}"],
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                    )
+                await asyncio.sleep(max(0.2, settings.spiderfoot_poll_interval))
+
+            if terminal_status != "FINISHED":
+                return ConnectorResult(
+                    connector=self.name,
+                    errors=["SpiderFoot scan timed out before result export"],
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+
+            export_response = await client.post(
+                f"{settings.spiderfoot_url.rstrip('/')}/scanexportjsonmulti",
+                data={"ids": scan_id},
+            )
+            export_response.raise_for_status()
+            if len(export_response.content) > settings.max_transform_output_bytes:
+                return ConnectorResult(
+                    connector=self.name,
+                    errors=["SpiderFoot result export exceeded the configured limit"],
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+            try:
+                export_payload = export_response.json()
+            except (json.JSONDecodeError, ValueError):
+                return ConnectorResult(
+                    connector=self.name,
+                    errors=["SpiderFoot returned an invalid result export"],
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+        evidence = _spiderfoot_evidence(
+            export_payload,
+            scan_id=scan_id,
+            target=identifier,
+        )
         return ConnectorResult(
             connector=self.name,
-            evidence=[
-                Evidence(
-                    type="passive_scan",
-                    value=scan_id,
-                    source=self.name,
-                    confidence=0.5,
-                    reliability=SourceReliability.MEDIUM,
-                    metadata={
-                        "target": identifier,
-                        "mode": "passive",
-                        "status": "submitted",
-                    },
-                )
-            ],
+            evidence=evidence,
+            errors=[] if evidence else ["SpiderFoot scan completed with no safe results"],
+            duration_ms=int((time.monotonic() - started) * 1000),
         )
 
 

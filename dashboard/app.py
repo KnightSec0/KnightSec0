@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
@@ -12,12 +13,12 @@ import os
 from pathlib import Path
 import re
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 from uuid import UUID, uuid4
 
 from celery import Celery
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import DateTime, ForeignKey, JSON, String, func, select
 from sqlalchemy.dialects.postgresql import ENUM as PGEnum
@@ -135,6 +136,100 @@ _ALLOWED_SOURCES = {
     "spiderfoot",
     "shodan",
     "censys",
+    "blackbird",
+    "theharvester",
+    "subfinder",
+    "httpx",
+    "ghunt",
+    "exiftool",
+    "tesseract",
+    "poppler",
+}
+_TRANSFORM_CATALOG = {
+    "spiderfoot": {
+        "title": "SpiderFoot passive scan",
+        "accepted_entity_types": ["username", "email", "domain", "hostname", "ip"],
+        "passive": True,
+        "authenticated": False,
+        "priority": "p0",
+    },
+    "sherlock": {
+        "title": "Sherlock username discovery",
+        "accepted_entity_types": ["username"],
+        "passive": True,
+        "authenticated": False,
+        "priority": "p0",
+    },
+    "maigret": {
+        "title": "Maigret username discovery",
+        "accepted_entity_types": ["username"],
+        "passive": True,
+        "authenticated": False,
+        "priority": "p0",
+    },
+    "holehe": {
+        "title": "Holehe service-presence signals",
+        "accepted_entity_types": ["email"],
+        "passive": True,
+        "authenticated": False,
+        "priority": "p0",
+    },
+    "blackbird": {
+        "title": "Blackbird account discovery",
+        "accepted_entity_types": ["username", "email"],
+        "passive": True,
+        "authenticated": False,
+        "priority": "p1",
+    },
+    "theharvester": {
+        "title": "theHarvester passive domain collection",
+        "accepted_entity_types": ["domain"],
+        "passive": True,
+        "authenticated": False,
+        "priority": "p1",
+    },
+    "subfinder": {
+        "title": "Subfinder passive subdomain discovery",
+        "accepted_entity_types": ["domain"],
+        "passive": True,
+        "authenticated": False,
+        "priority": "p1",
+    },
+    "httpx": {
+        "title": "HTTP metadata probe",
+        "accepted_entity_types": ["domain", "hostname", "url"],
+        "passive": False,
+        "authenticated": False,
+        "priority": "p2",
+    },
+    "ghunt": {
+        "title": "GHunt public Google identity",
+        "accepted_entity_types": ["email"],
+        "passive": True,
+        "authenticated": True,
+        "priority": "p2",
+    },
+    "exiftool": {
+        "title": "ExifTool metadata extraction",
+        "accepted_entity_types": ["file"],
+        "passive": True,
+        "authenticated": False,
+        "priority": "p1",
+    },
+    "tesseract": {
+        "title": "Tesseract OCR indicators",
+        "accepted_entity_types": ["file"],
+        "passive": True,
+        "authenticated": False,
+        "priority": "p1",
+    },
+    "poppler": {
+        "title": "Poppler PDF indicators",
+        "accepted_entity_types": ["file"],
+        "passive": True,
+        "authenticated": False,
+        "priority": "p1",
+    },
 }
 
 
@@ -178,6 +273,7 @@ class InvestigationCreate(BaseModel):
     authorized_domains: list[str] = Field(default_factory=list, max_length=20)
     authorized_ips: list[str] = Field(default_factory=list, max_length=20)
     allow_infrastructure_enrichment: bool = False
+    allow_authenticated_transforms: bool = False
     compare_previous_cases: bool = False
     lawful_purpose: str = Field(min_length=8, max_length=500)
     authorization_reference: str = Field(min_length=3, max_length=200)
@@ -291,7 +387,79 @@ class InvestigationCreate(BaseModel):
             raise ValueError(
                 "Shodan and Censys require infrastructure consent and an authorized IP"
             )
+        if "httpx" in self.permitted_sources and (
+            not self.authorized_domains
+            or not self.allow_infrastructure_enrichment
+        ):
+            raise ValueError(
+                "httpx requires infrastructure consent and an authorized domain"
+            )
+        if (
+            "ghunt" in self.permitted_sources
+            and not self.allow_authenticated_transforms
+        ):
+            raise ValueError(
+                "GHunt requires separate authenticated-transform consent"
+            )
         return self
+
+
+class TransformRequest(BaseModel):
+    transform: str = Field(min_length=2, max_length=64)
+    entity_type: str = Field(min_length=1, max_length=80)
+    value: str = Field(min_length=1, max_length=2000)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    pivot_depth: int = Field(default=0, ge=0, le=10)
+
+    @field_validator("transform", "entity_type", "value")
+    @classmethod
+    def clean_transform_strings(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def unique_transform_evidence_ids(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+    @model_validator(mode="after")
+    def validate_transform_shape(self) -> "TransformRequest":
+        name = self.transform.casefold()
+        spec = _TRANSFORM_CATALOG.get(name)
+        if spec is None:
+            raise ValueError("Unknown transform")
+        self.transform = name
+        self.entity_type = self.entity_type.casefold()
+        if self.entity_type not in spec["accepted_entity_types"]:
+            raise ValueError(
+                f"{name} does not accept entity type {self.entity_type}"
+            )
+        return self
+
+
+class GraphLayoutNode(BaseModel):
+    id: str = Field(min_length=1, max_length=160)
+    x: float = Field(ge=-100000, le=100000)
+    y: float = Field(ge=-100000, le=100000)
+    collapsed: bool = False
+
+
+class GraphLayoutUpdate(BaseModel):
+    nodes: list[GraphLayoutNode] = Field(max_length=3000)
+    viewport: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("viewport")
+    @classmethod
+    def validate_viewport(cls, value: dict[str, float]) -> dict[str, float]:
+        allowed = {"x", "y", "zoom"}
+        if set(value) - allowed:
+            raise ValueError("Unsupported viewport field")
+        output = {}
+        for key, member in value.items():
+            number = float(member)
+            if not -100000 <= number <= 100000:
+                raise ValueError("Viewport value is outside the supported range")
+            output[key] = number
+        return output
 
 
 def _database_url() -> str:
@@ -425,6 +593,11 @@ async def _serialize(
         "completed_at": investigation.completed_at,
         "authorization_reference": metadata.get("authorization_reference"),
         "permitted_sources": metadata.get("permitted_sources", []),
+        "authorized_domains": metadata.get("authorized_domains", []),
+        "allow_authenticated_transforms": bool(
+            metadata.get("allow_authenticated_transforms")
+        ),
+        "transform_runs": _redact_for_display(metadata.get("transform_runs", [])),
         "compare_previous_cases": bool(metadata.get("compare_previous_cases")),
         "source_status": metadata.get("source_status", []),
         "artifact_count": await _artifact_count(session, investigation.id),
@@ -450,6 +623,362 @@ async def _get_investigation(
     if investigation is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
     return investigation
+
+
+def _stored_graph(investigation: Investigation) -> dict[str, Any]:
+    report = (investigation.case_metadata or {}).get("structured_report")
+    graph = report.get("identity_graph") if isinstance(report, dict) else None
+    if not isinstance(graph, dict):
+        raise HTTPException(status_code=409, detail="Identity graph is not ready")
+    return _redact_for_display(graph)
+
+
+def _graph_document(investigation: Investigation) -> dict[str, Any]:
+    metadata = investigation.case_metadata or {}
+    graph = _stored_graph(investigation)
+    permitted = {
+        str(source).casefold()
+        for source in metadata.get("permitted_sources", [])
+    }
+    transforms = [
+        {"name": name, **spec}
+        for name, spec in sorted(_TRANSFORM_CATALOG.items())
+        if name in permitted
+    ]
+    return {
+        "schemaVersion": 2,
+        "caseId": str(investigation.id),
+        "authorizationReference": metadata.get("authorization_reference"),
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "graph": graph,
+        "layout": _redact_for_display(metadata.get("graph_layout", {})),
+        "transforms": transforms,
+        "transformRuns": _redact_for_display(metadata.get("transform_runs", [])),
+    }
+
+
+def _node_mapping_type(node: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    kind = str(node.get("kind") or "custom")
+    label = str(node.get("label") or node.get("id") or "Observation")
+    attributes = node.get("attributes")
+    attributes = attributes if isinstance(attributes, dict) else {}
+    if kind == "authorized_target":
+        return "name", {"fullName": label}
+    if kind == "email_observation":
+        value = attributes.get("email") or attributes.get("address")
+        return "email", {"address": value or label}
+    if kind == "phone_observation":
+        return "phone", {"number": attributes.get("phone") or label}
+    if kind == "username_observation":
+        return "custom", {"title": "Username", "value": label}
+    if kind == "public_profile":
+        url = label if label.startswith(("http://", "https://")) else attributes.get("url")
+        hostname = ""
+        if isinstance(url, str):
+            try:
+                hostname = (urlsplit(url).hostname or "").casefold()
+            except ValueError:
+                hostname = ""
+        platform = next(
+            (
+                name
+                for name, domains in {
+                    "instagram": ("instagram.com",),
+                    "facebook": ("facebook.com",),
+                    "twitter": ("twitter.com", "x.com"),
+                    "youtube": ("youtube.com",),
+                    "tiktok": ("tiktok.com",),
+                    "linkedin": ("linkedin.com",),
+                    "reddit": ("reddit.com",),
+                    "telegram": ("t.me", "telegram.me"),
+                }.items()
+                if any(
+                    hostname == domain or hostname.endswith(f".{domain}")
+                    for domain in domains
+                )
+            ),
+            "custom",
+        )
+        if platform == "custom":
+            return "custom", {"title": hostname or "Public profile", "url": url}
+        primary = {
+            "youtube": "channelName",
+            "linkedin": "fullName",
+        }.get(platform, "username")
+        return platform, {
+            primary: (
+                attributes.get("login")
+                or attributes.get("display_name")
+                or label
+            ),
+            "profileUrl": url,
+        }
+    return "custom", {
+        "title": kind.replace("_", " ").title(),
+        "value": label,
+        "url": label if label.startswith(("http://", "https://")) else None,
+    }
+
+
+def _mapping_document(investigation: Investigation) -> dict[str, Any]:
+    metadata = investigation.case_metadata or {}
+    report = metadata.get("structured_report")
+    report = report if isinstance(report, dict) else {}
+    graph = _stored_graph(investigation)
+    nodes = graph.get("nodes", [])
+    nodes = nodes if isinstance(nodes, list) else []
+    edges = graph.get("edges", [])
+    edges = edges if isinstance(edges, list) else []
+    layout = metadata.get("graph_layout")
+    layout = layout if isinstance(layout, dict) else {}
+    layout_nodes = layout.get("nodes", [])
+    positions = {
+        str(item.get("id")): {
+            "x": item.get("x", 0),
+            "y": item.get("y", 0),
+        }
+        for item in layout_nodes
+        if isinstance(item, dict) and item.get("id")
+    } if isinstance(layout_nodes, list) else {}
+    evidence_ledger = report.get("evidence_ledger", [])
+    evidence_index = {
+        str(item.get("id")): item
+        for item in evidence_ledger
+        if isinstance(item, dict) and item.get("id")
+    } if isinstance(evidence_ledger, list) else {}
+
+    identifiers = []
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict) or not node.get("id"):
+            continue
+        node_id = str(node["id"])
+        evidence_ids = [
+            str(value)
+            for value in node.get("evidence_ids", [])
+            if str(value) in evidence_index
+        ]
+        evidence_items = [evidence_index[value] for value in evidence_ids]
+        sources = sorted(
+            {
+                str(item.get("source"))
+                for item in evidence_items
+                if item.get("source")
+            }
+        )
+        observed = sorted(
+            str(item.get("observed_at"))
+            for item in evidence_items
+            if item.get("observed_at")
+        )
+        confidence_values = [
+            float(item["confidence"])
+            for item in evidence_items
+            if isinstance(item.get("confidence"), (int, float))
+        ]
+        statuses = [
+            str(item.get("identity_status"))
+            for item in evidence_items
+            if item.get("identity_status")
+        ]
+        identity_status = next(
+            (
+                status
+                for status in (
+                    "unrelated",
+                    "insufficient_evidence",
+                    "possible",
+                    "probable",
+                    "highly_probable",
+                    "confirmed",
+                )
+                if status in statuses
+            ),
+            None,
+        )
+        independence_groups = {
+            str(item.get("independence_group") or item.get("source"))
+            for item in evidence_items
+            if item.get("independence_group") or item.get("source")
+        }
+        identifier_type, fields = _node_mapping_type(node)
+        identifiers.append(
+            {
+                "id": node_id,
+                "type": identifier_type,
+                "fields": {
+                    key: value
+                    for key, value in fields.items()
+                    if value is not None
+                },
+                "notes": "Evidence-backed DeepVault graph node.",
+                "position": positions.get(
+                    node_id,
+                    {
+                        "x": 60 + (index % 4) * 260,
+                        "y": 60 + (index // 4) * 170,
+                    },
+                ),
+                "customIconId": None,
+                "evidenceIds": evidence_ids,
+                "sources": sources,
+                "confidence": (
+                    max(confidence_values) if confidence_values else None
+                ),
+                "identityStatus": identity_status,
+                "independentSourceCount": len(independence_groups),
+                "provenanceChain": [
+                    {
+                        "evidenceId": str(item.get("id")),
+                        "source": item.get("source"),
+                        "observedAt": item.get("observed_at"),
+                        "independenceGroup": item.get("independence_group"),
+                    }
+                    for item in evidence_items
+                ],
+                "firstObserved": observed[0] if observed else None,
+                "lastObserved": observed[-1] if observed else None,
+                "entityKind": node.get("kind"),
+                "attributes": node.get("attributes", {}),
+            }
+        )
+
+    connections = []
+    for edge in edges:
+        if not isinstance(edge, dict) or not edge.get("id"):
+            continue
+        edge_evidence = [
+            evidence_index[str(value)]
+            for value in edge.get("evidence_ids", [])
+            if str(value) in evidence_index
+        ]
+        observed = sorted(
+            str(item.get("observed_at"))
+            for item in edge_evidence
+            if item.get("observed_at")
+        )
+        connections.append(
+            {
+                "id": str(edge["id"]),
+                "source": edge.get("source_node_id"),
+                "target": edge.get("target_node_id"),
+                "sourceHandle": None,
+                "targetHandle": None,
+                "label": edge.get("relationship", ""),
+                "relationship": edge.get("relationship"),
+                "confidence": edge.get("confidence"),
+                "identityStatus": edge.get("identity_status"),
+                "evidenceIds": edge.get("evidence_ids", []),
+                "sources": sorted(
+                    {
+                        str(step.get("source"))
+                        for step in edge.get("provenance_chain", [])
+                        if isinstance(step, dict) and step.get("source")
+                    }
+                ),
+                "independentSourceCount": edge.get("independent_source_count", 1),
+                "provenanceChain": edge.get("provenance_chain", []),
+                "firstObserved": observed[0] if observed else None,
+                "lastObserved": observed[-1] if observed else None,
+            }
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "schemaVersion": 2,
+        "id": str(investigation.id),
+        "name": f"DeepVault — {investigation.target_name}",
+        "createdAt": (
+            investigation.created_at.isoformat()
+            if investigation.created_at
+            else now
+        ),
+        "updatedAt": now,
+        "target": {
+            "name": investigation.target_name,
+            "notes": (
+                "Imported from an authorized DeepVault case. Every derived "
+                "relationship retains its evidence IDs."
+            ),
+        },
+        "identifiers": identifiers,
+        "connections": connections,
+        "locations": [],
+        "pinLinks": [],
+        "mapDisplay": {
+            "showPinConnections": False,
+            "pinConnectionColor": "#ef4444",
+        },
+        "caseContext": {
+            "authorizationReference": metadata.get("authorization_reference"),
+            "permittedSources": metadata.get("permitted_sources", []),
+        },
+    }
+
+
+def _require_transform_authorization(
+    investigation: Investigation,
+    payload: TransformRequest,
+) -> None:
+    if investigation.status != InvestigationStatus.COMPLETED:
+        raise HTTPException(
+            status_code=409,
+            detail="Transforms require a completed investigation",
+        )
+    metadata = investigation.case_metadata or {}
+    if not metadata.get("authorization_confirmed"):
+        raise HTTPException(status_code=403, detail="Authorization is not confirmed")
+    if payload.transform not in {
+        str(source).casefold()
+        for source in metadata.get("permitted_sources", [])
+    }:
+        raise HTTPException(
+            status_code=403,
+            detail="Transform is outside the approved source scope",
+        )
+    try:
+        expiry = datetime.fromisoformat(
+            str(metadata.get("authorization_expires_at")).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Authorization expiry is invalid",
+        ) from exc
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if expiry <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=403, detail="Authorization has expired")
+    max_depth = max(0, int(os.getenv("MAX_PIVOT_DEPTH", "2")))
+    if payload.pivot_depth > max_depth:
+        raise HTTPException(status_code=400, detail="Pivot depth limit exceeded")
+    spec = _TRANSFORM_CATALOG[payload.transform]
+    if spec["authenticated"] and not metadata.get("allow_authenticated_transforms"):
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated transforms were not approved for this case",
+        )
+
+
+def _append_transform_run(
+    metadata: dict[str, Any],
+    run: dict[str, Any],
+) -> dict[str, Any]:
+    runs = [
+        dict(item)
+        for item in metadata.get("transform_runs", [])
+        if isinstance(item, dict)
+    ][-99:]
+    runs.append(run)
+    return {**metadata, "transform_runs": runs}
+
+
+def _active_transform_run_count(metadata: dict[str, Any]) -> int:
+    return sum(
+        1
+        for item in metadata.get("transform_runs", [])
+        if isinstance(item, dict)
+        and item.get("status") in {"queued", "running"}
+    )
 
 
 @app.get("/")
@@ -493,6 +1022,7 @@ async def create_investigation(payload: InvestigationCreate) -> dict[str, Any]:
         "authorized_domains": payload.authorized_domains,
         "authorized_ips": payload.authorized_ips,
         "allow_infrastructure_enrichment": payload.allow_infrastructure_enrichment,
+        "allow_authenticated_transforms": payload.allow_authenticated_transforms,
         "compare_previous_cases": payload.compare_previous_cases,
     }
     investigation = Investigation(
@@ -538,6 +1068,192 @@ async def get_investigation(investigation_id: UUID) -> dict[str, Any]:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
         return await _serialize(session, investigation, include_report=True)
+
+
+@app.get("/api/transforms")
+async def list_transforms() -> dict[str, Any]:
+    return {
+        "schemaVersion": 1,
+        "transforms": [
+            {"name": name, **spec}
+            for name, spec in sorted(_TRANSFORM_CATALOG.items())
+        ],
+    }
+
+
+@app.get("/api/investigations/{investigation_id}/graph")
+async def get_graph(investigation_id: UUID) -> dict[str, Any]:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        return _graph_document(investigation)
+
+
+@app.get("/api/investigations/{investigation_id}/mapping.osint.json")
+async def download_mapping_project(investigation_id: UUID) -> Response:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        document = _redact_for_display(_mapping_document(investigation))
+        filename = f"deepvault-{investigation_id}.osint.json"
+        return Response(
+            json.dumps(document, indent=2, default=str),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+
+@app.post("/api/investigations/{investigation_id}/graph-layout")
+async def update_graph_layout(
+    investigation_id: UUID,
+    payload: GraphLayoutUpdate,
+) -> dict[str, Any]:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        graph = _stored_graph(investigation)
+        valid_node_ids = {
+            str(node.get("id"))
+            for node in graph.get("nodes", [])
+            if isinstance(node, dict) and node.get("id")
+        }
+        supplied_ids = {node.id for node in payload.nodes}
+        if supplied_ids - valid_node_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="Layout contains nodes outside this case graph",
+            )
+        metadata = investigation.case_metadata or {}
+        investigation.case_metadata = {
+            **metadata,
+            "graph_layout": {
+                "nodes": [node.model_dump() for node in payload.nodes],
+                "viewport": payload.viewport,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+        await session.commit()
+        return {
+            "caseId": str(investigation.id),
+            "nodeCount": len(payload.nodes),
+            "status": "saved",
+        }
+
+
+@app.post("/api/investigations/{investigation_id}/transforms", status_code=202)
+async def execute_transform(
+    investigation_id: UUID,
+    payload: TransformRequest,
+) -> dict[str, Any]:
+    async with sessions() as session:
+        investigation = (
+            await session.execute(
+                select(Investigation)
+                .where(Investigation.id == investigation_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if investigation is None:
+            raise HTTPException(status_code=404, detail="Investigation not found")
+        _require_transform_authorization(investigation, payload)
+        run_id = f"TRUN-{uuid4().hex[:12].upper()}"
+        metadata = investigation.case_metadata or {}
+        max_parallel = max(1, int(os.getenv("MAX_PARALLEL_TRANSFORMS", "6")))
+        if _active_transform_run_count(metadata) >= max_parallel:
+            raise HTTPException(
+                status_code=429,
+                detail="The case has reached its parallel transform limit",
+            )
+        investigation.case_metadata = _append_transform_run(
+            metadata,
+            {
+                "id": run_id,
+                "transform": payload.transform,
+                "entity_type": payload.entity_type,
+                "evidence_ids": payload.evidence_ids,
+                "pivot_depth": payload.pivot_depth,
+                "status": "queued",
+                "queued_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        await session.commit()
+        try:
+            celery.send_task(
+                "deepvault.run_transform",
+                args=[
+                    str(investigation.id),
+                    payload.transform,
+                    {
+                        "type": payload.entity_type,
+                        "value": payload.value,
+                        "evidence_ids": payload.evidence_ids,
+                    },
+                    payload.pivot_depth,
+                    run_id,
+                ],
+            )
+        except Exception as exc:
+            metadata = investigation.case_metadata or {}
+            runs = [
+                {
+                    **item,
+                    **(
+                        {
+                            "status": "failed",
+                            "error": "Worker queue is unavailable",
+                        }
+                        if isinstance(item, dict) and item.get("id") == run_id
+                        else {}
+                    ),
+                }
+                for item in metadata.get("transform_runs", [])
+            ]
+            investigation.case_metadata = {**metadata, "transform_runs": runs}
+            await session.commit()
+            raise HTTPException(
+                status_code=503,
+                detail="Transform was not queued because the worker is unavailable",
+            ) from exc
+        return {
+            "caseId": str(investigation.id),
+            "runId": run_id,
+            "transform": payload.transform,
+            "status": "queued",
+        }
+
+
+@app.get("/api/investigations/{investigation_id}/events")
+async def stream_case_events(investigation_id: UUID) -> StreamingResponse:
+    async with sessions() as session:
+        await _get_investigation(session, investigation_id)
+
+    async def event_stream():
+        previous = ""
+        for _ in range(900):
+            async with sessions() as session:
+                investigation = await _get_investigation(session, investigation_id)
+                payload = await _serialize(
+                    session,
+                    investigation,
+                    include_report=True,
+                )
+            serialized = json.dumps(
+                _redact_for_display(payload),
+                default=str,
+                sort_keys=True,
+            )
+            if serialized != previous:
+                yield f"event: case\ndata: {serialized}\n\n"
+                previous = serialized
+            else:
+                yield "event: heartbeat\ndata: {}\n\n"
+            await asyncio.sleep(2)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/investigations/{investigation_id}/report.json")

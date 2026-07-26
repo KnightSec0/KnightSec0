@@ -129,6 +129,7 @@ class SherlockConnector(BaseConnector):
                     confidence=0.55,
                     reliability=SourceReliability.MEDIUM,
                     identity_status=IdentityStatus.POSSIBLE,
+                    independence_group="sherlock-catalog",
                     notes=[
                         "Username presence is not sufficient to confirm identity.",
                         "Manual profile-content validation is required.",

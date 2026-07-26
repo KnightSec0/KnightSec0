@@ -5,7 +5,8 @@ DeepVault Orchestrator — Celery entrypoint and task definitions.
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
+from pathlib import Path
+from uuid import UUID, uuid4
 
 from celery import Celery
 from celery.signals import worker_ready, worker_shutdown
@@ -29,6 +30,13 @@ from intelligence.models import Evidence, InvestigationTarget
 from intelligence.policy import CollectionPolicy
 from intelligence.redaction import redact_sensitive
 from reporting.person_report import PersonReportGenerator
+from transforms import (
+    TransformBudgets,
+    TransformContext,
+    TransformEntity,
+    TransformRunner,
+    build_default_registry,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -100,6 +108,339 @@ def run_investigation(self, investigation_id: str):
             redelivered=bool(delivery_info.get("redelivered")),
         )
     )
+
+
+@app.task(name="deepvault.run_transform")
+def run_transform(
+    investigation_id: str,
+    transform_name: str,
+    entity_payload: dict,
+    pivot_depth: int = 0,
+    run_id: str | None = None,
+):
+    """Run one analyst-confirmed transform against an authorized case."""
+    asyncio.run(
+        _run_transform(
+            investigation_id=investigation_id,
+            transform_name=transform_name,
+            entity_payload=entity_payload,
+            pivot_depth=pivot_depth,
+            run_id=run_id or f"TRUN-{uuid4().hex[:12].upper()}",
+        )
+    )
+
+
+def _transform_budgets() -> TransformBudgets:
+    return TransformBudgets(
+        max_parallel_transforms=settings.max_parallel_transforms,
+        max_results_per_transform=settings.max_results_per_transform,
+        max_graph_nodes=settings.max_graph_nodes,
+        max_pivot_depth=settings.max_pivot_depth,
+        transform_timeout=settings.transform_timeout,
+        cache_ttl_seconds=settings.transform_cache_ttl_seconds,
+    )
+
+
+def _transform_context(
+    inv: Investigation,
+    *,
+    pivot_depth: int,
+) -> TransformContext:
+    _validate_scoped_authorization(inv)
+    metadata = inv.case_metadata or {}
+    return TransformContext(
+        case_id=str(inv.id),
+        authorization_reference=str(metadata["authorization_reference"]).strip(),
+        lawful_purpose=str(metadata.get("lawful_purpose") or "").strip(),
+        authorization_expires_at=datetime.fromisoformat(
+            str(metadata["authorization_expires_at"]).replace("Z", "+00:00")
+        ),
+        permitted_transforms={
+            str(source).strip().casefold()
+            for source in metadata.get("permitted_sources", [])
+            if str(source).strip()
+        },
+        authorized_domains={
+            str(value).strip().casefold().rstrip(".")
+            for value in metadata.get("authorized_domains", [])
+            if str(value).strip()
+        },
+        authorized_ips={
+            str(value).strip()
+            for value in metadata.get("authorized_ips", [])
+            if str(value).strip()
+        },
+        pivot_depth=pivot_depth,
+        allow_infrastructure_enrichment=bool(
+            settings.allow_infrastructure_enrichment
+            and metadata.get("allow_infrastructure_enrichment")
+        ),
+        allow_authenticated_transforms=bool(
+            settings.allow_authenticated_transforms
+            and metadata.get("allow_authenticated_transforms")
+        ),
+        allow_sensitive_pivots=bool(settings.allow_sensitive_pivots),
+    )
+
+
+def _validate_transform_entity(
+    inv: Investigation,
+    entity: TransformEntity,
+) -> None:
+    """Require graph evidence unless the value was supplied in case scope."""
+    metadata = inv.case_metadata or {}
+    report = metadata.get("structured_report")
+    ledger = report.get("evidence_ledger", []) if isinstance(report, dict) else []
+    valid_evidence_ids = {
+        str(item.get("id"))
+        for item in ledger
+        if isinstance(item, dict) and item.get("id")
+    }
+    if entity.evidence_ids:
+        unknown = set(entity.evidence_ids) - valid_evidence_ids
+        if unknown:
+            raise PermissionError("Transform cites evidence outside this case")
+        return
+
+    scoped_values = {
+        str(value).strip().casefold()
+        for value in (
+            inv.target_username,
+            inv.target_email,
+            *(metadata.get("authorized_domains", []) or []),
+            *(metadata.get("authorized_ips", []) or []),
+        )
+        if value and str(value).strip()
+    }
+    if entity.type == "file":
+        # The adapter independently confines files to TRANSFORM_UPLOAD_ROOT.
+        return
+    if entity.value.strip().casefold().rstrip(".") not in {
+        value.rstrip(".") for value in scoped_values
+    }:
+        raise PermissionError(
+            "A derived transform input must cite evidence from this case"
+        )
+
+
+def _transform_run_update(
+    metadata: dict,
+    run_id: str,
+    **patch,
+) -> dict:
+    runs = [
+        dict(item)
+        for item in metadata.get("transform_runs", [])
+        if isinstance(item, dict)
+    ][-99:]
+    found = False
+    for item in runs:
+        if item.get("id") == run_id:
+            item.update(patch)
+            found = True
+            break
+    if not found:
+        runs.append({"id": run_id, **patch})
+    return {**metadata, "transform_runs": runs}
+
+
+def _transform_run_is_active(metadata: dict, run_id: str) -> bool:
+    for item in metadata.get("transform_runs", []):
+        if not isinstance(item, dict) or item.get("id") != run_id:
+            continue
+        if item.get("status") == "completed":
+            return True
+        if item.get("status") != "running":
+            return False
+        try:
+            started = datetime.fromisoformat(
+                str(item.get("started_at")).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return False
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - started < timedelta(
+            seconds=max(settings.transform_timeout * 2, 60)
+        )
+    return False
+
+
+async def _run_transform(
+    *,
+    investigation_id: str,
+    transform_name: str,
+    entity_payload: dict,
+    pivot_depth: int,
+    run_id: str,
+) -> None:
+    inv_uuid = UUID(investigation_id)
+    entity = TransformEntity.model_validate(entity_payload)
+    registry = build_default_registry()
+    runner = TransformRunner(registry, _transform_budgets())
+
+    async with async_session_factory() as session:
+        inv = (
+            await session.execute(
+                select(Investigation)
+                .where(Investigation.id == inv_uuid)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if inv is None:
+            raise ValueError("Investigation not found")
+        if inv.status != InvestigationStatus.COMPLETED:
+            raise ValueError("Transforms require a completed investigation")
+        if _transform_run_is_active(inv.case_metadata or {}, run_id):
+            logger.info("Transform run %s is already active or completed", run_id)
+            return
+        context = _transform_context(inv, pivot_depth=pivot_depth)
+        _validate_transform_entity(inv, entity)
+        graph = ((inv.case_metadata or {}).get("structured_report") or {}).get(
+            "identity_graph"
+        )
+        current_graph_nodes = (
+            len(graph.get("nodes", [])) if isinstance(graph, dict) else 0
+        )
+        inv.case_metadata = _transform_run_update(
+            inv.case_metadata or {},
+            run_id,
+            transform=transform_name,
+            entity_type=entity.type,
+            evidence_ids=entity.evidence_ids,
+            pivot_depth=pivot_depth,
+            status="running",
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await session.commit()
+
+    try:
+        result = await runner.run(
+            transform_name=transform_name,
+            entity=entity,
+            context=context,
+            current_graph_nodes=current_graph_nodes,
+        )
+    except Exception as exc:
+        async with async_session_factory() as session:
+            inv = (
+                await session.execute(
+                    select(Investigation)
+                    .where(Investigation.id == inv_uuid)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if inv is not None:
+                inv.case_metadata = _transform_run_update(
+                    inv.case_metadata or {},
+                    run_id,
+                    status="failed",
+                    error=f"{type(exc).__name__}: transform failed",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                await session.commit()
+        raise
+
+    async with async_session_factory() as session:
+        inv = (
+            await session.execute(
+                select(Investigation)
+                .where(Investigation.id == inv_uuid)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if inv is None:
+            raise ValueError("Investigation not found after transform")
+        for evidence in result.evidence:
+            session.add(
+                Artifact(
+                    investigation_id=inv_uuid,
+                    source=evidence.source,
+                    source_type=evidence.type,
+                    identifier_type=entity.type,
+                    identifier_value=(
+                        Path(entity.value).name
+                        if entity.type == "file"
+                        else entity.value[:500]
+                    ),
+                    context={
+                        "evidence": redact_sensitive(
+                            evidence.model_dump(mode="json")
+                        )
+                    },
+                    confidence=_confidence_label(evidence.confidence),
+                )
+            )
+        await session.commit()
+
+        artifacts = (
+            await session.scalars(
+                select(Artifact).where(Artifact.investigation_id == inv_uuid)
+            )
+        ).all()
+        metadata = inv.case_metadata or {}
+        source_status = [
+            dict(item)
+            for item in metadata.get("source_status", [])
+            if isinstance(item, dict)
+            and str(item.get("source")) != transform_name
+        ]
+        source_status.append(
+            {
+                "source": transform_name,
+                "status": (
+                    "evidence_collected"
+                    if result.evidence
+                    else "unavailable"
+                    if result.errors
+                    else "no_results"
+                ),
+                "evidence_count": len(result.evidence),
+                **(
+                    {
+                        "reason_code": _connector_status_reason(result.errors),
+                        "detail": _connector_status_detail(
+                            transform_name,
+                            result.errors,
+                        ),
+                    }
+                    if result.errors
+                    else {}
+                ),
+            }
+        )
+        target = {
+            "name": inv.target_name,
+            "aliases": inv.target_aliases or [],
+            "username": inv.target_username,
+            "email": inv.target_email,
+            "employer": metadata.get("employer"),
+            "location": metadata.get("location"),
+            "_source_status": sorted(
+                source_status,
+                key=lambda item: str(item.get("source")),
+            ),
+        }
+        report = await PersonReportGenerator().generate(
+            target=target,
+            artifacts=list(artifacts),
+            current_case_id=str(inv.id),
+        )
+        inv.case_metadata = _transform_run_update(
+            {
+                **metadata,
+                "source_status": target["_source_status"],
+                "structured_report": report.model_dump(mode="json"),
+            },
+            run_id,
+            status="completed",
+            evidence_count=len(result.evidence),
+            error_count=len(result.errors),
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        inv.risk_score = report.overall_risk.value
+        inv.updated_at = _db_now()
+        await session.commit()
 
 
 async def _run_investigation_pipeline(
