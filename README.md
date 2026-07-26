@@ -49,6 +49,8 @@ credentials into the dashboard.
 | Social media | Username-based public-profile discovery | Sherlock, Maigret |
 | Data Breaches | Breach names, dates and exposed data classes (no credentials) | HIBP |
 | Passive scanning | Results from an authorized SpiderFoot server | SpiderFoot |
+| Analyst transforms | Bounded, authorization-gated pivots with shared evidence normalization | Blackbird, theHarvester, Subfinder, httpx, GHunt, ExifTool, Tesseract, Poppler |
+| Interactive mapping | Live graph/SSE APIs and evidence-preserving Mapping Tool schema v2 export | OSINT-Mapping-Tool |
 | Infrastructure | Explicitly authorized literal-IP enrichment | Shodan, Censys |
 | Correlation | Provenance normalization, identity graph, hypotheses and contradiction detection | Local correlation engine |
 | Change tracking | Added, changed, persisting and not-observed evidence between explicitly comparable cases | Local temporal engine |
@@ -120,6 +122,10 @@ credentials into the dashboard.
 
 See [Evidence-first identity analysis](docs/IDENTITY_ANALYSIS.md) for the
 evidence contract and the intentionally excluded prototype behaviors.
+
+See [Evidence-backed transforms and mapping](docs/TRANSFORMS.md) for the
+transform contract, SpiderFoot result ingestion, mapping APIs, and the macOS
+collector workflow.
 
 ### 7. Structured Reporting Engine (orchestrator/reporting/person_report.py)
 - Produces evidence-linked findings with an executive summary and risk level

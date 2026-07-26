@@ -226,12 +226,23 @@
             <label class="source"><input type="checkbox" name="source" value="hunter">Hunter <small>key</small></label>
             <label class="source"><input type="checkbox" name="source" value="brave">Brave <small>key</small></label>
             <label class="source"><input type="checkbox" name="source" value="spiderfoot">SpiderFoot <small>local</small></label>
+            <label class="source"><input type="checkbox" name="source" value="blackbird">Blackbird <small>sidecar</small></label>
+            <label class="source"><input type="checkbox" name="source" value="theharvester">theHarvester <small>domain</small></label>
+            <label class="source"><input type="checkbox" name="source" value="subfinder">Subfinder <small>domain</small></label>
+            <label class="source"><input type="checkbox" name="source" value="httpx">httpx <small>active domain</small></label>
+            <label class="source"><input type="checkbox" name="source" value="ghunt">GHunt <small>authenticated</small></label>
+            <label class="source"><input type="checkbox" name="source" value="exiftool">ExifTool <small>file</small></label>
+            <label class="source"><input type="checkbox" name="source" value="tesseract">Tesseract <small>file</small></label>
+            <label class="source"><input type="checkbox" name="source" value="poppler">Poppler <small>file</small></label>
             <label class="source"><input type="checkbox" name="source" value="shodan">Shodan <small>IP only</small></label>
             <label class="source"><input type="checkbox" name="source" value="censys">Censys <small>IP only</small></label>
           </div>
         </fieldset>
         <label class="consent"><input id="infra-consent" type="checkbox">
-          <span>Permit Shodan/Censys enrichment only for the literal IP addresses entered above. This also requires <code>ALLOW_INFRASTRUCTURE_ENRICHMENT=true</code> in <code>.env</code>.</span>
+          <span>Permit active infrastructure enrichment: Shodan/Censys only for the literal IPs above and httpx only for the authorized domains above. This also requires <code>ALLOW_INFRASTRUCTURE_ENRICHMENT=true</code> in <code>.env</code>.</span>
+        </label>
+        <label class="consent"><input id="authenticated-consent" type="checkbox">
+          <span>Permit separately configured authenticated transforms such as GHunt. DeepVault never accepts or stores session cookies. This also requires <code>ALLOW_AUTHENTICATED_TRANSFORMS=true</code>.</span>
         </label>
         <label class="consent"><input id="compare-history" type="checkbox">
           <span>Compare this run with the latest compatible case under the same unexpired authorization, purpose, and source scope.</span>
@@ -302,6 +313,69 @@
         button.addEventListener("click", () => selectCase(button.dataset.id)));
     }
 
+    const transformInputs = {
+      spiderfoot: ["username", "email", "domain"],
+      sherlock: ["username"],
+      maigret: ["username"],
+      holehe: ["email"],
+      blackbird: ["username", "email"],
+      theharvester: ["domain"],
+      subfinder: ["domain"],
+      httpx: ["domain"],
+      ghunt: ["email"],
+    };
+
+    function transformActions(item) {
+      if (item.status !== "completed") return [];
+      const values = {
+        username: item.target_username ? [item.target_username] : [],
+        email: item.target_email ? [item.target_email] : [],
+        domain: Array.isArray(item.authorized_domains) ? item.authorized_domains : [],
+      };
+      const permitted = new Set(item.permitted_sources || []);
+      const actions = [];
+      for (const [name, entityTypes] of Object.entries(transformInputs)) {
+        if (!permitted.has(name)) continue;
+        for (const entityType of entityTypes) {
+          for (const value of values[entityType] || []) {
+            actions.push(
+              `<button class="secondary transform-action"
+                data-transform="${escapeHtml(name)}"
+                data-entity-type="${escapeHtml(entityType)}"
+                data-value="${encodeURIComponent(value)}">
+                ${escapeHtml(name)} · ${escapeHtml(entityType)}
+              </button>`
+            );
+          }
+        }
+      }
+      return actions;
+    }
+
+    async function queueTransform(button) {
+      button.disabled = true;
+      const original = button.textContent;
+      button.textContent = "Queueing…";
+      try {
+        await api(`/api/investigations/${state.selected}/transforms`, {
+          method: "POST",
+          body: JSON.stringify({
+            transform: button.dataset.transform,
+            entity_type: button.dataset.entityType,
+            value: decodeURIComponent(button.dataset.value),
+            evidence_ids: [],
+            pivot_depth: 0,
+          }),
+        });
+        await selectCase(state.selected);
+      } catch (error) {
+        window.alert(error.message);
+      } finally {
+        button.disabled = false;
+        button.textContent = original;
+      }
+    }
+
     function renderDetail(item) {
       const report = item.report;
       const risk = report?.overall_risk || item.risk_score || "—";
@@ -349,6 +423,7 @@
           <div class="actions">
             <a class="secondary ${item.has_report ? "" : "disabled"}" href="/api/investigations/${item.id}/report.json">Download JSON</a>
             <a class="secondary ${item.has_report ? "" : "disabled"}" href="/api/investigations/${item.id}/report.html">Download report</a>
+            <a class="secondary ${item.has_report ? "" : "disabled"}" href="/api/investigations/${item.id}/mapping.osint.json">Export graph</a>
           </div>
         </div>
         <div class="cards">
@@ -439,6 +514,18 @@
             `<span class="chip">${escapeHtml(source.source)} · ${escapeHtml(source.evidence_count)} · ${escapeHtml(source.status)}</span>`
           ).join("") || `<span class="sub">Coverage appears when evidence is normalized.</span>`}</div>
         </section>
+        <section class="panel"><h3>Analyst-triggered transforms</h3>
+          <p class="sub">Transforms run only after an explicit click and remain constrained by this case’s source scope, authorization expiry, evidence citations, and pivot budgets.</p>
+          <div class="actions">${transformActions(item).join("") ||
+            `<span class="sub">No applicable target transforms were approved for this case.</span>`}</div>
+          ${(item.transform_runs || []).slice().reverse().slice(0, 20).map(run =>
+            `<article class="finding"><h4>${escapeHtml(run.transform)} · ${escapeHtml(run.status)}</h4>
+              <p class="sub">${escapeHtml(run.entity_type || "")} · depth ${escapeHtml(run.pivot_depth || 0)} · ${escapeHtml(run.evidence_count ?? 0)} evidence</p>
+              ${(run.evidence_ids || []).length
+                ? `<span class="evidence">${run.evidence_ids.map(escapeHtml).join(" · ")}</span>`
+                : ""}
+            </article>`).join("")}
+        </section>
         <section class="panel"><h3>Live evidence stream</h3>
           ${liveEvidence.map(evidence => `<details class="evidence-item">
             <summary><strong>${escapeHtml(evidence.source)}</strong> ·
@@ -476,6 +563,8 @@
           <ul class="report-list">${recommendations.map(item =>
             `<li>${escapeHtml(item)}</li>`).join("")}</ul>
         </section>`;
+      document.querySelectorAll(".transform-action").forEach(button =>
+        button.addEventListener("click", () => queueTransform(button)));
     }
 
     async function selectCase(id) {
@@ -525,6 +614,7 @@
         authorized_ips: $("#ips").value.split(",")
           .map(value => value.trim()).filter(Boolean),
         allow_infrastructure_enrichment: $("#infra-consent").checked,
+        allow_authenticated_transforms: $("#authenticated-consent").checked,
         compare_previous_cases: $("#compare-history").checked,
         lawful_purpose: $("#purpose").value,
         authorization_reference: $("#reference").value,

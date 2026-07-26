@@ -164,6 +164,7 @@ class MaigretConnector(BaseConnector):
                         confidence=0.58,
                         reliability=SourceReliability.MEDIUM,
                         identity_status=IdentityStatus.POSSIBLE,
+                        independence_group="maigret-catalog",
                         notes=[
                             "Username presence must be corroborated with profile attributes.",
                         ],

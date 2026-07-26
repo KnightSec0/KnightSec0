@@ -68,6 +68,10 @@ class Evidence(BaseModel):
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     reliability: SourceReliability = SourceReliability.UNKNOWN
     identity_status: IdentityStatus = IdentityStatus.INSUFFICIENT_EVIDENCE
+    authorization_reference: str | None = Field(default=None, max_length=200)
+    evidence_ids: list[str] = Field(default_factory=list)
+    independence_group: str | None = Field(default=None, max_length=100)
+    tool_version: str | None = Field(default=None, max_length=100)
     corroborated_by: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -79,6 +83,17 @@ class Evidence(BaseModel):
         if not cleaned:
             raise ValueError("Evidence strings cannot be blank")
         return cleaned
+
+    @field_validator("evidence_ids", "corroborated_by")
+    @classmethod
+    def unique_string_lists(cls, values: list[str]) -> list[str]:
+        return list(
+            dict.fromkeys(
+                value.strip()
+                for value in values
+                if isinstance(value, str) and value.strip()
+            )
+        )
 
     def safe_dump(self) -> dict[str, Any]:
         """Return an LLM-safe representation with credential-like fields removed."""

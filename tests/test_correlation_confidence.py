@@ -90,6 +90,31 @@ class CorrelationConfidenceTests(unittest.TestCase):
             identity_confidence_summary(correlated), IdentityStatus.PROBABLE
         )
 
+    def test_overlapping_catalog_adapters_are_not_independent(self):
+        correlated = correlate_evidence(
+            [
+                Evidence(
+                    type="social_profile",
+                    value="https://example.test/alice",
+                    source="blackbird",
+                    independence_group="whatsmyname-catalog",
+                    confidence=0.58,
+                ),
+                Evidence(
+                    type="social_profile",
+                    value="https://example.test/alice/",
+                    source="whatsmyname",
+                    independence_group="whatsmyname-catalog",
+                    confidence=0.60,
+                ),
+            ]
+        )
+
+        self.assertEqual(correlated[0].corroborated_by, [])
+        self.assertEqual(correlated[0].identity_status, IdentityStatus.POSSIBLE)
+        self.assertEqual(correlated[0].metadata["source_count"], 1)
+        self.assertEqual(correlated[0].metadata["collector_count"], 2)
+
     def test_identity_summary_caps_uncorroborated_claim_at_possible(self):
         evidence = [
             Evidence(
