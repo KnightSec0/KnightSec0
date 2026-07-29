@@ -416,7 +416,11 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertEqual(report["findings"], [])
         self.assertEqual(report["timeline"], [])
         self.assertEqual(report["contradictions"], [])
-        self.assertEqual(report["overall_risk"], "review_required")
+        self.assertEqual(report["overall_risk"], "not_assessed_after_review")
+        self.assertIn(
+            "No identity association is verified",
+            report["executive_summary"],
+        )
         self.assertIn("excluded as false positives", report["executive_summary"])
         self.assertEqual(
             [item["id"] for item in mapping["identifiers"]],
@@ -435,6 +439,17 @@ class DashboardGraphExportTests(unittest.TestCase):
 
     def test_restoring_evidence_to_review_makes_it_visible_again(self):
         investigation = self.investigation()
+        investigation.case_metadata["structured_report"]["identity_graph"][
+            "nodes"
+        ].append(
+            {
+                "id": "NODE-SOURCE",
+                "kind": "public_source",
+                "label": "github",
+                "attributes": {},
+                "evidence_ids": ["EVID-1"],
+            }
+        )
         investigation.case_metadata["evidence_adjudications"] = {
             "EVID-1": {
                 "status": "needs_review",
@@ -454,6 +469,13 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertEqual(document["stats"]["evidence_count"], 1)
         self.assertEqual(profile["adjudication_status"], "needs_review")
         self.assertEqual(profile["confidence_label"], "Analyst review required")
+        source = next(
+            item
+            for item in document["entities"]
+            if item["entity_id"] == "NODE-SOURCE"
+        )
+        self.assertIsNone(source["adjudication_status"])
+        self.assertEqual(source["adjudication_notes"], [])
         self.assertIn("needs_review", _graph_csv_document(investigation))
 
     def test_interoperable_exports_keep_relationship_evidence_ids(self):
@@ -531,7 +553,12 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertIn("Mark false positive", workbench)
         self.assertIn("Restore to review", workbench)
         self.assertIn("mental health", workbench)
-        self.assertIn("Shift-click to compare", workbench)
+        self.assertIn("Connection view", workbench)
+        self.assertIn("Outgoing from selected", workbench)
+        self.assertIn("Incoming to selected", workbench)
+        self.assertIn("Evidence search", workbench)
+        self.assertIn("data-evidence-focus", workbench)
+        self.assertIn("Click or press Enter on a node", workbench)
         self.assertIn("graph.graphml", workbench)
         self.assertIn("graph.gexf", workbench)
         self.assertIn("graph.csv", workbench)
@@ -691,7 +718,7 @@ class DashboardReportRenderingTests(unittest.TestCase):
             review_summary=review_summary,
         )
 
-        self.assertNotIn("<script>", rendered)
+        self.assertNotIn("<script>alert('target')</script>", rendered)
         self.assertNotIn("<img src=x", rendered)
         self.assertNotIn("<b>manually</b>", rendered)
         self.assertNotIn("<svg onload", rendered)
@@ -709,8 +736,16 @@ class DashboardReportRenderingTests(unittest.TestCase):
         self.assertIn("What you must not conclude", rendered)
         self.assertIn("Full technical provenance", rendered)
         self.assertIn("Evidence-first identity analysis", rendered)
+        self.assertIn('id="interactive-graph"', rendered)
+        self.assertIn('id="graph-direction"', rendered)
+        self.assertIn("Outgoing from selected", rendered)
+        self.assertIn('id="dv-graph-data"', rendered)
+        self.assertIn("report-node", rendered)
+        self.assertIn("evidence-EVID-ABC123", rendered)
+        self.assertIn("href='#evidence-EVID-ABC123'", rendered)
         self.assertIn("Changes since the previous comparable case", rendered)
         self.assertIn("&lt;svg onload=alert(&#x27;graph&#x27;)&gt;", rendered)
+        self.assertIn("\\u003csvg onload=alert('graph')\\u003e", rendered)
         self.assertIn("&lt;iframe src=bad&gt;", rendered)
         self.assertGreaterEqual(rendered.count("EVID-ABC123"), 3)
 

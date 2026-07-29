@@ -176,6 +176,12 @@
     .coverage { display: flex; gap: 8px; flex-wrap: wrap; }
     .chip { border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px;
       font-size: 11px; color: #b9cbc1; }
+    button.chip {
+      font: inherit; background: transparent; cursor: pointer;
+    }
+    button.chip:hover, button.chip:focus-visible {
+      border-color: var(--blue); color: var(--ink); outline: none;
+    }
     .empty { display: grid; place-items: center; min-height: 55vh; text-align: center;
       color: var(--muted); }
     .empty strong { color: var(--ink); display: block; font-size: 20px; margin-bottom: 8px; }
@@ -307,9 +313,13 @@
       display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
       margin-top: 9px; color: var(--muted); font-size: 8px;
     }
-    .evidence-reference code {
+    .evidence-link {
       padding: 3px 5px; border: 1px solid #493049; border-radius: 4px;
       color: #f19aa3; background: #211427; font: 8px ui-monospace, monospace;
+      cursor: pointer;
+    }
+    .evidence-link:hover, .evidence-link:focus-visible {
+      border-color: var(--red); color: white; outline: none;
     }
     .evidence-reference small { color: var(--muted); }
     .overview-grid {
@@ -359,7 +369,8 @@
     .graph-mode-banner + .graph-toolbar { border-radius: 0; }
     .graph-toolbar {
       display: grid; grid-template-columns: minmax(140px, .8fr) minmax(140px, .8fr)
-        minmax(200px, 1fr) auto; gap: 10px; align-items: end;
+        minmax(170px, 1fr) minmax(200px, 1fr) auto;
+      gap: 10px; align-items: end;
       padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px 10px 0 0;
       background: #0b1931;
     }
@@ -393,8 +404,11 @@
       fill: #8fa1bf; font-size: 8px; text-anchor: middle;
       paint-order: stroke; stroke: #071326; stroke-width: 3px; pointer-events: none;
     }
-    .graph-node { cursor: grab; outline: none; }
+    .graph-node { cursor: grab; outline: none; pointer-events: all; }
     .graph-node:active { cursor: grabbing; }
+    .graph-node:focus-visible .node-halo {
+      fill: rgba(122,184,255,.16); stroke: var(--blue); stroke-width: 3;
+    }
     .node-halo { fill: rgba(255,255,255,.025); stroke: #33496f; stroke-width: 1; }
     .node-body { stroke: rgba(255,255,255,.7); stroke-width: 1.5; }
     .confidence-ring {
@@ -468,6 +482,13 @@
     }
     .inspector-entity span, .relationship-card span, .relationship-card small,
     .pivot-card small { color: var(--muted); font-size: 9px; line-height: 1.4; }
+    .graph-select-peer {
+      padding: 0; border: 0; color: var(--blue); background: none;
+      font: inherit; font-weight: 700; text-align: left; cursor: pointer;
+    }
+    .graph-select-peer:hover, .graph-select-peer:focus-visible {
+      color: white; text-decoration: underline; outline: none;
+    }
     .relationship-card em, .pivot-card em {
       color: var(--red); font: normal 8px ui-monospace, monospace;
       overflow-wrap: anywhere;
@@ -488,6 +509,14 @@
     .workbench-table-panel .section-heading { padding: 20px 20px 0; }
     .workbench-table-panel > .notice { margin: 0 20px 18px; }
     .workbench-table-panel > .finding { margin: 0 20px 12px; }
+    .evidence-toolbar {
+      display: grid; grid-template-columns: minmax(220px, 1fr) 180px 180px auto;
+      gap: 10px; align-items: end; padding: 0 20px 18px;
+    }
+    .evidence-toolbar label { margin: 0; }
+    .evidence-toolbar input, .evidence-toolbar select {
+      margin-top: 5px; padding: 9px 10px;
+    }
     .table-wrap { overflow: auto; }
     .evidence-table { width: 100%; border-collapse: collapse; font-size: 10px; }
     .evidence-table th {
@@ -522,6 +551,11 @@
       color: var(--muted); font-size: 10px;
     }
     .metric-strip b { color: var(--ink); margin-left: 5px; }
+    .report-explainer {
+      margin-top: 14px; padding: 12px; border-left: 3px solid var(--amber);
+      background: #201c12; color: #d7deea; font-size: 11px; line-height: 1.55;
+    }
+    .report-explainer p { margin: 5px 0 0; }
     @media (max-width: 880px) {
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -533,6 +567,7 @@
       .lead-actions { grid-column: 2; grid-template-columns: 1fr 1fr; }
       .graph-toolbar { grid-template-columns: 1fr 1fr; }
       .graph-buttons { justify-content: start; grid-column: 1 / -1; }
+      .evidence-toolbar { grid-template-columns: 1fr 1fr; }
       .graph-shell { grid-template-columns: 1fr; }
       aside.node-inspector {
         border-left: 0; border-top: 1px solid var(--line); max-height: none;
@@ -553,6 +588,7 @@
       .lead-actions { grid-template-columns: 1fr; }
       .graph-mode-banner { align-items: flex-start; flex-direction: column; }
       .graph-toolbar, .report-grid { grid-template-columns: 1fr; }
+      .evidence-toolbar { grid-template-columns: 1fr; }
       .graph-buttons, .report-wide { grid-column: auto; }
       .timeline-event { grid-template-columns: 1fr; gap: 8px; }
     }
@@ -754,7 +790,7 @@
       $("#case-list").innerHTML = state.cases.map(item => `
         <button class="case ${state.selected === item.id ? "active" : ""}" data-id="${item.id}">
           <span class="case-top"><strong>${escapeHtml(item.target_name)}</strong>${badge(item.status)}</span>
-          <small>${item.artifact_count} evidence item(s) · ${new Date(item.created_at).toLocaleString()}</small>
+          <small>${item.artifact_count} collected record(s) · ${new Date(item.created_at).toLocaleString()}</small>
         </button>`).join("") || `<p class="sub">No previous cases.</p>`;
       document.querySelectorAll(".case").forEach(button =>
         button.addEventListener("click", () => selectCase(button.dataset.id)));

@@ -75,6 +75,26 @@
   const unique = values => [...new Set(values.filter(Boolean))];
   const relationshipLabel = value => plainRelationshipLabels[value]
     || titleCase(value || "cited relationship");
+  const identityLabel = value => ({
+    insufficient_evidence: "No identity verified",
+    possible: "Possible — verify manually",
+    probable: "Probable — analyst confirmation required",
+    highly_probable: "Highly probable — analyst confirmation required",
+    confirmed: "Confirmed by reviewed public evidence",
+    authorized_target: "Case subject",
+  }[value] || titleCase(value || "not assessed"));
+  const riskLabel = value => ({
+    review_required: "Not assessed — analyst review required",
+    not_assessed_after_review: "Not assessed after analyst review",
+    insufficient_evidence: "Not assessed — insufficient evidence",
+  }[value] || titleCase(value || "not assessed"));
+  const coverageLabel = value => ({
+    evidence_collected: "Public observations collected",
+    no_results: "Checked — no public result",
+    unavailable: "Unavailable — provider or configuration missing",
+    not_queried: "Not selected for this case",
+    insufficient: "Insufficient source coverage",
+  }[value] || titleCase(value || "not assessed"));
   const emailForDisplay = value => {
     const [local, domain] = String(value || "").split("@");
     if (!local || !domain) return value || "";
@@ -83,7 +103,9 @@
   const evidenceReferences = (values, limit = 3) => {
     const cited = unique(values || []);
     if (!cited.length) return `<span class="evidence-reference">No evidence ID</span>`;
-    const visible = cited.slice(0, limit).map(value => `<code>${html(value)}</code>`).join(" ");
+    const visible = cited.slice(0, limit).map(value =>
+      `<button class="evidence-link" type="button"
+        data-evidence-focus="${html(value)}">${html(value)}</button>`).join(" ");
     return `<span class="evidence-reference">${visible}${cited.length > limit
       ? ` <small>+${cited.length - limit} more</small>` : ""}</span>`;
   };
@@ -94,7 +116,7 @@
       low_signal: "Unverified lead",
       suppressed: "Hidden by default",
     }[node.reviewPriority])
-    || titleCase(node.identityStatus || "insufficient_evidence");
+    || identityLabel(node.identityStatus || "insufficient_evidence");
   const decisionLabel = value => ({
     accepted: "Analyst accepted",
     false_positive: "False positive",
@@ -117,6 +139,7 @@
         tab: "overview",
         source: "all",
         type: "all",
+        direction: "all",
         minimumConfidence: 0,
         showLabels: false,
         collapsed: false,
@@ -130,6 +153,9 @@
         graphLoading: false,
         graphLoaded: false,
         graphVersion: null,
+        evidenceQuery: "",
+        evidenceSource: "all",
+        evidenceDecision: "all",
       });
     }
     return caseStates.get(caseId);
@@ -325,6 +351,26 @@
     }
     let edges = data.edges.filter(edge =>
       allowed.has(edge.source_node_id) && allowed.has(edge.target_node_id));
+    const directionalNodeId = [...state.selectedIds][0] || state.focusNodeId;
+    if (directionalNodeId && state.direction !== "all") {
+      edges = edges.filter(edge => {
+        if (state.direction === "outgoing") {
+          return edge.source_node_id === directionalNodeId;
+        }
+        if (state.direction === "incoming") {
+          return edge.target_node_id === directionalNodeId;
+        }
+        return edge.source_node_id === directionalNodeId
+          || edge.target_node_id === directionalNodeId;
+      });
+      const directionalIds = new Set([directionalNodeId]);
+      edges.forEach(edge => {
+        directionalIds.add(edge.source_node_id);
+        directionalIds.add(edge.target_node_id);
+      });
+      records = records.filter(node => directionalIds.has(node.id));
+      allowed = new Set(records.map(node => node.id));
+    }
     if (!state.collapsed) return {nodes: records, edges};
 
     const targetNodes = records.filter(node => node.kind === "authorized_target");
@@ -636,6 +682,18 @@
               ${state.type === type ? "selected" : ""}>${html(titleCase(type))}</option>`).join("")}
           </select>
         </label>
+        <label>Connection view
+          <select id="graph-direction-filter">
+            <option value="all" ${state.direction === "all" ? "selected" : ""}>
+              All visible connections</option>
+            <option value="neighbors" ${state.direction === "neighbors" ? "selected" : ""}>
+              All neighbors of selected</option>
+            <option value="outgoing" ${state.direction === "outgoing" ? "selected" : ""}>
+              Outgoing from selected</option>
+            <option value="incoming" ${state.direction === "incoming" ? "selected" : ""}>
+              Incoming to selected</option>
+          </select>
+        </label>
         <label class="confidence-filter">Minimum confidence
           <span id="confidence-value">${Math.round(state.minimumConfidence * 100)}%</span>
           <input id="graph-confidence-filter" type="range" min="0" max="100"
@@ -658,8 +716,8 @@
           <svg id="identity-map" viewBox="0 0 1000 650"
             role="img" aria-label="Evidence-backed identity graph"></svg>
           <div class="graph-help">
-            Wheel to zoom · drag background to pan · drag nodes to arrange ·
-            double-click for neighborhood · Shift-click to compare
+            Click or press Enter on a node to inspect it · choose a connection
+            direction to navigate inside-out · wheel to zoom · drag to arrange
           </div>
           <div class="graph-legend">
             <span><i class="solid"></i> evidence-supported relationship</span>
@@ -678,7 +736,8 @@
   function nodeSourcesMarkup(node) {
     return (node.sources || []).length
       ? `<div class="chip-row">${node.sources.map(source =>
-          `<span class="chip">${html(source)}</span>`).join("")}</div>`
+          `<button class="chip evidence-source-link" type="button"
+            data-evidence-source="${html(source)}">${html(source)}</button>`).join("")}</div>`
       : `<p class="sub">No publisher metadata on this node.</p>`;
   }
 
@@ -700,7 +759,7 @@
           <span>${html(titleCase(node.kind))} · ${html(confidenceLabel(node))}</span>
         </article>`).join("")}
         <h4>Shared evidence</h4>
-        <p class="evidence">${[...commonEvidence].map(html).join(" · ") || "No shared evidence IDs"}</p>
+        <p class="evidence">${evidenceReferences([...commonEvidence], 20)}</p>
         <p class="inspector-warning">Shared identifiers are analyst leads, not proof that one person owns every account.</p>`;
     }
     const selectedId = selectedIds[0] || state.focusNodeId;
@@ -720,7 +779,7 @@
         <p>${html(node.members?.length || 0)} entities are grouped by type for visual clarity. Their individual evidence records and confidence values remain unchanged.</p>
         ${nodeSourcesMarkup(node)}
         <h4>Evidence IDs</h4>
-        <p class="evidence">${(node.evidence_ids || []).map(html).join(" · ")}</p>
+        <p class="evidence">${evidenceReferences(node.evidence_ids || [], 20)}</p>
         <button class="secondary" id="expand-selected-cluster" type="button">Expand this graph</button>`;
     }
     const adjacent = data.edges.filter(edge =>
@@ -738,7 +797,7 @@
       <div class="inspector-score">
         <strong>${html(confidenceLabel(node))}</strong>
         <span>${html(percent(node.confidence))} technical confidence ·
-          ${html(titleCase(node.identityStatus))}</span>
+          ${html(identityLabel(node.identityStatus))}</span>
       </div>
       ${nodeSourcesMarkup(node)}
       ${profileUrl ? `<a class="secondary inspector-link" href="${html(profileUrl)}"
@@ -750,9 +809,12 @@
         ? `<ul class="compact-list">${node.hypothesis.limitations.map(value =>
             `<li>${html(value)}</li>`).join("")}</ul>` : ""}
       <h4>Evidence IDs</h4>
-      <p class="evidence">${(node.evidence_ids || []).map(html).join(" · ")
-        || "Target context supplied by the case analyst"}</p>
-      ${(node.evidence_ids || []).length ? `<div class="inspector-actions">
+      <p class="evidence">${(node.evidence_ids || []).length
+        ? evidenceReferences(node.evidence_ids || [], 20)
+        : "Target context supplied by the case analyst"}</p>
+      ${(node.evidence_ids || []).length
+        && !["authorized_target", "public_source"].includes(node.kind)
+        ? `<div class="inspector-actions">
         <button class="secondary evidence-decision" type="button"
           data-node-decision="accepted"
           data-evidence-ids="${html((node.evidence_ids || []).join(","))}">Accept observation</button>
@@ -775,9 +837,11 @@
         const peer = data.nodeById[peerId];
         return `<article class="relationship-card">
           <strong>${html(relationshipLabel(edge.relationship))}</strong>
-          <span>${html(peer?.label || peerId)} · ${html(percent(edge.confidence))}</span>
+          <button class="graph-select-peer" type="button"
+            data-node-id="${html(peerId)}">${html(peer?.label || peerId)}</button>
+          <span>${html(percent(edge.confidence))}</span>
           <small>${html(edge.explanation || "")}</small>
-          <em>${(edge.evidence_ids || []).map(html).join(" · ")}</em>
+          <em>${evidenceReferences(edge.evidence_ids || [], 20)}</em>
         </article>`;
       }).join("") || `<p class="sub">No visible adjacent relationship.</p>`}
       <div class="inspector-actions">
@@ -826,29 +890,73 @@
           data-node-id="${html(node.id)}">Run ${html(transform)}</button>`).join("")}</div>`;
   }
 
-  function evidenceMarkup(item, data) {
+  function evidenceMarkup(item, data, state) {
     const decisions = Object.entries(data.adjudications || {});
     const excluded = decisions.filter(
       ([, decision]) => decision?.status === "false_positive",
     );
+    const sources = unique(data.evidence.map(entry => entry.source)).sort();
+    const query = state.evidenceQuery.trim().toLocaleLowerCase();
+    const visibleEvidence = data.evidence.filter(entry => {
+      const decision = data.adjudications?.[entry.id]?.status || "unreviewed";
+      const searchText = [
+        entry.id,
+        entry.type,
+        entry.source,
+        entry.value,
+        entry.source_url,
+      ].join(" ").toLocaleLowerCase();
+      return (!query || searchText.includes(query))
+        && (state.evidenceSource === "all"
+          || entry.source === state.evidenceSource)
+        && (state.evidenceDecision === "all"
+          || decision === state.evidenceDecision);
+    });
     return `<section class="panel workbench-table-panel">
       <div class="section-heading"><div><p class="eyebrow">Evidence ledger</p>
-        <h3>${data.evidence.length} normalized observations</h3></div>
+        <h3>${visibleEvidence.length} of ${data.evidence.length} active observations</h3></div>
         <p class="sub">Review decisions change conclusions and exports, while the append-only audit history remains available.</p></div>
       <div class="notice"><strong>Decision-support boundary:</strong> use cited public facts
         and human review. Do not infer mental health, personality, protected traits, or
         make an automated employment decision.</div>
+      <div class="evidence-toolbar">
+        <label>Evidence search
+          <input id="evidence-search" type="search"
+            value="${html(state.evidenceQuery)}"
+            placeholder="Evidence ID, value, source or type">
+        </label>
+        <label>Source
+          <select id="evidence-source-filter">
+            <option value="all">All sources</option>
+            ${sources.map(source => `<option value="${html(source)}"
+              ${state.evidenceSource === source ? "selected" : ""}>${html(source)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Decision
+          <select id="evidence-decision-filter">
+            ${[
+              ["all", "All decisions"],
+              ["unreviewed", "Not reviewed"],
+              ["needs_review", "Needs review"],
+              ["accepted", "Analyst accepted"],
+            ].map(([value, label]) => `<option value="${value}"
+              ${state.evidenceDecision === value ? "selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </label>
+        <button class="secondary" id="evidence-reset" type="button">Clear filters</button>
+      </div>
       <div class="table-wrap"><table class="evidence-table">
         <thead><tr><th>Evidence</th><th>Type</th><th>Source</th><th>Confidence</th>
           <th>Identity status</th><th>Decision</th><th>Observed</th>
           <th>Public source</th><th>Analyst actions</th></tr></thead>
-        <tbody>${data.evidence.map(entry => {
+        <tbody>${visibleEvidence.map(entry => {
           const url = safeUrl(entry.source_url);
           const decision = data.adjudications?.[entry.id] || {};
-          return `<tr><td><code>${html(entry.id)}</code><small>${html(entry.value)}</small></td>
+          return `<tr id="evidence-row-${html(entry.id)}"><td>
+            <code>${html(entry.id)}</code><small>${html(entry.value)}</small></td>
             <td>${html(entry.type)}</td><td>${html(entry.source)}</td>
             <td>${html(percent(entry.confidence))}</td>
-            <td>${html(titleCase(entry.identity_status || "insufficient_evidence"))}</td>
+            <td>${html(identityLabel(entry.identity_status || "insufficient_evidence"))}</td>
             <td><strong>${html(decisionLabel(decision.status))}</strong>
               ${decision.note ? `<small>${html(decision.note)}</small>` : ""}</td>
             <td>${entry.observed_at ? html(new Date(entry.observed_at).toLocaleString()) : "—"}</td>
@@ -861,7 +969,7 @@
               <button class="secondary evidence-decision danger" type="button"
                 data-evidence-id="${html(entry.id)}" data-evidence-status="false_positive">False positive</button>
             </div></td></tr>`;
-        }).join("") || `<tr><td colspan="9">No active evidence remains.</td></tr>`}</tbody>
+        }).join("") || `<tr><td colspan="9">No active evidence matches these filters.</td></tr>`}</tbody>
       </table></div>
       <div class="section-heading"><div><p class="eyebrow">Excluded observations</p>
         <h3>${excluded.length} false positive${excluded.length === 1 ? "" : "s"}</h3></div>
@@ -887,9 +995,39 @@
       ${timeline.map(event => `<article class="timeline-event">
         <time>${html(new Date(event.occurred_at).toLocaleString())}</time>
         <div><h4>${html(event.description)}</h4>
-          <p class="evidence">${(event.evidence_ids || []).map(html).join(" · ")}</p></div>
+          <p class="evidence">${evidenceReferences(event.evidence_ids || [], 20)}</p></div>
       </article>`).join("") || `<div class="empty-tab">No source-stated event dates are available.</div>`}
     </section>`;
+  }
+
+  function reportFindingsMarkup(findings) {
+    const labels = {
+      corroborated_facts: "Corroborated public facts",
+      probable_profiles: "Probable profiles",
+      possible_profiles: "Possible profiles",
+      defensive_exposure: "Defensive exposure",
+      service_signals: "Service-presence signals",
+      unverified_profiles: "Unverified username leads",
+      quarantined_candidates: "Quarantined sensitive candidates",
+      rejected_observations: "Rejected observations",
+      other_observations: "Other observations",
+    };
+    const groups = (findings || []).reduce((output, finding) => {
+      (output[finding.category || "other_observations"] ||= []).push(finding);
+      return output;
+    }, {});
+    return Object.entries(labels).map(([category, label]) => {
+      const entries = groups[category] || [];
+      if (!entries.length) return "";
+      return `<section class="finding-group"><h3>${html(label)} · ${entries.length}</h3>
+        ${entries.map(finding => `<article class="finding">
+          <h4>${html(finding.title)}</h4>
+          <p>${html(finding.statement)}</p>
+          <p class="sub">${html(titleCase(finding.verification_status || "unverified"))}
+            · ${html(percent(finding.confidence))}</p>
+          ${evidenceReferences(finding.evidence_ids || [], 20)}
+        </article>`).join("")}</section>`;
+    }).join("");
   }
 
   function reportMarkup(item, helpers, data) {
@@ -900,24 +1038,35 @@
     const coverage = report.source_coverage || [];
     const contradictions = report.contradictions || [];
     const recommendations = report.recommendations || [];
+    const summary = data.reviewSummary || fallbackReviewSummary(data, item);
+    const counts = summary.counts || {};
     return `
       <section class="report-grid">
         <article class="panel report-summary"><p class="eyebrow">Executive assessment</p>
           <h3>${html(item.target_name)}</h3><p class="summary">${html(report.executive_summary)}</p>
-          <div class="metric-strip"><span>Identity <b>${html(report.identity_confidence)}</b></span>
-            <span>Exposure <b>${html(report.overall_risk)}</b></span>
-            <span>Coverage <b>${html(report.coverage_assessment)}</b></span></div></article>
+          <div class="metric-strip"><span>Identity <b>${html(identityLabel(report.identity_confidence))}</b></span>
+            <span>Exposure <b>${html(riskLabel(report.overall_risk))}</b></span>
+            <span>Coverage <b>${html(coverageLabel(report.coverage_assessment))}</b></span></div>
+          <div class="report-explainer"><strong>What the current result means</strong>
+            <p>${html(counts.supported || 0)} supported ·
+              ${html(counts.cross_tool_overlap || 0)} cross-tool overlaps ·
+              ${html(counts.service_signals || 0)} service signals ·
+              ${html(counts.low_signal || 0)} unverified leads.
+              Cross-tool overlap prioritizes a manual check; it does not prove account ownership.</p>
+          </div></article>
         <article class="panel"><p class="eyebrow">Source coverage</p>
           <div class="chip-row">${coverage.map(source =>
-            `<span class="chip">${html(source.source)} · ${html(source.evidence_count)} · ${html(source.status)}</span>`
+            `<button class="chip evidence-source-link" type="button"
+              data-evidence-source="${html(source.source)}">${html(source.source)}
+              · ${html(source.evidence_count)} · ${html(coverageLabel(source.status))}</button>`
           ).join("") || `<span class="sub">No coverage records.</span>`}</div></article>
         <article class="panel report-wide"><p class="eyebrow">Evidence-linked findings</p>
-          ${helpers.renderFindingGroups(report.findings || [])
+          ${reportFindingsMarkup(report.findings || [])
             || `<p class="sub">No evidence-backed findings.</p>`}</article>
         <article class="panel"><p class="eyebrow">Contradictions</p>
           ${contradictions.map(entry => `<div class="finding"><p>${html(entry.description)}</p>
             <small>${html(entry.recommendation)}</small>
-            <em class="evidence">${(entry.evidence_ids || []).map(html).join(" · ")}</em></div>`
+            <em class="evidence">${evidenceReferences(entry.evidence_ids || [], 20)}</em></div>`
           ).join("") || `<p class="sub">No evidence-backed contradictions.</p>`}</article>
         <article class="panel"><p class="eyebrow">Recommendations</p>
           <ol class="compact-list">${recommendations.map(entry =>
@@ -1075,6 +1224,20 @@
     });
     svg.querySelectorAll(".graph-node").forEach(element => {
       const nodeId = element.dataset.nodeId;
+      const selectNode = additive => {
+        if (additive) {
+          if (state.selectedIds.has(nodeId)) state.selectedIds.delete(nodeId);
+          else state.selectedIds.add(nodeId);
+        } else {
+          state.selectedIds = new Set([nodeId]);
+        }
+        if (state.direction === "all") {
+          updateInspector(item, state, data);
+          renderGraphSvg(item, state, data);
+        } else {
+          drawActiveGraph(item, state, data);
+        }
+      };
       element.addEventListener("pointerdown", event => {
         event.stopPropagation();
         const cursor = point(event);
@@ -1090,14 +1253,12 @@
       });
       element.addEventListener("click", event => {
         event.stopPropagation();
-        if (event.shiftKey) {
-          if (state.selectedIds.has(nodeId)) state.selectedIds.delete(nodeId);
-          else state.selectedIds.add(nodeId);
-        } else {
-          state.selectedIds = new Set([nodeId]);
-        }
-        updateInspector(item, state, data);
-        renderGraphSvg(item, state, data);
+        selectNode(event.shiftKey);
+      });
+      element.addEventListener("keydown", event => {
+        if (!["Enter", " "].includes(event.key)) return;
+        event.preventDefault();
+        selectNode(event.shiftKey);
       });
       element.addEventListener("dblclick", event => {
         event.preventDefault();
@@ -1197,6 +1358,11 @@
       state.focusNodeId = null;
       drawActiveGraph(item, state, data);
     });
+    document.querySelectorAll(".graph-select-peer").forEach(button =>
+      button.addEventListener("click", () => {
+        state.selectedIds = new Set([button.dataset.nodeId]);
+        drawActiveGraph(item, state, data);
+      }));
     document.querySelectorAll(".graph-pivot").forEach(button =>
       button.addEventListener("click", async () => {
         const status = document.querySelector("#pivot-status");
@@ -1222,7 +1388,10 @@
         }
       }));
     const inspector = document.querySelector("#node-inspector");
-    if (inspector) bindEvidenceDecisionButtons(item, state, inspector);
+    if (inspector) {
+      bindEvidenceDecisionButtons(item, state, inspector);
+      bindEvidenceNavigation(item, state, data, inspector);
+    }
   }
 
   function drawActiveGraph(item, state, data) {
@@ -1239,6 +1408,7 @@
       if (state.simpleGraph) state.showSuppressed = false;
       state.source = "all";
       state.type = "all";
+      state.direction = "all";
       state.minimumConfidence = 0;
       state.focusNodeId = null;
       state.selectedIds = new Set();
@@ -1250,6 +1420,10 @@
     });
     document.querySelector("#graph-type-filter")?.addEventListener("change", event => {
       state.type = event.target.value;
+      drawActiveGraph(item, state, data);
+    });
+    document.querySelector("#graph-direction-filter")?.addEventListener("change", event => {
+      state.direction = event.target.value;
       drawActiveGraph(item, state, data);
     });
     document.querySelector("#graph-confidence-filter")?.addEventListener("input", event => {
@@ -1313,6 +1487,76 @@
         state.selectedIds = new Set([button.dataset.nodeId]);
         showTab(item, state, data);
       }));
+    bindEvidenceNavigation(item, state, data, panel);
+  }
+
+  function bindEvidenceNavigation(item, state, data, root = document) {
+    root.querySelectorAll("[data-evidence-focus]").forEach(button => {
+      if (button.dataset.evidenceBound === "true") return;
+      button.dataset.evidenceBound = "true";
+      button.addEventListener("click", () => {
+        state.evidenceQuery = button.dataset.evidenceFocus || "";
+        state.evidenceSource = "all";
+        state.evidenceDecision = "all";
+        state.tab = "evidence";
+        showTab(item, state, data);
+        document.querySelector("#evidence-search")?.focus();
+      });
+    });
+    root.querySelectorAll("[data-evidence-source]").forEach(button => {
+      if (button.dataset.sourceBound === "true") return;
+      button.dataset.sourceBound = "true";
+      button.addEventListener("click", () => {
+        state.evidenceQuery = "";
+        state.evidenceSource = button.dataset.evidenceSource || "all";
+        state.evidenceDecision = "all";
+        state.tab = "evidence";
+        showTab(item, state, data);
+      });
+    });
+  }
+
+  function drawActiveEvidence(item, state, data) {
+    const panel = document.querySelector("[data-tab-panel='evidence']");
+    if (!panel) return;
+    panel.innerHTML = evidenceMarkup(item, data, state);
+    const redraw = () => drawActiveEvidence(item, state, data);
+    panel.querySelector("#evidence-search")?.addEventListener("input", event => {
+      state.evidenceQuery = event.target.value;
+      redraw();
+      const search = document.querySelector("#evidence-search");
+      search?.focus();
+      search?.setSelectionRange(search.value.length, search.value.length);
+    });
+    panel.querySelector("#evidence-source-filter")?.addEventListener("change", event => {
+      state.evidenceSource = event.target.value;
+      redraw();
+    });
+    panel.querySelector("#evidence-decision-filter")?.addEventListener("change", event => {
+      state.evidenceDecision = event.target.value;
+      redraw();
+    });
+    panel.querySelector("#evidence-reset")?.addEventListener("click", () => {
+      state.evidenceQuery = "";
+      state.evidenceSource = "all";
+      state.evidenceDecision = "all";
+      redraw();
+    });
+    bindEvidenceDecisionButtons(item, state, panel);
+  }
+
+  function drawActiveTimeline(item, state, data) {
+    const panel = document.querySelector("[data-tab-panel='timeline']");
+    if (!panel) return;
+    panel.innerHTML = timelineMarkup(item);
+    bindEvidenceNavigation(item, state, data, panel);
+  }
+
+  function drawActiveReport(item, state, data) {
+    const panel = document.querySelector("[data-tab-panel='report']");
+    if (!panel) return;
+    panel.innerHTML = reportMarkup(item, state.helpers, data);
+    bindEvidenceNavigation(item, state, data, panel);
   }
 
   function showTab(item, state, data) {
@@ -1323,6 +1567,9 @@
     });
     if (state.tab === "overview") drawActiveOverview(item, state, data);
     if (state.tab === "graph") drawActiveGraph(item, state, data);
+    if (state.tab === "evidence") drawActiveEvidence(item, state, data);
+    if (state.tab === "timeline") drawActiveTimeline(item, state, data);
+    if (state.tab === "report") drawActiveReport(item, state, data);
   }
 
   function hydrateGraphDocument(item, state) {
@@ -1351,6 +1598,9 @@
         const freshData = graphData(item, state);
         if (state.tab === "overview") drawActiveOverview(item, state, freshData);
         if (state.tab === "graph") drawActiveGraph(item, state, freshData);
+        if (state.tab === "evidence") drawActiveEvidence(item, state, freshData);
+        if (state.tab === "timeline") drawActiveTimeline(item, state, freshData);
+        if (state.tab === "report") drawActiveReport(item, state, freshData);
       })
       .catch(() => {})
       .finally(() => {
@@ -1413,8 +1663,12 @@
         <div><span>Evidence</span><strong>${html(stats.evidence_count)}</strong></div>
         <div><span>Sources</span><strong>${html(stats.source_count)}</strong></div>
         <div><span>False positives</span><strong>${html(item.false_positive_count || 0)}</strong></div>
-        <div><span>Identity</span><strong>${html(report?.identity_confidence || "—")}</strong></div>
-        <div><span>Exposure</span><strong>${html(report?.overall_risk || item.risk_score || "—")}</strong></div>
+        <div><span>Identity</span><strong>${html(
+          report ? identityLabel(report.identity_confidence) : "—",
+        )}</strong></div>
+        <div><span>Exposure</span><strong>${html(
+          report ? riskLabel(report.overall_risk) : (item.risk_score || "—"),
+        )}</strong></div>
       </div>
       ${item.error ? `<div class="notice">${html(item.error)}</div>` : ""}
       <div class="notice"><strong>Human decision support:</strong> DeepVault presents
@@ -1438,9 +1692,9 @@
       </nav>
       <div data-tab-panel="overview"></div>
       <div data-tab-panel="graph"></div>
-      <div data-tab-panel="evidence" hidden>${evidenceMarkup(item, data)}</div>
-      <div data-tab-panel="timeline" hidden>${timelineMarkup(item)}</div>
-      <div data-tab-panel="report" hidden>${reportMarkup(item, helpers, data)}</div>`;
+      <div data-tab-panel="evidence" hidden></div>
+      <div data-tab-panel="timeline" hidden></div>
+      <div data-tab-panel="report" hidden></div>`;
     document.querySelectorAll("[data-result-tab]").forEach(button =>
       button.addEventListener("click", () => {
         state.tab = button.dataset.resultTab;
@@ -1448,7 +1702,6 @@
       }));
     document.querySelectorAll(".transform-action").forEach(button =>
       button.addEventListener("click", () => helpers.queueTransform(button)));
-    bindEvidenceDecisionButtons(item, state);
     showTab(item, state, data);
     hydrateGraphDocument(item, state);
   }

@@ -18,11 +18,13 @@ available:
 - **Graph** combines normalized observations from every permitted connector.
   It opens in simplified mode with the target and the strongest review leads;
   the full technical provenance graph remains one click away.
-  Drag nodes to arrange them, drag the background to pan, use the wheel to zoom,
-  double-click a node to isolate its neighborhood, or Shift-click several nodes
-  to compare them.
+  Click or press Enter on a node to open its inspector, drag nodes to arrange
+  them, drag the background to pan, use the wheel to zoom, double-click a node
+  to isolate its neighborhood, or Shift-click several nodes to compare them.
 - **Evidence** shows the redacted evidence ledger, immutable evidence IDs,
   source, observation time, confidence, identity status, and safe public links.
+  Search and filter it by source or analyst decision. Clicking an evidence ID
+  anywhere in Overview, Graph, Timeline, or Report opens the matching row.
 - **Timeline** includes only event dates stated by a source. Collection time is
   intentionally not presented as person-history.
 - **Report** keeps the executive summary, evidence-linked findings,
@@ -42,6 +44,10 @@ visual noise without deleting audit evidence. An analyst can switch to the full
 technical graph and can explicitly reveal suppressed results.
 
 Both graph modes can be filtered by source, entity type, and minimum confidence.
+After selecting a node, **Connection view** can show all neighbors, only
+outgoing relationships, or only incoming relationships. Relationship peers in
+the inspector are buttons, so an analyst can navigate the graph inside-out
+without visually locating the next node.
 Entity clusters can be collapsed for large cases without changing the
 underlying evidence. Edge labels can be hidden, the viewport can be reset, and
 reviewed node positions can be saved to the case.
@@ -113,9 +119,13 @@ remain the audit source when another visualization tool does not display every
 provenance field.
 
 The downloadable HTML report now starts with the same plain-language assessment
-and review queue as the dashboard. Full publisher provenance remains available
-inside a collapsed technical section, and the evidence appendix remains
-complete for authorized audit and printing.
+and review queue as the dashboard. It contains a self-contained interactive
+graph with text, type, confidence, incoming/outgoing, zoom, pan, node-inspector,
+public-page, relationship-peer, and evidence-link controls. Evidence IDs,
+coverage citations, findings, timeline entries, contradictions, and technical
+relationships link directly to the evidence appendix. Full publisher provenance
+remains available inside a collapsed technical section, and the evidence
+appendix remains complete for controlled audit and printing.
 
 ## Analyst adjudication and false positives
 

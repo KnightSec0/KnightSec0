@@ -986,7 +986,9 @@ def _effective_report(investigation: Investigation) -> dict[str, Any] | None:
             false_positive_ids,
         )
 
-    graph, _, _, _ = _adjudicated_graph_parts(investigation)
+    graph, graph_nodes, graph_edges, evidence_index = _adjudicated_graph_parts(
+        investigation
+    )
     report["identity_graph"] = graph
     surviving_ids = sorted(
         str(item.get("id"))
@@ -994,14 +996,28 @@ def _effective_report(investigation: Investigation) -> dict[str, Any] | None:
         if item.get("id")
     )
     if false_positive_ids:
+        normalized = _normalized_graph_view(
+            investigation,
+            graph,
+            graph_nodes,
+            graph_edges,
+            evidence_index,
+        )
+        review_counts = normalized.get("review_summary", {}).get("counts", {})
+        supported_count = int(review_counts.get("supported") or 0)
+        review_first_count = int(review_counts.get("review_first") or 0)
+        low_signal_count = int(review_counts.get("low_signal") or 0)
         report["executive_summary"] = (
+            "No identity association is verified by the current evidence. "
             f"After analyst review, {len(surviving_ledger)} active public "
-            f"evidence record(s) remain. {len(false_positive_ids)} observation(s) "
-            "were excluded as false positives and are not used in conclusions. "
-            "Review the remaining cited findings before making any decision."
+            f"record(s) remain: {supported_count} supported candidate(s), "
+            f"{review_first_count} candidate(s) to check first, and "
+            f"{low_signal_count} unverified lead(s). "
+            f"{len(false_positive_ids)} observation(s) were excluded as false "
+            "positives and are not used in conclusions."
         )
         report["executive_summary_evidence_ids"] = surviving_ids
-        report["overall_risk"] = "review_required"
+        report["overall_risk"] = "not_assessed_after_review"
         limitations = report.get("limitations", [])
         limitations = list(limitations) if isinstance(limitations, list) else []
         limitations.append(
@@ -1325,6 +1341,18 @@ def _review_summary(
         if entity.get("entity_type") == "service"
         and entity.get("review_priority") != "suppressed"
     ]
+    analyst_review_required = [
+        entity
+        for entity in candidates
+        if entity.get("adjudication_status")
+        == EvidenceDecisionStatus.NEEDS_REVIEW.value
+    ]
+    analyst_accepted = [
+        entity
+        for entity in candidates
+        if entity.get("adjudication_status")
+        == EvidenceDecisionStatus.ACCEPTED.value
+    ]
     key_points = [
         {
             "title": "Candidate observations",
@@ -1416,6 +1444,10 @@ def _review_summary(
             "review_first": len(review_first),
             "low_signal": len(low_signal),
             "suppressed": len(suppressed),
+            "cross_tool_overlap": len(overlap),
+            "service_signals": len(service_signals),
+            "analyst_review_required": len(analyst_review_required),
+            "analyst_accepted": len(analyst_accepted),
             "relationships": len(relationships),
         },
         "priority_leads": priority_leads,
@@ -1535,6 +1567,10 @@ def _normalized_graph_view(
             confidence = 1.0
             identity_status = "authorized_target"
         cluster_counts[kind] = cluster_counts.get(kind, 0) + 1
+        is_reviewable_entity = kind not in {
+            "authorized_target",
+            "public_source",
+        }
         entity = {
             "entity_id": node_id,
             "entity_type": kind,
@@ -1562,7 +1598,8 @@ def _normalized_graph_view(
             "evidence_ids": evidence_ids,
             "adjudication_status": (
                 EvidenceDecisionStatus.ACCEPTED.value
-                if evidence_ids
+                if is_reviewable_entity
+                and evidence_ids
                 and all(
                     adjudications.get(evidence_id, {}).get("status")
                     == EvidenceDecisionStatus.ACCEPTED.value
@@ -1570,7 +1607,8 @@ def _normalized_graph_view(
                 )
                 else (
                     EvidenceDecisionStatus.NEEDS_REVIEW.value
-                    if any(
+                    if is_reviewable_entity
+                    and any(
                         adjudications.get(evidence_id, {}).get("status")
                         == EvidenceDecisionStatus.NEEDS_REVIEW.value
                         for evidence_id in evidence_ids
@@ -1581,7 +1619,7 @@ def _normalized_graph_view(
             "adjudication_notes": [
                 adjudications[evidence_id]
                 for evidence_id in evidence_ids
-                if evidence_id in adjudications
+                if is_reviewable_entity and evidence_id in adjudications
             ],
         }
         entity.update(
@@ -2688,9 +2726,11 @@ def render_report_html(
     report: dict[str, Any],
     target_name: str,
     review_summary: dict[str, Any] | None = None,
+    graph_document: dict[str, Any] | None = None,
 ) -> str:
     report = _redact_for_display(report)
     review_summary = _redact_for_display(review_summary or {})
+    graph_document = _redact_for_display(graph_document or {})
 
     def safe(value: Any) -> str:
         return escape(str(value if value is not None else ""))
@@ -2704,6 +2744,40 @@ def render_report_html(
             return f"{score * 100:.0f}%"
         return str(value)
 
+    def anchor_id(value: Any) -> str:
+        return re.sub(r"[^A-Za-z0-9_-]+", "-", str(value or "")).strip("-")
+
+    def identity_label(value: Any) -> str:
+        labels = {
+            "insufficient_evidence": "No identity verified",
+            "possible": "Possible — verify manually",
+            "probable": "Probable — analyst confirmation required",
+            "highly_probable": (
+                "Highly probable — analyst confirmation required"
+            ),
+            "confirmed": "Confirmed by reviewed public evidence",
+            "authorized_target": "Case subject",
+        }
+        return labels.get(str(value), str(value or "Not assessed").replace("_", " "))
+
+    def risk_label(value: Any) -> str:
+        labels = {
+            "review_required": "Not assessed — analyst review required",
+            "not_assessed_after_review": "Not assessed after analyst review",
+            "insufficient_evidence": "Not assessed — insufficient evidence",
+        }
+        return labels.get(str(value), str(value or "Not assessed").replace("_", " "))
+
+    def coverage_label(value: Any) -> str:
+        labels = {
+            "evidence_collected": "Public observations collected",
+            "no_results": "Checked — no public result",
+            "unavailable": "Unavailable — provider or configuration missing",
+            "not_queried": "Not selected for this case",
+            "insufficient": "Insufficient source coverage",
+        }
+        return labels.get(str(value), str(value or "Not assessed").replace("_", " "))
+
     def evidence_citations(values: Any, limit: int = 8) -> str:
         evidence_ids = [
             str(value)
@@ -2712,16 +2786,21 @@ def render_report_html(
         ]
         visible = evidence_ids[:limit]
         remaining = len(evidence_ids) - len(visible)
-        citation_text = ", ".join(visible)
+        citation_links = " ".join(
+            f"<a href='#evidence-{safe(anchor_id(value))}'>{safe(value)}</a>"
+            for value in visible
+        )
         if remaining:
-            citation_text += f" · +{remaining} more in the evidence appendix"
+            citation_links += (
+                f" <span>+{remaining} more in the evidence appendix</span>"
+            )
         return (
-            f"<span class='citations'>{safe(citation_text)}</span>"
-            if citation_text
+            f"<span class='citations'>{citation_links}</span>"
+            if citation_links
             else "<span class='citations'>No evidence ID</span>"
         )
 
-    def public_link(value: Any) -> str:
+    def public_named_link(value: Any, label: str) -> str:
         if not isinstance(value, str):
             return ""
         try:
@@ -2732,8 +2811,11 @@ def render_report_html(
             return ""
         return (
             f"<a class='review-link' href='{safe(value)}' "
-            "target='_blank' rel='noreferrer'>Open public page</a>"
+            f"target='_blank' rel='noreferrer'>{safe(label)}</a>"
         )
+
+    def public_link(value: Any) -> str:
+        return public_named_link(value, "Open public page")
 
     verdict = review_summary.get("verdict", {})
     verdict = verdict if isinstance(verdict, dict) else {}
@@ -2845,7 +2927,7 @@ def render_report_html(
             f"<p class='meta'>Status "
             f"{safe(item.get('verification_status') or 'unverified')} · "
             f"Confidence {safe(confidence_label(item.get('confidence')))} · "
-            f"Evidence {safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"Evidence</p>{evidence_citations(item.get('evidence_ids'))}"
             f"{f'<ul>{finding_limitations}</ul>' if finding_limitations else ''}"
             "</article>"
         )
@@ -2871,9 +2953,9 @@ def render_report_html(
             "<tr>"
             f"<td>{safe(item.get('source'))}</td>"
             f"<td>{safe(item.get('evidence_count'))}</td>"
-            f"<td>{safe(str(item.get('status') or '').replace('_', ' '))}</td>"
+            f"<td>{safe(coverage_label(item.get('status')))}</td>"
             f"<td>{safe(item.get('detail'))}</td>"
-            f"<td>{safe(', '.join(item.get('evidence_ids', [])))}</td>"
+            f"<td>{evidence_citations(item.get('evidence_ids'))}</td>"
             "</tr>"
         )
         for item in report.get("source_coverage", [])
@@ -2883,8 +2965,8 @@ def render_report_html(
             "<article class='finding'>"
             f"<p class='meta'>{safe(item.get('occurred_at'))}</p>"
             f"<p>{safe(item.get('description'))}</p>"
-            f"<p class='meta'>Evidence "
-            f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"<p class='meta'>Evidence</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
             "</article>"
         )
         for item in report.get("timeline", [])
@@ -2894,8 +2976,8 @@ def render_report_html(
             "<article class='finding'>"
             f"<p>{safe(item.get('description'))}</p>"
             f"<p>{safe(item.get('recommendation'))}</p>"
-            f"<p class='meta'>Evidence "
-            f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"<p class='meta'>Evidence</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
             "</article>"
         )
         for item in report.get("contradictions", [])
@@ -2924,6 +3006,15 @@ def render_report_html(
         for item in graph_nodes
         if isinstance(item, dict) and item.get("id")
     }
+
+    def graph_node_link(node_id: Any) -> str:
+        node = node_by_id.get(str(node_id), {})
+        label = node_labels.get(str(node_id), node_id)
+        attributes = node.get("attributes")
+        attributes = attributes if isinstance(attributes, dict) else {}
+        value = attributes.get("url") or label
+        return public_named_link(value, str(label)) or safe(label)
+
     reviewable_statuses = {"confirmed", "highly_probable", "probable", "possible"}
 
     def graph_item_is_reviewable(item: dict[str, Any], node_key: str) -> bool:
@@ -2948,8 +3039,8 @@ def render_report_html(
             f"<h3>{safe(item.get('identity_status'))} · "
             f"{safe(confidence_label(item.get('confidence')))}</h3>"
             f"<p>{safe(item.get('claim'))}</p>"
-            f"<p class='meta'>Evidence "
-            f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"<p class='meta'>Evidence</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
             + (
                 "<ul>"
                 + "".join(
@@ -2968,11 +3059,11 @@ def render_report_html(
         (
             "<tr>"
             f"<td>{safe(_PLAIN_RELATIONSHIP_LABELS.get(str(item.get('relationship')), str(item.get('relationship') or '').replace('_', ' ').capitalize()))}</td>"
-            f"<td>{safe(node_labels.get(str(item.get('source_node_id')), item.get('source_node_id')))}</td>"
-            f"<td>{safe(node_labels.get(str(item.get('target_node_id')), item.get('target_node_id')))}</td>"
+            f"<td>{graph_node_link(item.get('source_node_id'))}</td>"
+            f"<td>{graph_node_link(item.get('target_node_id'))}</td>"
             f"<td>{safe(confidence_label(item.get('confidence')))}</td>"
-            f"<td>{safe(item.get('identity_status'))}</td>"
-            f"<td>{safe(', '.join(item.get('evidence_ids', [])))}</td>"
+            f"<td>{safe(identity_label(item.get('identity_status')))}</td>"
+            f"<td>{evidence_citations(item.get('evidence_ids'))}</td>"
             "</tr>"
         )
         for item in graph_edge_items
@@ -2991,8 +3082,8 @@ def render_report_html(
             f"<p>{safe(item.get('action'))}</p>"
             "<p class='meta'>Manual review only · new case approval required · "
             f"{safe(item.get('priority'))} priority</p>"
-            f"<p class='meta'>Evidence "
-            f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"<p class='meta'>Evidence</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
             "</article>"
         )
         for item in primary_graph_pivots
@@ -3033,8 +3124,9 @@ def render_report_html(
                     if changed_fields
                     else ""
                 )
-                + f"<p class='meta'>Evidence {safe(' → '.join(evidence_ids))}</p>"
-                "</article>"
+                + f"<p class='meta'>Evidence</p>"
+                + evidence_citations(evidence_ids)
+                + "</article>"
             )
         if parts:
             temporal_groups.append(f"<h3>{safe(label)}</h3>{''.join(parts)}")
@@ -3058,15 +3150,20 @@ def render_report_html(
         )
     evidence_ledger = "".join(
         (
-            "<article class='finding'>"
+            f"<article class='finding evidence-record' "
+            f"id='evidence-{safe(anchor_id(item.get('id')))}'>"
             f"<h3>{safe(item.get('id'))} · {safe(item.get('source'))}</h3>"
             f"<p><strong>Type:</strong> {safe(item.get('type'))} · "
             f"<strong>Confidence:</strong> "
             f"{safe(confidence_label(item.get('confidence')))} · "
-            f"<strong>Identity:</strong> {safe(item.get('identity_status'))}</p>"
+            f"<strong>Identity:</strong> "
+            f"{safe(identity_label(item.get('identity_status')))}</p>"
             f"<p><strong>Value:</strong> {safe(item.get('value'))}</p>"
-            f"<p><strong>Source URL:</strong> {safe(item.get('source_url'))}</p>"
+            f"<p><strong>Source URL:</strong> "
+            f"{public_link(item.get('source_url')) or 'Not available'}</p>"
             f"<p class='meta'>Observed {safe(item.get('observed_at'))}</p>"
+            "<p><a href='#interactive-graph'>Return to interactive graph</a> · "
+            "<a href='#report-top'>Return to report summary</a></p>"
             f"<pre>{safe(json.dumps(item.get('metadata', {}), indent=2, default=str))}</pre>"
             "</article>"
         )
@@ -3079,7 +3176,8 @@ def render_report_html(
     adjudication_decisions = "".join(
         (
             "<article class='finding'>"
-            f"<h3>{safe(item.get('evidence_id'))} · "
+            f"<h3><a href='#evidence-{safe(anchor_id(item.get('evidence_id')))}'>"
+            f"{safe(item.get('evidence_id'))}</a> · "
             f"{safe(str(item.get('status') or '').replace('_', ' ').title())}</h3>"
             f"<p><strong>Reason:</strong> {safe(item.get('reason_code'))}</p>"
             f"<p>{safe(item.get('note'))}</p>"
@@ -3099,6 +3197,415 @@ def render_report_html(
     methodology = "".join(
         f"<li>{safe(item)}</li>" for item in report.get("methodology", [])
     )
+    normalized_entities = graph_document.get("entities", [])
+    normalized_entities = (
+        normalized_entities if isinstance(normalized_entities, list) else []
+    )
+    normalized_relationships = graph_document.get("relationships", [])
+    normalized_relationships = (
+        normalized_relationships
+        if isinstance(normalized_relationships, list)
+        else []
+    )
+    if not normalized_entities:
+        normalized_entities = [
+            {
+                "entity_id": item.get("id"),
+                "entity_type": item.get("kind"),
+                "label": item.get("label") or item.get("id"),
+                "canonical_value": (
+                    item.get("attributes", {}).get("url")
+                    if isinstance(item.get("attributes"), dict)
+                    else None
+                ),
+                "confidence": (
+                    1
+                    if item.get("id") == identity_graph.get("target_node_id")
+                    else 0
+                ),
+                "identity_status": (
+                    "authorized_target"
+                    if item.get("id") == identity_graph.get("target_node_id")
+                    else "insufficient_evidence"
+                ),
+                "source_tools": [],
+                "evidence_ids": item.get("evidence_ids", []),
+            }
+            for item in graph_nodes
+            if isinstance(item, dict)
+        ]
+    if not normalized_relationships:
+        normalized_relationships = [
+            {
+                "edge_id": item.get("id"),
+                "from_entity_id": item.get("source_node_id"),
+                "to_entity_id": item.get("target_node_id"),
+                "relationship_type": item.get("relationship"),
+                "plain_language_type": _PLAIN_RELATIONSHIP_LABELS.get(
+                    str(item.get("relationship")),
+                    str(item.get("relationship") or "Cited relationship")
+                    .replace("_", " ")
+                    .capitalize(),
+                ),
+                "confidence": item.get("confidence"),
+                "identity_status": item.get("identity_status"),
+                "evidence_ids": item.get("evidence_ids", []),
+                "reason": item.get("explanation"),
+            }
+            for item in graph_edge_items
+            if isinstance(item, dict)
+        ]
+    interactive_payload = {
+        "target_entity_id": (
+            graph_document.get("target_entity_id")
+            or identity_graph.get("target_node_id")
+        ),
+        "entities": normalized_entities,
+        "relationships": normalized_relationships,
+    }
+    graph_data_json = json.dumps(
+        interactive_payload,
+        separators=(",", ":"),
+        default=str,
+    )
+    graph_data_json = (
+        graph_data_json.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+    interactive_graph = f"""
+    <section class="interactive-graph-section" id="interactive-graph">
+      <p class="eyebrow">INTERACTIVE EVIDENCE MAP</p>
+      <h2>Explore the identity graph</h2>
+      <p>Select a node to inspect it. Filter by type, confidence, text, or
+        incoming/outgoing connections. Every evidence ID opens its record below.</p>
+      <div class="graph-controls">
+        <label>Search
+          <input id="graph-search" type="search" placeholder="Name, URL, source or ID">
+        </label>
+        <label>Entity type
+          <select id="graph-type"><option value="all">All entity types</option></select>
+        </label>
+        <label>Connection view
+          <select id="graph-direction">
+            <option value="all">All visible connections</option>
+            <option value="neighbors">All neighbors of selected</option>
+            <option value="outgoing">Outgoing from selected</option>
+            <option value="incoming">Incoming to selected</option>
+          </select>
+        </label>
+        <label>Minimum confidence <span id="graph-confidence-value">0%</span>
+          <input id="graph-confidence" type="range" min="0" max="100" value="0">
+        </label>
+        <button id="graph-reset" type="button">Reset view</button>
+      </div>
+      <p class="graph-counter" id="graph-counter"></p>
+      <div class="interactive-graph-layout">
+        <div class="report-graph-stage">
+          <svg id="report-graph" viewBox="0 0 1000 620"
+            aria-label="Interactive evidence graph"></svg>
+          <p class="graph-instructions">Click or press Enter on a node · wheel
+            to zoom · drag the background to pan</p>
+        </div>
+        <aside id="report-graph-inspector">
+          <h3>Select an entity</h3>
+          <p>Its meaning, sources, relationships, public page, and cited evidence
+            will appear here.</p>
+        </aside>
+      </div>
+    </section>
+    <script type="application/json" id="dv-graph-data">{graph_data_json}</script>
+    """
+    interactive_graph += """
+    <script>
+    (() => {
+      "use strict";
+      const payload = JSON.parse(document.querySelector("#dv-graph-data").textContent);
+      const svg = document.querySelector("#report-graph");
+      if (!svg) return;
+      const entities = Array.isArray(payload.entities) ? payload.entities : [];
+      const relationships = Array.isArray(payload.relationships)
+        ? payload.relationships : [];
+      const byId = Object.fromEntries(entities.map(entity =>
+        [String(entity.entity_id), entity]));
+      const palette = {
+        authorized_target: "#72a9e8", public_source: "#72809b",
+        public_profile: "#8a6bd4", service: "#d8a51f",
+        breach_event: "#d34a52", email_observation: "#d34a52",
+        username_observation: "#7789d8", public_resource: "#4bb9b6"
+      };
+      const esc = value => String(value ?? "").replace(/[&<>"']/g, character =>
+        ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
+          "'": "&#039;"}[character]));
+      const anchor = value => String(value || "").replace(
+        /[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+      const percent = value => Number.isFinite(Number(value))
+        ? `${Math.round(Number(value) * 100)}%` : "not scored";
+      const label = value => String(value || "observation")
+        .replaceAll("_", " ").replace(/\\b\\w/g, letter => letter.toUpperCase());
+      const state = {
+        selected: payload.target_entity_id ? String(payload.target_entity_id) : null,
+        query: "", type: "all", direction: "all", minimum: 0,
+        viewport: {x: 0, y: 0, zoom: 1}
+      };
+      const positions = new Map();
+      entities.forEach((entity, index) => {
+        const id = String(entity.entity_id);
+        if (id === String(payload.target_entity_id)) {
+          positions.set(id, {x: 500, y: 310});
+          return;
+        }
+        const adjusted = index - (payload.target_entity_id ? 1 : 0);
+        const ring = Math.floor(Math.max(adjusted, 0) / 20);
+        const slot = Math.max(adjusted, 0) % 20;
+        const count = Math.min(20, Math.max(entities.length - 1 - ring * 20, 1));
+        const radius = 150 + ring * 88;
+        const angle = Math.PI * 2 * slot / count - Math.PI / 2;
+        positions.set(id, {
+          x: 500 + Math.cos(angle) * radius,
+          y: 310 + Math.sin(angle) * Math.min(radius, 270)
+        });
+      });
+      const typeSelect = document.querySelector("#graph-type");
+      [...new Set(entities.map(entity => entity.entity_type).filter(Boolean))]
+        .sort().forEach(type => {
+          const option = document.createElement("option");
+          option.value = type;
+          option.textContent = label(type);
+          typeSelect.append(option);
+        });
+      const baseSelection = () => {
+        const query = state.query.toLocaleLowerCase();
+        return entities.filter(entity => {
+          const id = String(entity.entity_id);
+          const text = [
+            entity.label, entity.canonical_value, entity.entity_type,
+            ...(entity.source_tools || []), ...(entity.evidence_ids || [])
+          ].join(" ").toLocaleLowerCase();
+          return id === String(payload.target_entity_id)
+            || id === state.selected
+            || ((!query || text.includes(query))
+              && (state.type === "all" || entity.entity_type === state.type)
+              && Number(entity.confidence || 0) >= state.minimum);
+        });
+      };
+      const visibleGraph = () => {
+        let nodes = baseSelection();
+        let ids = new Set(nodes.map(entity => String(entity.entity_id)));
+        let edges = relationships.filter(edge =>
+          ids.has(String(edge.from_entity_id)) && ids.has(String(edge.to_entity_id)));
+        if (state.selected && state.direction !== "all") {
+          edges = edges.filter(edge => {
+            const from = String(edge.from_entity_id);
+            const to = String(edge.to_entity_id);
+            if (state.direction === "outgoing") return from === state.selected;
+            if (state.direction === "incoming") return to === state.selected;
+            return from === state.selected || to === state.selected;
+          });
+          ids = new Set([state.selected]);
+          edges.forEach(edge => {
+            ids.add(String(edge.from_entity_id));
+            ids.add(String(edge.to_entity_id));
+          });
+          nodes = nodes.filter(entity => ids.has(String(entity.entity_id)));
+        }
+        return {nodes, edges};
+      };
+      const updateInspector = () => {
+        const inspector = document.querySelector("#report-graph-inspector");
+        const entity = byId[state.selected];
+        inspector.replaceChildren();
+        if (!entity) {
+          inspector.innerHTML = "<h3>Select an entity</h3><p>Click a graph node.</p>";
+          return;
+        }
+        const heading = document.createElement("h3");
+        heading.textContent = entity.label || entity.entity_id;
+        inspector.append(heading);
+        const status = document.createElement("p");
+        status.className = "inspector-status";
+        status.textContent = `${label(entity.entity_type)} · ${
+          entity.confidence_label || label(entity.identity_status)
+        } · ${percent(entity.confidence)}`;
+        inspector.append(status);
+        if (entity.plain_language_explanation) {
+          const explanation = document.createElement("p");
+          explanation.textContent = entity.plain_language_explanation;
+          inspector.append(explanation);
+        }
+        const sources = document.createElement("p");
+        sources.textContent = `Sources: ${
+          (entity.source_tools || []).join(" + ") || "case context"}`;
+        inspector.append(sources);
+        const value = entity.canonical_value;
+        try {
+          const url = new URL(value);
+          if (["http:", "https:"].includes(url.protocol)) {
+            const link = document.createElement("a");
+            link.href = url.href;
+            link.target = "_blank";
+            link.rel = "noreferrer";
+            link.textContent = "Open cited public page";
+            inspector.append(link);
+          }
+        } catch (_) {}
+        const evidenceTitle = document.createElement("h4");
+        evidenceTitle.textContent = "Evidence";
+        inspector.append(evidenceTitle);
+        const evidenceList = document.createElement("div");
+        evidenceList.className = "inspector-evidence";
+        (entity.evidence_ids || []).forEach(id => {
+          const link = document.createElement("a");
+          link.href = `#evidence-${anchor(id)}`;
+          link.textContent = id;
+          evidenceList.append(link);
+        });
+        if (!evidenceList.children.length) {
+          evidenceList.textContent = "No evidence ID — case subject context.";
+        }
+        inspector.append(evidenceList);
+        const adjacent = relationships.filter(edge =>
+          String(edge.from_entity_id) === state.selected
+          || String(edge.to_entity_id) === state.selected);
+        const relationTitle = document.createElement("h4");
+        relationTitle.textContent = `Relationships (${adjacent.length})`;
+        inspector.append(relationTitle);
+        adjacent.slice(0, 20).forEach(edge => {
+          const peerId = String(edge.from_entity_id) === state.selected
+            ? String(edge.to_entity_id) : String(edge.from_entity_id);
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "inspector-peer";
+          button.textContent = `${
+            edge.plain_language_type || label(edge.relationship_type)
+          }: ${byId[peerId]?.label || peerId}`;
+          button.addEventListener("click", () => {
+            state.selected = peerId;
+            render();
+          });
+          inspector.append(button);
+        });
+      };
+      const render = () => {
+        const {nodes, edges} = visibleGraph();
+        const world = state.viewport;
+        const edgeMarkup = edges.map(edge => {
+          const from = positions.get(String(edge.from_entity_id));
+          const to = positions.get(String(edge.to_entity_id));
+          if (!from || !to) return "";
+          const uncertain = ["possible", "insufficient_evidence"].includes(
+            edge.identity_status);
+          return `<line class="${uncertain ? "uncertain" : ""}"
+            x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}">
+            <title>${esc(edge.plain_language_type || edge.relationship_type)}
+              · ${(edge.evidence_ids || []).map(esc).join(", ")}</title></line>`;
+        }).join("");
+        const nodeMarkup = nodes.map(entity => {
+          const id = String(entity.entity_id);
+          const position = positions.get(id);
+          const selected = id === state.selected;
+          const color = palette[entity.entity_type] || "#94a3b8";
+          return `<g class="report-node ${selected ? "selected" : ""}"
+            data-node-id="${esc(id)}" tabindex="0" role="button"
+            aria-label="${esc(entity.label || id)}"
+            transform="translate(${position.x} ${position.y})">
+            <circle r="31" fill="${color}"></circle>
+            <text y="5">${esc(entity.entity_type === "authorized_target" ? "P" :
+              entity.entity_type === "public_source" ? "S" :
+              entity.entity_type === "service" ? "✓" : "@")}</text>
+            <text class="report-node-label" y="51">${
+              esc(String(entity.label || id).slice(0, 32))}</text>
+            <title>${esc(entity.label || id)} · ${percent(entity.confidence)}</title>
+          </g>`;
+        }).join("");
+        svg.innerHTML = `<defs><marker id="report-arrow" viewBox="0 0 10 10"
+          refX="26" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+          <path d="M0 0 L10 5 L0 10z" fill="#69788e"></path></marker></defs>
+          <g id="report-world" transform="translate(${world.x} ${world.y})
+            scale(${world.zoom})">${edgeMarkup}${nodeMarkup}</g>`;
+        svg.querySelectorAll(".report-node").forEach(node => {
+          const select = () => {
+            state.selected = node.dataset.nodeId;
+            render();
+          };
+          node.addEventListener("click", select);
+          node.addEventListener("keydown", event => {
+            if (!["Enter", " "].includes(event.key)) return;
+            event.preventDefault();
+            select();
+          });
+        });
+        document.querySelector("#graph-counter").textContent =
+          `Showing ${nodes.length} of ${entities.length} entities and ${
+            edges.length} of ${relationships.length} relationships`;
+        updateInspector();
+      };
+      document.querySelector("#graph-search").addEventListener("input", event => {
+        state.query = event.target.value;
+        render();
+      });
+      typeSelect.addEventListener("change", event => {
+        state.type = event.target.value;
+        render();
+      });
+      document.querySelector("#graph-direction").addEventListener(
+        "change", event => {
+          state.direction = event.target.value;
+          render();
+        });
+      document.querySelector("#graph-confidence").addEventListener(
+        "input", event => {
+          state.minimum = Number(event.target.value) / 100;
+          document.querySelector("#graph-confidence-value").textContent =
+            `${event.target.value}%`;
+          render();
+        });
+      document.querySelector("#graph-reset").addEventListener("click", () => {
+        state.query = "";
+        state.type = "all";
+        state.direction = "all";
+        state.minimum = 0;
+        state.viewport = {x: 0, y: 0, zoom: 1};
+        state.selected = payload.target_entity_id
+          ? String(payload.target_entity_id) : null;
+        document.querySelector("#graph-search").value = "";
+        typeSelect.value = "all";
+        document.querySelector("#graph-direction").value = "all";
+        document.querySelector("#graph-confidence").value = "0";
+        document.querySelector("#graph-confidence-value").textContent = "0%";
+        render();
+      });
+      svg.addEventListener("wheel", event => {
+        event.preventDefault();
+        state.viewport.zoom = Math.max(.35, Math.min(3,
+          state.viewport.zoom * (event.deltaY < 0 ? 1.12 : .89)));
+        render();
+      }, {passive: false});
+      let pan = null;
+      svg.addEventListener("pointerdown", event => {
+        if (event.target.closest(".report-node")) return;
+        pan = {x: event.clientX, y: event.clientY,
+          startX: state.viewport.x, startY: state.viewport.y};
+        svg.setPointerCapture(event.pointerId);
+      });
+      svg.addEventListener("pointermove", event => {
+        if (!pan) return;
+        state.viewport.x = pan.startX + event.clientX - pan.x;
+        state.viewport.y = pan.startY + event.clientY - pan.y;
+        const world = svg.querySelector("#report-world");
+        world?.setAttribute("transform", `translate(${state.viewport.x}
+          ${state.viewport.y}) scale(${state.viewport.zoom})`);
+      });
+      svg.addEventListener("pointerup", event => {
+        pan = null;
+        try { svg.releasePointerCapture(event.pointerId); } catch (_) {}
+      });
+      render();
+    })();
+    </script>
+    """
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -3107,9 +3614,17 @@ def render_report_html(
   <title>DeepVault report — {safe(target_name)}</title>
 	  <style>
 	    body {{ font: 15px/1.55 Inter, system-ui, sans-serif; color: #18221d;
-	      max-width: 900px; margin: 0 auto; padding: 48px; }}
+	      max-width: 1180px; margin: 0 auto; padding: 48px; }}
 	    header {{ border-bottom: 3px solid #1d7a4d; margin-bottom: 32px; }}
 	    h1 {{ margin-bottom: 4px; }} h2 {{ margin-top: 32px; }}
+      a {{ color: #1e5c98; }}
+      .report-nav {{ position: sticky; top: 0; z-index: 20; display: flex;
+        gap: 8px; flex-wrap: wrap; padding: 10px; margin: 0 0 18px;
+        border: 1px solid #ccd9e6; border-radius: 9px;
+        background: rgba(255,255,255,.96); }}
+      .report-nav a {{ padding: 5px 8px; border-radius: 6px;
+        text-decoration: none; font-size: 12px; font-weight: 700; }}
+      .report-nav a:hover, .report-nav a:focus {{ background: #e7f0f8; }}
 	    .plain-review {{ border: 2px solid #284e7a; border-radius: 14px;
 	      padding: 24px; margin: 22px 0 32px; background: #f4f8fc; }}
 	    .plain-review > h2:first-of-type {{ margin-top: 4px; font-size: 28px; }}
@@ -3138,6 +3653,11 @@ def render_report_html(
 	      font-size: 11px; font-weight: 800; text-transform: uppercase; }}
 	    .citations {{ display: block; color: #8a2631; font: 11px ui-monospace,
 	      SFMono-Regular, monospace; margin-top: 7px; overflow-wrap: anywhere; }}
+      .citations a {{ display: inline-block; padding: 2px 5px; margin: 2px;
+        border: 1px solid #dfb3ba; border-radius: 4px; color: #8a2631;
+        background: #fff; text-decoration: none; }}
+      .citations a:hover, .citations a:focus {{ color: white;
+        background: #8a2631; }}
 	    .review-link {{ display: inline-block; margin-top: 8px; color: #1e5c98; }}
 	    .plain-grid {{ display: grid; grid-template-columns: 1fr 1fr;
 	      gap: 18px; margin-top: 22px; }}
@@ -3153,6 +3673,61 @@ def render_report_html(
     .meta {{ color: #52635a; font-size: 13px; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ border-bottom: 1px solid #d7e3da; padding: 10px; text-align: left; }}
+      .interactive-graph-section {{ scroll-margin-top: 70px; }}
+      .graph-controls {{ display: grid;
+        grid-template-columns: minmax(180px, 1fr) 180px 220px minmax(180px, 1fr) auto;
+        gap: 10px; align-items: end; padding: 12px; border: 1px solid #cbd8e4;
+        border-radius: 10px 10px 0 0; background: #f4f8fc; }}
+      .graph-controls label {{ display: grid; gap: 5px; color: #52635a;
+        font-size: 11px; font-weight: 700; }}
+      .graph-controls input, .graph-controls select, .graph-controls button {{
+        box-sizing: border-box; width: 100%; min-height: 38px; padding: 8px;
+        border: 1px solid #9fb2c5; border-radius: 6px; background: white; }}
+      .graph-controls button {{ color: white; background: #284e7a;
+        cursor: pointer; font-weight: 800; }}
+      .graph-counter {{ margin: 0; padding: 8px 12px; color: #52635a;
+        border: 1px solid #cbd8e4; border-top: 0; font-size: 12px; }}
+      .interactive-graph-layout {{ display: grid;
+        grid-template-columns: minmax(0, 1fr) 300px; min-height: 620px;
+        border: 1px solid #cbd8e4; border-top: 0; border-radius: 0 0 10px 10px;
+        overflow: hidden; }}
+      .report-graph-stage {{ position: relative; min-width: 0;
+        background-color: #081525; background-image:
+          linear-gradient(rgba(100,124,151,.12) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(100,124,151,.12) 1px, transparent 1px);
+        background-size: 24px 24px; }}
+      #report-graph {{ display: block; width: 100%; height: 620px;
+        touch-action: none; }}
+      #report-graph line {{ stroke: #69788e; stroke-width: 1.5;
+        marker-end: url(#report-arrow); }}
+      #report-graph line.uncertain {{ stroke-dasharray: 6 5; opacity: .7; }}
+      .report-node {{ cursor: pointer; outline: none; }}
+      .report-node circle {{ stroke: rgba(255,255,255,.8); stroke-width: 2; }}
+      .report-node.selected circle, .report-node:focus-visible circle {{
+        stroke: #ffda66; stroke-width: 5; }}
+      .report-node text {{ fill: #091321; font-size: 17px; font-weight: 900;
+        text-anchor: middle; pointer-events: none; }}
+      .report-node .report-node-label {{ fill: #f4f8fc; font-size: 9px;
+        paint-order: stroke; stroke: #081525; stroke-width: 3px; }}
+      .graph-instructions {{ position: absolute; left: 12px; bottom: 10px;
+        max-width: calc(100% - 44px); margin: 0; padding: 7px 9px;
+        color: #c3d0de; border: 1px solid #40536b; border-radius: 6px;
+        background: rgba(8,21,37,.9); font-size: 10px; }}
+      #report-graph-inspector {{ padding: 18px; border-left: 1px solid #cbd8e4;
+        background: #f4f8fc; overflow: auto; }}
+      #report-graph-inspector h3 {{ margin-top: 0; overflow-wrap: anywhere; }}
+      #report-graph-inspector h4 {{ margin: 20px 0 7px; color: #52635a;
+        font-size: 11px; text-transform: uppercase; }}
+      .inspector-status {{ padding: 9px; border-left: 3px solid #d09a00;
+        background: #fff7db; }}
+      .inspector-evidence {{ display: flex; flex-wrap: wrap; gap: 5px; }}
+      .inspector-evidence a {{ padding: 3px 5px; border: 1px solid #dfb3ba;
+        border-radius: 4px; color: #8a2631; background: white;
+        font: 10px ui-monospace, monospace; text-decoration: none; }}
+      .inspector-peer {{ display: block; width: 100%; padding: 8px 0;
+        border: 0; border-top: 1px solid #ccd9e6; color: #1e5c98;
+        background: transparent; text-align: left; cursor: pointer; }}
+      .evidence-record {{ scroll-margin-top: 70px; }}
 	    pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #e8f0ea;
 	      border-radius: 8px; padding: 12px; font-size: 12px; }}
 	    details.technical {{ margin: 14px 0; }}
@@ -3161,6 +3736,9 @@ def render_report_html(
 	    @media (max-width: 680px) {{
 	      body {{ padding: 22px; }}
 	      .review-counts, .plain-grid {{ grid-template-columns: 1fr 1fr; }}
+        .graph-controls {{ grid-template-columns: 1fr; }}
+        .interactive-graph-layout {{ grid-template-columns: 1fr; }}
+        #report-graph-inspector {{ border-left: 0; border-top: 1px solid #cbd8e4; }}
 	    }}
 	    @media print {{
 	      body {{ padding: 0; }}
@@ -3169,13 +3747,21 @@ def render_report_html(
 	    }}
   </style>
 </head>
-<body>
+<body id="report-top">
 	  <header>
     <p>DEEPVAULT · PERSON INTELLIGENCE REPORT</p>
     <h1>{safe(target_name)}</h1>
     <p class="meta">Report {safe(report.get("report_id"))} ·
 	      {safe(report.get("generated_at"))}</p>
   </header>
+  <nav class="report-nav" aria-label="Report sections">
+    <a href="#report-top">Summary</a>
+    <a href="#findings">Findings</a>
+    <a href="#interactive-graph">Interactive graph</a>
+    <a href="#source-coverage">Source coverage</a>
+    <a href="#evidence-appendix">Evidence appendix</a>
+    <a href="#analyst-decisions">Analyst decisions</a>
+  </nav>
   <div class="notice"><strong>Responsible-use boundary:</strong> this report
     presents cited public evidence for human review. It must not be used to infer
     mental health, diagnose personality, infer protected traits, or make an
@@ -3185,14 +3771,15 @@ def render_report_html(
     <h2>Executive summary</h2>
     <p>{safe(report.get("executive_summary"))}</p>
     <p><strong>Identity confidence:</strong>
-      {safe(report.get("identity_confidence"))} ·
-      <strong>Risk:</strong> {safe(report.get("overall_risk"))} ·
-      <strong>Coverage:</strong> {safe(report.get("coverage_assessment"))} ·
+      {safe(identity_label(report.get("identity_confidence")))} ·
+      <strong>Risk:</strong> {safe(risk_label(report.get("overall_risk")))} ·
+      <strong>Coverage:</strong>
+      {safe(coverage_label(report.get("coverage_assessment")))} ·
       <strong>Evidence:</strong> {safe(report.get("evidence_count"))}</p>
-    <p class="meta">Evidence citations:
-      {safe(", ".join(report.get("executive_summary_evidence_ids", [])))}</p>
+    <p class="meta">Evidence citations:</p>
+      {evidence_citations(report.get("executive_summary_evidence_ids"))}
   </section>
-  <h2>Findings</h2>
+  <h2 id="findings">Findings</h2>
   {findings or "<p>No evidence-backed findings were produced.</p>"}
   <h2>Evidence-first identity analysis</h2>
   <p><strong>Graph:</strong> {safe(len(graph_nodes))} nodes ·
@@ -3200,6 +3787,7 @@ def render_report_html(
     {safe(len(primary_graph_hypotheses))} reviewable hypotheses ·
     {safe(secondary_graph_hypothesis_count)} low-signal hypotheses retained in JSON</p>
 	  {graph_hypotheses or "<p>No evidence-backed identity hypotheses were produced.</p>"}
+    {interactive_graph}
 	  <details class="technical">
 	    <summary>Full technical provenance · {safe(len(graph_edge_items))} relationships</summary>
 	    <p class="meta">These rows document which tool published each observation.
@@ -3211,7 +3799,7 @@ def render_report_html(
   <h3>Ranked analyst pivots</h3>
   {graph_pivots or "<p>No evidence-backed pivots were produced.</p>"}
   {temporal_section}
-  <h2>Source coverage</h2>
+  <h2 id="source-coverage">Source coverage</h2>
   <table><thead><tr><th>Source</th><th>Evidence</th><th>Status</th>
     <th>Coverage note</th><th>Evidence IDs</th></tr></thead>
     <tbody>{coverage}</tbody></table>
@@ -3219,9 +3807,9 @@ def render_report_html(
   {timeline or "<p>No source-provided event dates were available. Collection timestamps are intentionally excluded because they are not person-history events.</p>"}
   <h2>Contradictions</h2>
   {contradictions or "<p>No contradiction entries were produced.</p>"}
-  <h2>Evidence appendix</h2>
+  <h2 id="evidence-appendix">Evidence appendix</h2>
   {evidence_ledger or "<p>No evidence records were produced.</p>"}
-  <h2>Analyst review decisions</h2>
+  <h2 id="analyst-decisions">Analyst review decisions</h2>
   <p>{safe(adjudication_summary.get("notice") or "No analyst exclusions were recorded.")}</p>
   {adjudication_decisions or "<p>No analyst decisions were recorded.</p>"}
   <h2>Recommendations</h2>
@@ -3241,13 +3829,15 @@ async def download_html_report(investigation_id: UUID) -> Response:
         report = _effective_report(investigation)
         if report is None:
             raise HTTPException(status_code=409, detail="Report is not ready")
-        review_summary = _graph_document(investigation).get("review_summary", {})
+        graph_document = _graph_document(investigation)
+        review_summary = graph_document.get("review_summary", {})
         filename = f"deepvault-{investigation_id}.html"
         return Response(
             render_report_html(
                 report,
                 investigation.target_name,
                 review_summary=review_summary,
+                graph_document=graph_document,
             ),
             media_type="text/html",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
