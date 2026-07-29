@@ -2,7 +2,9 @@ import os
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
+from xml.etree import ElementTree as ET
 
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -13,7 +15,10 @@ from dashboard.app import (  # noqa: E402
     InvestigationCreate,
     TransformRequest,
     _active_transform_run_count,
+    _gexf_document,
+    _graph_csv_document,
     _graph_document,
+    _graphml_document,
     _mapping_document,
     render_report_html,
 )
@@ -264,6 +269,76 @@ class DashboardGraphExportTests(unittest.TestCase):
             mapping["connections"][0]["provenanceChain"][0]["source"],
             "github",
         )
+        self.assertEqual(graph["stats"]["entity_count"], 2)
+        self.assertEqual(graph["stats"]["relationship_count"], 1)
+        self.assertEqual(graph["stats"]["evidence_count"], 1)
+        profile_entity = next(
+            item
+            for item in graph["entities"]
+            if item["entity_id"] == "NODE-PROFILE"
+        )
+        self.assertEqual(profile_entity["source_tools"], ["github"])
+        self.assertEqual(profile_entity["confidence"], 0.62)
+        self.assertEqual(profile_entity["evidence_ids"], ["EVID-1"])
+        self.assertEqual(
+            graph["relationships"][0]["reason"],
+            "Public observation.",
+        )
+
+    def test_interoperable_exports_keep_relationship_evidence_ids(self):
+        investigation = self.investigation()
+
+        graphml = _graphml_document(investigation)
+        gexf = _gexf_document(investigation)
+        csv_export = _graph_csv_document(investigation)
+
+        graphml_root = ET.fromstring(graphml)
+        gexf_root = ET.fromstring(gexf)
+        self.assertTrue(graphml_root.tag.endswith("graphml"))
+        self.assertTrue(gexf_root.tag.endswith("gexf"))
+        self.assertIn("EVID-1", graphml.decode())
+        self.assertIn("candidate_profile", graphml.decode())
+        self.assertIn("candidate_profile", gexf.decode())
+        self.assertIn("relationship,EDGE-1", csv_export)
+        self.assertIn("EVID-1", csv_export)
+
+    def test_exports_escape_markup_and_reject_unknown_evidence(self):
+        investigation = self.investigation()
+        graph = investigation.case_metadata["structured_report"]["identity_graph"]
+        graph["nodes"][1]["label"] = "<script>alert('graph')</script>"
+        graphml = _graphml_document(investigation).decode()
+        self.assertNotIn("<script>", graphml)
+        self.assertIn("&lt;script&gt;", graphml)
+
+        graph["edges"][0]["evidence_ids"] = ["EVID-UNKNOWN"]
+        with self.assertRaisesRegex(
+            HTTPException,
+            "relationship failed evidence validation",
+        ):
+            _graph_document(investigation)
+
+    def test_workbench_assets_define_requested_views_and_theme(self):
+        with open(
+            os.path.join(ROOT, "dashboard", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            index = file.read()
+        with open(
+            os.path.join(ROOT, "dashboard", "static", "workbench.js"),
+            encoding="utf-8",
+        ) as file:
+            workbench = file.read()
+
+        self.assertIn("--bg: #071326", index)
+        self.assertIn("--accent: #c1121f", index)
+        self.assertIn('src="/static/workbench.js"', index)
+        for result_view in ("graph", "evidence", "timeline", "report"):
+            self.assertIn(f'["{result_view}"', workbench)
+        self.assertIn("Why this match?", workbench)
+        self.assertIn("Shift-click to compare", workbench)
+        self.assertIn("graph.graphml", workbench)
+        self.assertIn("graph.gexf", workbench)
+        self.assertIn("graph.csv", workbench)
 
 
 class DashboardReportRenderingTests(unittest.TestCase):

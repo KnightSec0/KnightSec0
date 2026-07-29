@@ -106,6 +106,10 @@ The dashboard provides:
 | `GET` | `/api/investigations/{id}/graph` | Read the live evidence graph |
 | `GET` | `/api/investigations/{id}/events` | Stream case and transform changes over SSE |
 | `POST` | `/api/investigations/{id}/graph-layout` | Save reviewed node positions |
+| `GET` | `/api/investigations/{id}/graph.json` | Download the full normalized graph |
+| `GET` | `/api/investigations/{id}/graph.graphml` | Download evidence-linked GraphML |
+| `GET` | `/api/investigations/{id}/graph.gexf` | Download GEXF for graph tools |
+| `GET` | `/api/investigations/{id}/graph.csv` | Download flattened entities and relationships |
 | `GET` | `/api/investigations/{id}/mapping.osint.json` | Download Mapping Tool schema v2 |
 
 Example transform request:
@@ -120,10 +124,12 @@ Example transform request:
 }
 ```
 
-The mapping export retains confidence, identity status, evidence IDs, source
-names, independent-source count, observation dates, and the full provenance
-chain. File import is the compatibility path today. The graph and event APIs
-are the integration contract for a future embedded mapper.
+The embedded localhost workbench now consumes the graph contract directly.
+The normalized response includes entities, relationships, clusters, source/type
+statistics, evidence IDs, reasons, and provenance chains. The Mapping schema
+export retains confidence, identity status, evidence IDs, source names,
+independent-source count, observation dates, and the full provenance chain.
+GraphML and CSV retain relationship evidence IDs for external audit.
 
 Install the separate mapping UI on macOS:
 

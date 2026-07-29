@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from html import escape
 import ipaddress
+import io
 import json
 import os
 from pathlib import Path
@@ -15,10 +17,12 @@ import re
 from typing import Any
 from urllib.parse import quote_plus, urlsplit
 from uuid import UUID, uuid4
+from xml.etree import ElementTree as ET
 
 from celery import Celery
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import DateTime, ForeignKey, JSON, String, func, select
 from sqlalchemy.dialects.postgresql import ENUM as PGEnum
@@ -545,6 +549,7 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.middleware("http")
@@ -686,9 +691,242 @@ def _stored_graph(investigation: Investigation) -> dict[str, Any]:
     return _redact_for_display(graph)
 
 
+def _graph_parts(
+    investigation: Investigation,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    """Return a validated graph and its evidence index for public export."""
+    graph = _stored_graph(investigation)
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    evidence = graph.get("evidence_index", [])
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        raise HTTPException(status_code=409, detail="Identity graph is malformed")
+    clean_nodes = [node for node in nodes if isinstance(node, dict)]
+    clean_edges = [edge for edge in edges if isinstance(edge, dict)]
+    evidence_items = [item for item in evidence if isinstance(item, dict)]
+    report = (investigation.case_metadata or {}).get("structured_report")
+    ledger = report.get("evidence_ledger", []) if isinstance(report, dict) else []
+    if isinstance(ledger, list):
+        evidence_items.extend(item for item in ledger if isinstance(item, dict))
+    node_ids = {
+        str(node.get("id"))
+        for node in clean_nodes
+        if node.get("id")
+    }
+    edge_ids = {
+        str(edge.get("id"))
+        for edge in clean_edges
+        if edge.get("id")
+    }
+    evidence_index: dict[str, dict[str, Any]] = {}
+    for item in evidence_items:
+        if item.get("id"):
+            evidence_index[str(item["id"])] = item
+    if len(node_ids) != len(clean_nodes):
+        raise HTTPException(
+            status_code=409,
+            detail="Identity graph contains missing or duplicate node IDs",
+        )
+    if len(edge_ids) != len(clean_edges):
+        raise HTTPException(
+            status_code=409,
+            detail="Identity graph contains missing or duplicate relationship IDs",
+        )
+    for node in clean_nodes:
+        cited = {str(value) for value in node.get("evidence_ids", [])}
+        if cited - set(evidence_index):
+            raise HTTPException(
+                status_code=409,
+                detail="Identity graph node cites unknown evidence",
+            )
+    for edge in clean_edges:
+        endpoints = {
+            str(edge.get("source_node_id")),
+            str(edge.get("target_node_id")),
+        }
+        cited = {str(value) for value in edge.get("evidence_ids", [])}
+        if endpoints - node_ids or not cited or cited - set(evidence_index):
+            raise HTTPException(
+                status_code=409,
+                detail="Identity graph relationship failed evidence validation",
+            )
+    return graph, clean_nodes, clean_edges, evidence_index
+
+
+def _normalized_graph_view(
+    investigation: Investigation,
+    graph: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    evidence_index: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Create a UI-friendly entity model without weakening graph provenance."""
+    metadata = investigation.case_metadata or {}
+    report = metadata.get("structured_report")
+    report = report if isinstance(report, dict) else {}
+    ledger = report.get("evidence_ledger", [])
+    ledger_by_id = {
+        str(item.get("id")): item
+        for item in ledger
+        if isinstance(item, dict) and item.get("id")
+    } if isinstance(ledger, list) else {}
+    hypotheses = graph.get("hypotheses", [])
+    hypothesis_by_node = {
+        str(item.get("object_node_id")): item
+        for item in hypotheses
+        if isinstance(item, dict) and item.get("object_node_id")
+    } if isinstance(hypotheses, list) else {}
+    edges_by_node: dict[str, list[dict[str, Any]]] = {}
+    for edge in edges:
+        for node_id in (edge.get("source_node_id"), edge.get("target_node_id")):
+            if node_id:
+                edges_by_node.setdefault(str(node_id), []).append(edge)
+
+    entities: list[dict[str, Any]] = []
+    cluster_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    for node in nodes:
+        node_id = str(node["id"])
+        kind = str(node.get("kind") or "public_observation")
+        evidence_ids = [str(value) for value in node.get("evidence_ids", [])]
+        evidence_items = [
+            ledger_by_id.get(value) or evidence_index.get(value, {})
+            for value in evidence_ids
+        ]
+        sources = sorted(
+            {
+                str(item.get("source"))
+                for item in evidence_items
+                if item.get("source")
+            },
+            key=str.casefold,
+        )
+        for source in sources:
+            source_counts[source] = source_counts.get(source, 0) + 1
+        observed = sorted(
+            str(item.get("observed_at"))
+            for item in evidence_items
+            if item.get("observed_at")
+        )
+        attributes = node.get("attributes")
+        attributes = attributes if isinstance(attributes, dict) else {}
+        hypothesis = hypothesis_by_node.get(node_id, {})
+        confidence = hypothesis.get("confidence")
+        identity_status = hypothesis.get("identity_status")
+        related_edges = edges_by_node.get(node_id, [])
+        if confidence is None and related_edges:
+            confidence = max(
+                float(edge.get("confidence") or 0)
+                for edge in related_edges
+            )
+            identity_status = max(
+                (
+                    str(edge.get("identity_status") or "insufficient_evidence")
+                    for edge in related_edges
+                ),
+                key=lambda status: {
+                    "unrelated": -1,
+                    "insufficient_evidence": 0,
+                    "possible": 1,
+                    "probable": 2,
+                    "highly_probable": 3,
+                    "confirmed": 4,
+                }.get(status, 0),
+            )
+        if (
+            node_id == graph.get("target_node_id")
+            or kind == "authorized_target"
+        ):
+            confidence = 1.0
+            identity_status = "authorized_target"
+        cluster_counts[kind] = cluster_counts.get(kind, 0) + 1
+        entities.append(
+            {
+                "entity_id": node_id,
+                "entity_type": kind,
+                "label": node.get("label") or node_id,
+                "canonical_value": (
+                    attributes.get("url")
+                    or attributes.get("email")
+                    or attributes.get("address")
+                    or node.get("label")
+                ),
+                "aliases": attributes.get("aliases", []),
+                "source_tools": sources,
+                "source_urls": sorted(
+                    {
+                        str(item.get("source_url"))
+                        for item in evidence_items
+                        if item.get("source_url")
+                    }
+                ),
+                "confidence": confidence,
+                "identity_status": identity_status or "insufficient_evidence",
+                "first_seen": observed[0] if observed else None,
+                "last_seen": observed[-1] if observed else None,
+                "metadata": attributes,
+                "evidence_ids": evidence_ids,
+            }
+        )
+
+    relationships = [
+        {
+            "edge_id": str(edge["id"]),
+            "from_entity_id": edge.get("source_node_id"),
+            "to_entity_id": edge.get("target_node_id"),
+            "relationship_type": edge.get("relationship"),
+            "confidence": edge.get("confidence"),
+            "identity_status": edge.get("identity_status"),
+            "source_tools": sorted(
+                {
+                    str(step.get("source"))
+                    for step in edge.get("provenance_chain", [])
+                    if isinstance(step, dict) and step.get("source")
+                },
+                key=str.casefold,
+            ),
+            "evidence_ids": [str(value) for value in edge.get("evidence_ids", [])],
+            "reason": edge.get("explanation")
+            or next(
+                (
+                    step.get("explanation")
+                    for step in edge.get("provenance_chain", [])
+                    if isinstance(step, dict) and step.get("explanation")
+                ),
+                "Cited evidence relationship.",
+            ),
+            "independent_source_count": edge.get("independent_source_count", 1),
+            "provenance_chain": edge.get("provenance_chain", []),
+        }
+        for edge in edges
+    ]
+    return {
+        "target_entity_id": graph.get("target_node_id"),
+        "entities": entities,
+        "relationships": relationships,
+        "clusters": [
+            {"entity_type": kind, "count": count}
+            for kind, count in sorted(cluster_counts.items())
+        ],
+        "stats": {
+            "entity_count": len(entities),
+            "relationship_count": len(relationships),
+            "evidence_count": len(evidence_index),
+            "source_count": len(source_counts),
+            "entities_by_type": dict(sorted(cluster_counts.items())),
+            "entities_by_source": dict(sorted(source_counts.items())),
+        },
+    }
+
+
 def _graph_document(investigation: Investigation) -> dict[str, Any]:
     metadata = investigation.case_metadata or {}
-    graph = _stored_graph(investigation)
+    graph, nodes, edges, evidence_index = _graph_parts(investigation)
     permitted = {
         str(source).casefold()
         for source in metadata.get("permitted_sources", [])
@@ -707,7 +945,182 @@ def _graph_document(investigation: Investigation) -> dict[str, Any]:
         "layout": _redact_for_display(metadata.get("graph_layout", {})),
         "transforms": transforms,
         "transformRuns": _redact_for_display(metadata.get("transform_runs", [])),
+        **_normalized_graph_view(
+            investigation,
+            graph,
+            nodes,
+            edges,
+            evidence_index,
+        ),
     }
+
+
+def _graphml_document(investigation: Investigation) -> bytes:
+    graph, nodes, edges, _ = _graph_parts(investigation)
+    namespace = "http://graphml.graphdrawing.org/xmlns"
+    ET.register_namespace("", namespace)
+    root = ET.Element(f"{{{namespace}}}graphml")
+    for key_id, target, name, attr_type in (
+        ("n_label", "node", "label", "string"),
+        ("n_type", "node", "entity_type", "string"),
+        ("n_evidence", "node", "evidence_ids", "string"),
+        ("n_attributes", "node", "attributes", "string"),
+        ("e_type", "edge", "relationship_type", "string"),
+        ("e_confidence", "edge", "confidence", "double"),
+        ("e_status", "edge", "identity_status", "string"),
+        ("e_reason", "edge", "reason", "string"),
+        ("e_evidence", "edge", "evidence_ids", "string"),
+    ):
+        ET.SubElement(
+            root,
+            f"{{{namespace}}}key",
+            {
+                "id": key_id,
+                "for": target,
+                "attr.name": name,
+                "attr.type": attr_type,
+            },
+        )
+    graph_element = ET.SubElement(
+        root,
+        f"{{{namespace}}}graph",
+        {
+            "id": str(investigation.id),
+            "edgedefault": "directed",
+        },
+    )
+
+    def add_data(parent: ET.Element, key: str, value: Any) -> None:
+        child = ET.SubElement(parent, f"{{{namespace}}}data", {"key": key})
+        child.text = str(value)
+
+    for node in nodes:
+        element = ET.SubElement(
+            graph_element,
+            f"{{{namespace}}}node",
+            {"id": str(node["id"])},
+        )
+        add_data(element, "n_label", node.get("label") or node["id"])
+        add_data(element, "n_type", node.get("kind") or "public_observation")
+        add_data(element, "n_evidence", json.dumps(node.get("evidence_ids", [])))
+        add_data(
+            element,
+            "n_attributes",
+            json.dumps(node.get("attributes", {}), sort_keys=True),
+        )
+    for edge in edges:
+        element = ET.SubElement(
+            graph_element,
+            f"{{{namespace}}}edge",
+            {
+                "id": str(edge["id"]),
+                "source": str(edge["source_node_id"]),
+                "target": str(edge["target_node_id"]),
+            },
+        )
+        add_data(element, "e_type", edge.get("relationship") or "related_to")
+        add_data(element, "e_confidence", edge.get("confidence", 0))
+        add_data(
+            element,
+            "e_status",
+            edge.get("identity_status") or "insufficient_evidence",
+        )
+        add_data(element, "e_reason", edge.get("explanation") or "")
+        add_data(element, "e_evidence", json.dumps(edge.get("evidence_ids", [])))
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _gexf_document(investigation: Investigation) -> bytes:
+    _, nodes, edges, _ = _graph_parts(investigation)
+    namespace = "http://www.gexf.net/1.3"
+    ET.register_namespace("", namespace)
+    root = ET.Element(
+        f"{{{namespace}}}gexf",
+        {"version": "1.3"},
+    )
+    graph_element = ET.SubElement(
+        root,
+        f"{{{namespace}}}graph",
+        {"defaultedgetype": "directed", "mode": "static"},
+    )
+    nodes_element = ET.SubElement(graph_element, f"{{{namespace}}}nodes")
+    for node in nodes:
+        ET.SubElement(
+            nodes_element,
+            f"{{{namespace}}}node",
+            {
+                "id": str(node["id"]),
+                "label": str(node.get("label") or node["id"]),
+            },
+        )
+    edges_element = ET.SubElement(graph_element, f"{{{namespace}}}edges")
+    for edge in edges:
+        ET.SubElement(
+            edges_element,
+            f"{{{namespace}}}edge",
+            {
+                "id": str(edge["id"]),
+                "source": str(edge["source_node_id"]),
+                "target": str(edge["target_node_id"]),
+                "label": str(edge.get("relationship") or "related_to"),
+                "weight": str(edge.get("confidence", 0)),
+            },
+        )
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _graph_csv_document(investigation: Investigation) -> str:
+    _, nodes, edges, _ = _graph_parts(investigation)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        (
+            "record_type",
+            "id",
+            "entity_type",
+            "label",
+            "source_entity_id",
+            "target_entity_id",
+            "relationship_type",
+            "confidence",
+            "identity_status",
+            "evidence_ids",
+            "reason",
+        )
+    )
+    for node in nodes:
+        writer.writerow(
+            (
+                "entity",
+                node.get("id"),
+                node.get("kind"),
+                node.get("label"),
+                "",
+                "",
+                "",
+                "",
+                "",
+                "|".join(str(value) for value in node.get("evidence_ids", [])),
+                "",
+            )
+        )
+    for edge in edges:
+        writer.writerow(
+            (
+                "relationship",
+                edge.get("id"),
+                "",
+                "",
+                edge.get("source_node_id"),
+                edge.get("target_node_id"),
+                edge.get("relationship"),
+                edge.get("confidence"),
+                edge.get("identity_status"),
+                "|".join(str(value) for value in edge.get("evidence_ids", [])),
+                edge.get("explanation"),
+            )
+        )
+    return output.getvalue()
 
 
 def _node_mapping_type(node: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -1140,6 +1553,55 @@ async def get_graph(investigation_id: UUID) -> dict[str, Any]:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
         return _graph_document(investigation)
+
+
+@app.get("/api/investigations/{investigation_id}/graph.json")
+async def download_graph_json(investigation_id: UUID) -> Response:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        document = _redact_for_display(_graph_document(investigation))
+        filename = f"deepvault-{investigation_id}-graph.json"
+        return Response(
+            json.dumps(document, indent=2, default=str),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+
+@app.get("/api/investigations/{investigation_id}/graph.graphml")
+async def download_graphml(investigation_id: UUID) -> Response:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        filename = f"deepvault-{investigation_id}.graphml"
+        return Response(
+            _graphml_document(investigation),
+            media_type="application/graphml+xml",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+
+@app.get("/api/investigations/{investigation_id}/graph.gexf")
+async def download_gexf(investigation_id: UUID) -> Response:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        filename = f"deepvault-{investigation_id}.gexf"
+        return Response(
+            _gexf_document(investigation),
+            media_type="application/gexf+xml",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+
+@app.get("/api/investigations/{investigation_id}/graph.csv")
+async def download_graph_csv(investigation_id: UUID) -> Response:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        filename = f"deepvault-{investigation_id}-graph.csv"
+        return Response(
+            _graph_csv_document(investigation),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
 
 @app.get("/api/investigations/{investigation_id}/mapping.osint.json")
