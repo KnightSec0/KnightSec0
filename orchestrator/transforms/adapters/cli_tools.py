@@ -1,6 +1,6 @@
 """Safe adapters for separately installed CLI tools.
 
-Third-party code is never imported into DeepVault.  Each adapter executes a
+Third-party code is never imported into WorldAtlas.  Each adapter executes a
 fixed argv list, parses a bounded machine-readable result, and emits minimized
 evidence.  Missing tools are reported as source-coverage gaps.
 """
@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterable
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from config import settings
 from connectors.cli import run_cli
@@ -89,6 +89,19 @@ def _safe_url(value: Any) -> str | None:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
     return value.strip()
+
+
+def _username_profile_url(url: str, username: str) -> bool:
+    """Require the exact queried username in the public URL path or query."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    searchable = unquote(f"{parsed.path}?{parsed.query}").casefold()
+    token = username.casefold()
+    return bool(
+        re.search(rf"(?<![\w.-]){re.escape(token)}(?![\w.-])", searchable)
+    )
 
 
 def _read_json(path: Path) -> Any:
@@ -276,12 +289,54 @@ class BlackbirdTransform(TransformAdapter):
         for record in payload if isinstance(payload, list) else []:
             if not isinstance(record, dict):
                 continue
+            status = record.get("status")
+            if status is None:
+                status = record.get("exists")
+            if status is not None:
+                status_token = str(status).strip().casefold().replace("_", "-")
+                if status is not True and status_token not in {
+                    "claimed",
+                    "exists",
+                    "found",
+                    "taken",
+                    "true",
+                }:
+                    continue
             url = _safe_url(
                 record.get("url")
                 or record.get("url_user")
                 or record.get("profile_url")
             )
             if not url:
+                continue
+            site = str(record.get("name") or "")[:120]
+            if entity.type == "email":
+                service = (urlsplit(url).hostname or site or "unknown").removeprefix(
+                    "www."
+                )
+                evidence.append(
+                    Evidence(
+                        type="service_registration",
+                        value=service,
+                        source=self.spec.name,
+                        source_url=None,
+                        confidence=0.30,
+                        reliability=SourceReliability.MEDIUM,
+                        identity_status=IdentityStatus.INSUFFICIENT_EVIDENCE,
+                        independence_group=self.spec.independence_group,
+                        notes=[
+                            "An email-registration signal is not a public profile.",
+                            "No login or account-recovery verification is permitted.",
+                        ],
+                        metadata={
+                            "service": service,
+                            "status": str(status or "found")[:80],
+                            "query_type": "email",
+                        },
+                    )
+                )
+                continue
+            if not _username_profile_url(url, entity.value):
                 continue
             evidence.append(
                 Evidence(
@@ -298,8 +353,9 @@ class BlackbirdTransform(TransformAdapter):
                         "Blackbird AI profiling was not executed or imported.",
                     ],
                     metadata={
-                        "site": str(record.get("name") or "")[:120],
-                        "username": entity.value if entity.type == "username" else None,
+                        "site": site,
+                        "username": entity.value,
+                        "catalogue_claimed": True,
                     },
                 )
             )
@@ -587,7 +643,7 @@ class GHuntTransform(TransformAdapter):
         independence_group="google",
         description=(
             "Requires explicit consent and a separately managed GHunt session. "
-            "Cookies are never accepted or persisted by DeepVault."
+            "Cookies are never accepted or persisted by WorldAtlas."
         ),
     )
 

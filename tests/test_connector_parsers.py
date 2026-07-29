@@ -86,7 +86,12 @@ class ConnectorParserTests(unittest.TestCase):
                 "alice,GitHub,https://github.com/,"
                 "https://github.com/alice,QueryStatus.CLAIMED,200,0.1\n"
                 "alice,Example,https://example.test/,"
-                "https://example.test/alice,Available,404,0.1\n",
+                "https://example.test/alice,Available,404,0.1\n"
+                "alice,Homepage,https://home.test/,,Claimed,200,0.1\n"
+                "alice,Partial,https://partial.test/,"
+                "https://partial.test/malice,Claimed,200,0.1\n"
+                "alice,Gone,https://gone.test/,"
+                "https://gone.test/alice,Claimed,404,0.1\n",
                 encoding="utf-8",
             )
             return CLIResult(
@@ -110,10 +115,12 @@ class ConnectorParserTests(unittest.TestCase):
         self.assertIn("--local", captured_args)
         self.assertIn("--no-txt", captured_args)
         self.assertNotIn("--json", captured_args)
-        self.assertEqual(len(result.evidence), 1)
+        self.assertEqual(len(result.evidence), 2)
         self.assertEqual(result.evidence[0].value, "https://github.com/alice")
         self.assertEqual(result.evidence[0].metadata["site"], "GitHub")
         self.assertEqual(result.evidence[0].metadata["platform"], "github.com")
+        self.assertTrue(result.evidence[1].metadata["not_found"])
+        self.assertFalse(result.evidence[1].metadata["profile_accessible"])
 
 
 if __name__ == "__main__":

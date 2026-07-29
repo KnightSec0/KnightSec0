@@ -71,8 +71,11 @@ _FINDING_CATEGORY_ORDER = {
     "defensive_exposure": 3,
     "service_signals": 4,
     "unverified_profiles": 5,
-    "quarantined_candidates": 6,
-    "rejected_observations": 7,
+    "catalogue_leads": 6,
+    "unverified_search_results": 7,
+    "inaccessible_profiles": 8,
+    "quarantined_candidates": 9,
+    "rejected_observations": 10,
 }
 
 
@@ -244,7 +247,11 @@ def _mean_confidence(items: list[Evidence]) -> float:
 def _grouped_candidate_findings(evidence: list[Evidence]) -> list[Finding]:
     groups: dict[tuple[str, str, str, bool], list[Evidence]] = {}
     for item in evidence:
-        if item.type in {"social_profile", "service_registration"}:
+        if item.type in {
+            "person_search_result",
+            "social_profile",
+            "service_registration",
+        }:
             quality = evidence_quality(item)
             groups.setdefault(
                 (
@@ -280,7 +287,7 @@ def _grouped_candidate_findings(evidence: list[Evidence]) -> list[Finding]:
             if verification_status == "rejected":
                 observations = "; ".join(
                     _candidate_description(item)
-                    if evidence_type == "social_profile"
+                    if evidence_type in {"person_search_result", "social_profile"}
                     else _service_label(item)
                     for item in part
                 )
@@ -294,9 +301,31 @@ def _grouped_candidate_findings(evidence: list[Evidence]) -> list[Finding]:
                     "A rejected observation is not attributed to the person.",
                     "Re-evaluate only when new public, independently cited evidence exists.",
                 ]
-            elif evidence_type == "social_profile":
+            elif evidence_type in {"person_search_result", "social_profile"}:
                 candidates = "; ".join(_candidate_description(item) for item in part)
-                if verification_status == "quarantined":
+                if verification_status == "catalogue_only":
+                    title = f"Catalogue-only username leads{part_suffix}"
+                    statement = (
+                        f"{sources} returned {len(part)} catalogue URL(s): "
+                        f"{candidates}. No observed name, employer, location, or "
+                        "profile content links them to the investigated person. "
+                        "They are hidden from primary results."
+                    )
+                elif verification_status == "insufficient_context":
+                    title = f"Search results without enough identity context{part_suffix}"
+                    statement = (
+                        f"{sources} returned {len(part)} search result(s): "
+                        f"{candidates}. Each result matches fewer than two supplied "
+                        "identity attributes and is not attributed to the person."
+                    )
+                elif verification_status == "inaccessible":
+                    title = f"Unavailable profile links{part_suffix}"
+                    statement = (
+                        f"{sources} returned {len(part)} URL(s) that were unavailable "
+                        f"or produced HTTP errors: {candidates}. They are retained "
+                        "only in the audit ledger."
+                    )
+                elif verification_status == "quarantined":
                     title = f"Quarantined sensitive candidates{part_suffix}"
                     statement = (
                         f"{sources} returned {len(part)} sensitive-profile candidate(s): "
@@ -358,7 +387,7 @@ def _grouped_candidate_findings(evidence: list[Evidence]) -> list[Finding]:
     return sorted(
         findings,
         key=lambda item: (
-            _FINDING_CATEGORY_ORDER.get(item.category, 8),
+            _FINDING_CATEGORY_ORDER.get(item.category, 11),
             -item.confidence,
             item.title.casefold(),
         ),
@@ -632,7 +661,7 @@ def _baseline_report(
     )
 
     summary_parts = [
-        f"DeepVault normalized {len(evidence)} source observation(s)."
+        f"WorldAtlas normalized {len(evidence)} source observation(s)."
     ]
     actionable_count = (
         result_quality["confirmed"]
@@ -811,7 +840,7 @@ def _baseline_report(
     if counts["breach"]:
         recommendations.append(
             "Prioritize remediation for verified breach exposure and rotate affected "
-            "credentials outside DeepVault."
+            "credentials outside WorldAtlas."
         )
     if unavailable_count:
         recommendations.append(
@@ -1050,7 +1079,7 @@ def _gate_not_observed_by_coverage(
         update={"not_observed": len(kept)}
     )
     note = (
-        f"{comparison.scope_note} DeepVault omitted {suppressed} possible "
+        f"{comparison.scope_note} WorldAtlas omitted {suppressed} possible "
         "not-observed difference(s) because the current run lacked successful "
         "coverage for the relevant source."
     )

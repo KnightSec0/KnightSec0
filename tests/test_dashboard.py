@@ -2,18 +2,31 @@ import os
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
+from xml.etree import ElementTree as ET
 
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
 from dashboard.app import (  # noqa: E402
+    EXPORT_PREFIX,
+    PRODUCT_FULL_NAME,
+    PRODUCT_NAME,
+    PRODUCT_TAGLINE,
+    PRODUCT_VENDOR,
+    EvidenceAdjudicationRequest,
+    EvidenceDecisionStatus,
     Investigation,
     InvestigationCreate,
     TransformRequest,
     _active_transform_run_count,
+    _effective_report,
+    _gexf_document,
+    _graph_csv_document,
     _graph_document,
+    _graphml_document,
     _mapping_document,
     render_report_html,
 )
@@ -35,6 +48,25 @@ def valid_request(**overrides):
 
 
 class DashboardRequestValidationTests(unittest.TestCase):
+    def test_false_positive_decision_requires_an_analyst_note(self):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "requires an analyst note",
+        ):
+            EvidenceAdjudicationRequest(
+                evidence_ids=["EVID-1"],
+                status=EvidenceDecisionStatus.FALSE_POSITIVE,
+                reason_code="identity_mismatch",
+            )
+
+        decision = EvidenceAdjudicationRequest(
+            evidence_ids=["EVID-1", "EVID-1"],
+            status=EvidenceDecisionStatus.FALSE_POSITIVE,
+            reason_code="identity_mismatch",
+            note="The public profile belongs to a different person.",
+        )
+        self.assertEqual(decision.evidence_ids, ["EVID-1"])
+
     def test_temporal_comparison_is_explicit_opt_in(self):
         self.assertFalse(
             InvestigationCreate(**valid_request()).compare_previous_cases
@@ -47,13 +79,13 @@ class DashboardRequestValidationTests(unittest.TestCase):
 
     def test_rejects_unconfirmed_authorization(self):
         with self.assertRaisesRegex(
-            ValidationError, "Written authorization must be confirmed"
+            ValidationError, "Documented case approval must be confirmed"
         ):
             InvestigationCreate(**valid_request(authorization_confirmed=False))
 
     def test_rejects_expired_authorization(self):
         with self.assertRaisesRegex(
-            ValidationError, "Authorization expiry must be in the future"
+            ValidationError, "Case mandate expiry must be in the future"
         ):
             InvestigationCreate(
                 **valid_request(
@@ -103,7 +135,7 @@ class DashboardRequestValidationTests(unittest.TestCase):
             )
 
     def test_active_and_authenticated_transforms_require_separate_scope(self):
-        with self.assertRaisesRegex(ValidationError, "authorized domain"):
+        with self.assertRaisesRegex(ValidationError, "in-scope domain"):
             InvestigationCreate(
                 **valid_request(permitted_sources=["github", "httpx"])
             )
@@ -246,10 +278,25 @@ class DashboardGraphExportTests(unittest.TestCase):
 
         self.assertEqual(graph["schemaVersion"], 2)
         self.assertEqual(
+            graph["product"],
+            {
+                "name": PRODUCT_FULL_NAME,
+                "shortName": PRODUCT_NAME,
+                "vendor": PRODUCT_VENDOR,
+                "tagline": PRODUCT_TAGLINE,
+            },
+        )
+        self.assertEqual(
             [item["name"] for item in graph["transforms"]],
             ["blackbird"],
         )
         self.assertEqual(mapping["schemaVersion"], 2)
+        self.assertEqual(
+            mapping["name"],
+            "SIGMA WorldAtlas Intelligence — Alice Example",
+        )
+        self.assertIn("WorldAtlas", mapping["target"]["notes"])
+        self.assertNotIn("DeepVault", str(mapping))
         profile = next(
             item
             for item in mapping["identifiers"]
@@ -264,9 +311,350 @@ class DashboardGraphExportTests(unittest.TestCase):
             mapping["connections"][0]["provenanceChain"][0]["source"],
             "github",
         )
+        self.assertEqual(graph["stats"]["entity_count"], 2)
+        self.assertEqual(graph["stats"]["relationship_count"], 1)
+        self.assertEqual(graph["stats"]["evidence_count"], 1)
+        target_entity = next(
+            item
+            for item in graph["entities"]
+            if item["entity_id"] == "NODE-TARGET"
+        )
+        self.assertEqual(target_entity["source_tools"], [])
+        self.assertEqual(target_entity["publisher_count"], 0)
+        profile_entity = next(
+            item
+            for item in graph["entities"]
+            if item["entity_id"] == "NODE-PROFILE"
+        )
+        self.assertEqual(profile_entity["source_tools"], ["github"])
+        self.assertEqual(profile_entity["confidence"], 0.62)
+        self.assertEqual(profile_entity["evidence_ids"], ["EVID-1"])
+        self.assertEqual(profile_entity["review_priority"], "review_first")
+        self.assertEqual(profile_entity["confidence_label"], "Possible match")
+        self.assertEqual(
+            graph["relationships"][0]["reason"],
+            "Public observation.",
+        )
+        self.assertEqual(
+            graph["relationships"][0]["plain_language_type"],
+            "Possible public profile",
+        )
+        self.assertEqual(
+            graph["review_summary"]["verdict"]["title"],
+            "No verified identity match yet",
+        )
+        self.assertEqual(
+            graph["review_summary"]["verdict"]["evidence_ids"],
+            ["EVID-1"],
+        )
+        self.assertEqual(graph["review_summary"]["counts"]["review_first"], 1)
+        self.assertEqual(
+            graph["review_summary"]["priority_leads"][0]["entity_id"],
+            "NODE-PROFILE",
+        )
+
+    def test_simplified_review_hides_generic_profile_endpoints(self):
+        investigation = self.investigation()
+        graph = investigation.case_metadata["structured_report"]["identity_graph"]
+        graph["nodes"][1]["label"] = "https://discord.com/"
+        graph["nodes"][1]["attributes"] = {
+            "url": "https://discord.com/",
+            "verification_status": "unverified",
+        }
+
+        document = _graph_document(investigation)
+        profile = next(
+            item
+            for item in document["entities"]
+            if item["entity_id"] == "NODE-PROFILE"
+        )
+
+        self.assertTrue(profile["generic_endpoint"])
+        self.assertEqual(profile["review_priority"], "suppressed")
+        self.assertEqual(document["review_summary"]["counts"]["suppressed"], 1)
+        self.assertEqual(document["review_summary"]["priority_leads"], [])
+
+    def test_simplified_review_hides_catalogue_only_username_pages(self):
+        investigation = self.investigation()
+        graph = investigation.case_metadata["structured_report"]["identity_graph"]
+        graph["nodes"][1]["attributes"] = {
+            "url": "https://social.example/alice",
+            "verification_status": "unverified",
+            "matched_attributes": [],
+            "flags": [],
+        }
+        graph["edges"][0]["provenance_chain"][0]["source"] = "sherlock"
+        investigation.case_metadata["structured_report"]["evidence_ledger"][0][
+            "source"
+        ] = "sherlock"
+
+        document = _graph_document(investigation)
+        profile = next(
+            item
+            for item in document["entities"]
+            if item["entity_id"] == "NODE-PROFILE"
+        )
+
+        self.assertEqual(profile["review_priority"], "suppressed")
+        self.assertIn("username catalogue", profile["plain_language_explanation"])
+        self.assertEqual(document["review_summary"]["priority_leads"], [])
+
+    def test_false_positive_is_removed_from_views_exports_and_report(self):
+        investigation = self.investigation()
+        structured_report = investigation.case_metadata["structured_report"]
+        structured_report["findings"] = [
+            {
+                "title": "Candidate profile",
+                "statement": "The profile may belong to the person.",
+                "evidence_ids": ["EVID-1"],
+            }
+        ]
+        structured_report["timeline"] = [
+            {
+                "description": "Candidate profile event.",
+                "evidence_ids": ["EVID-1"],
+            }
+        ]
+        structured_report["contradictions"] = [
+            {
+                "description": "Candidate mismatch.",
+                "evidence_ids": ["EVID-1"],
+            }
+        ]
+        investigation.case_metadata["evidence_adjudications"] = {
+            "EVID-1": {
+                "status": "false_positive",
+                "reason_code": "identity_mismatch",
+                "note": "The profile belongs to another person.",
+                "reviewer": "Analyst A",
+                "updated_at": "2026-07-29T10:00:00Z",
+            }
+        }
+        investigation.case_metadata["adjudication_audit"] = [
+            {
+                "id": "ADJ-1",
+                "evidence_id": "EVID-1",
+                "decision": investigation.case_metadata[
+                    "evidence_adjudications"
+                ]["EVID-1"],
+                "recorded_at": "2026-07-29T10:00:00Z",
+            }
+        ]
+
+        document = _graph_document(investigation)
+        report = _effective_report(investigation)
+        mapping = _mapping_document(investigation)
+
+        self.assertEqual(document["falsePositiveCount"], 1)
+        self.assertEqual(document["stats"]["evidence_count"], 0)
+        self.assertEqual(document["stats"]["relationship_count"], 0)
+        self.assertEqual(
+            [item["entity_id"] for item in document["entities"]],
+            ["NODE-TARGET"],
+        )
+        self.assertEqual(
+            document["review_summary"]["counts"]["candidate_observations"],
+            0,
+        )
+        self.assertEqual(report["evidence_ledger"], [])
+        self.assertEqual(report["evidence_count"], 0)
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(report["timeline"], [])
+        self.assertEqual(report["contradictions"], [])
+        self.assertEqual(report["overall_risk"], "not_assessed_after_review")
+        self.assertIn(
+            "No identity association is verified",
+            report["executive_summary"],
+        )
+        self.assertIn("excluded as false positives", report["executive_summary"])
+        self.assertEqual(
+            [item["id"] for item in mapping["identifiers"]],
+            ["NODE-TARGET"],
+        )
+        self.assertNotIn("EVID-1", _graphml_document(investigation).decode())
+
+        rendered = render_report_html(
+            report,
+            investigation.target_name,
+            review_summary=document["review_summary"],
+        )
+        self.assertIn("Analyst review decisions", rendered)
+        self.assertIn("The profile belongs to another person.", rendered)
+        self.assertIn("must not be used to infer", rendered)
+
+    def test_restoring_evidence_to_review_makes_it_visible_again(self):
+        investigation = self.investigation()
+        investigation.case_metadata["structured_report"]["identity_graph"][
+            "nodes"
+        ].append(
+            {
+                "id": "NODE-SOURCE",
+                "kind": "public_source",
+                "label": "github",
+                "attributes": {},
+                "evidence_ids": ["EVID-1"],
+            }
+        )
+        investigation.case_metadata["evidence_adjudications"] = {
+            "EVID-1": {
+                "status": "needs_review",
+                "reason_code": "requires_more_evidence",
+                "note": "Restored for verification.",
+                "reviewer": "Analyst A",
+                "updated_at": "2026-07-29T10:00:00Z",
+            }
+        }
+
+        document = _graph_document(investigation)
+        profile = next(
+            item
+            for item in document["entities"]
+            if item["entity_id"] == "NODE-PROFILE"
+        )
+        self.assertEqual(document["stats"]["evidence_count"], 1)
+        self.assertEqual(profile["adjudication_status"], "needs_review")
+        self.assertEqual(profile["confidence_label"], "Analyst review required")
+        source = next(
+            item
+            for item in document["entities"]
+            if item["entity_id"] == "NODE-SOURCE"
+        )
+        self.assertIsNone(source["adjudication_status"])
+        self.assertEqual(source["adjudication_notes"], [])
+        self.assertIn("needs_review", _graph_csv_document(investigation))
+
+    def test_interoperable_exports_keep_relationship_evidence_ids(self):
+        investigation = self.investigation()
+
+        graphml = _graphml_document(investigation)
+        gexf = _gexf_document(investigation)
+        csv_export = _graph_csv_document(investigation)
+
+        graphml_root = ET.fromstring(graphml)
+        gexf_root = ET.fromstring(gexf)
+        self.assertTrue(graphml_root.tag.endswith("graphml"))
+        self.assertTrue(gexf_root.tag.endswith("gexf"))
+        self.assertIn("EVID-1", graphml.decode())
+        self.assertIn("candidate_profile", graphml.decode())
+        self.assertIn("candidate_profile", gexf.decode())
+        self.assertIn("relationship,EDGE-1", csv_export)
+        self.assertIn("EVID-1", csv_export)
+        self.assertIn("review_priority,review_label,source_tools", csv_export)
+        self.assertIn(
+            "adjudication_status,adjudication_notes",
+            csv_export,
+        )
+        self.assertIn("summary,verdict", csv_export)
+        self.assertIn("Possible match", csv_export)
+
+    def test_exports_escape_markup_and_reject_unknown_evidence(self):
+        investigation = self.investigation()
+        graph = investigation.case_metadata["structured_report"]["identity_graph"]
+        graph["nodes"][1]["label"] = "<script>alert('graph')</script>"
+        graphml = _graphml_document(investigation).decode()
+        self.assertNotIn("<script>", graphml)
+        self.assertIn("&lt;script&gt;", graphml)
+
+        graph["nodes"][1]["label"] = "=2+2"
+        csv_export = _graph_csv_document(investigation)
+        self.assertIn("'=2+2", csv_export)
+
+        graph["edges"][0]["evidence_ids"] = ["EVID-UNKNOWN"]
+        with self.assertRaisesRegex(
+            HTTPException,
+            "relationship failed evidence validation",
+        ):
+            _graph_document(investigation)
+
+    def test_workbench_assets_define_requested_views_and_theme(self):
+        with open(
+            os.path.join(ROOT, "dashboard", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            index = file.read()
+        with open(
+            os.path.join(ROOT, "dashboard", "static", "workbench.js"),
+            encoding="utf-8",
+        ) as file:
+            workbench = file.read()
+
+        self.assertIn("--bg: #071326", index)
+        self.assertIn("--accent: #c1121f", index)
+        self.assertIn("SIGMA WorldAtlas Intelligence", index)
+        self.assertIn("A SIGMA Intelligence Platform", index)
+        self.assertIn('aria-label="WorldAtlas">WA', index)
+        self.assertNotIn("<h1>DeepVault</h1>", index)
+        self.assertIn(
+            'src="/static/workbench.js?v=entity-click-v2"',
+            index,
+        )
+        self.assertIn("Case mandate reference", index)
+        self.assertIn("Start investigation", index)
+        self.assertNotIn("Start authorized investigation", index)
+        for result_view in ("overview", "graph", "evidence", "timeline", "report"):
+            self.assertIn(f'["{result_view}"', workbench)
+        self.assertIn("Plain-language assessment", workbench)
+        self.assertIn("What to check first", workbench)
+        self.assertIn("What you must not conclude", workbench)
+        self.assertIn("Show full technical graph", workbench)
+        self.assertIn("Hidden noise", workbench)
+        self.assertIn("Why this match?", workbench)
+        self.assertIn('authorized_target: "Case subject"', workbench)
+        self.assertIn("Approved transforms", workbench)
+        self.assertNotIn("Authorized transforms", workbench)
+        self.assertIn("Mark false positive", workbench)
+        self.assertIn("Restore to review", workbench)
+        self.assertIn("mental health", workbench)
+        self.assertIn("Connection view", workbench)
+        self.assertIn("Outgoing from selected", workbench)
+        self.assertIn("Incoming to selected", workbench)
+        self.assertIn("Find an entity", workbench)
+        self.assertIn("Visible entity directory", workbench)
+        self.assertIn("data-graph-entity-id", workbench)
+        self.assertIn("Cited evidence details", workbench)
+        self.assertIn("Ownership conclusion", workbench)
+        self.assertIn("Evidence search", workbench)
+        self.assertIn("Unvalidated discovery link", workbench)
+        self.assertIn("Unavailable page", workbench)
+        self.assertIn("const simpleCandidates = prioritized;", workbench)
+        self.assertIn("data-evidence-focus", workbench)
+        self.assertIn("Click or press Enter on a node", workbench)
+        self.assertIn("element.setPointerCapture(event.pointerId)", workbench)
+        self.assertIn("!completed.moved", workbench)
+        self.assertNotIn('element.addEventListener("click"', workbench)
+        self.assertIn("graph.graphml", workbench)
+        self.assertIn("graph.gexf", workbench)
+        self.assertIn("graph.csv", workbench)
 
 
 class DashboardReportRenderingTests(unittest.TestCase):
+    def test_product_branding_is_consistent_across_reports_and_exports(self):
+        self.assertEqual(PRODUCT_NAME, "WorldAtlas")
+        self.assertEqual(PRODUCT_FULL_NAME, "SIGMA WorldAtlas Intelligence")
+        self.assertEqual(PRODUCT_VENDOR, "SIGMA")
+        self.assertEqual(
+            PRODUCT_TAGLINE,
+            "From public evidence to defensible insight",
+        )
+        self.assertEqual(EXPORT_PREFIX, "sigma-worldatlas")
+
+        rendered = render_report_html(
+            {
+                "report_id": "REPORT-BRAND",
+                "generated_at": "2026-07-29T12:00:00Z",
+                "executive_summary": "No cited conclusion was produced.",
+                "identity_confidence": "insufficient_evidence",
+                "overall_risk": "not_assessed",
+                "evidence_count": 0,
+                "executive_summary_evidence_ids": [],
+            },
+            "Alice Example",
+        )
+        self.assertIn(PRODUCT_FULL_NAME, rendered)
+        self.assertIn("SIGMA · WORLDATLAS", rendered)
+        self.assertIn(PRODUCT_TAGLINE, rendered)
+        self.assertNotIn("DEEPVAULT · PERSON", rendered)
+
     def test_html_escapes_untrusted_values_and_keeps_evidence_citations(self):
         report = {
             "report_id": "REPORT-1",
@@ -375,9 +763,52 @@ class DashboardReportRenderingTests(unittest.TestCase):
             "recommendations": ["Review <b>manually</b>."],
         }
 
-        rendered = render_report_html(report, "Alice <script>alert('target')</script>")
+        review_summary = {
+            "verdict": {
+                "status": "manual_verification_required",
+                "title": "No verified identity match yet",
+                "explanation": "One candidate requires manual review.",
+                "evidence_ids": ["EVID-ABC123"],
+            },
+            "counts": {
+                "supported": 0,
+                "review_first": 1,
+                "low_signal": 0,
+                "suppressed": 0,
+            },
+            "priority_leads": [
+                {
+                    "entity_id": "NODE-PROFILE",
+                    "label": "<img src=x onerror=alert('lead')>",
+                    "public_url": "https://github.com/alice",
+                    "confidence_label": "Possible match",
+                    "technical_confidence": 0.62,
+                    "source_tools": ["github"],
+                    "explanation": "Compare public profile details.",
+                    "evidence_ids": ["EVID-ABC123"],
+                }
+            ],
+            "key_points": [
+                {
+                    "title": "Candidate observations",
+                    "statement": "One candidate was retained.",
+                    "evidence_ids": ["EVID-ABC123"],
+                }
+            ],
+            "cautions": [
+                {
+                    "statement": "A username match is not proof.",
+                    "evidence_ids": ["EVID-ABC123"],
+                }
+            ],
+        }
+        rendered = render_report_html(
+            report,
+            "Alice <script>alert('target')</script>",
+            review_summary=review_summary,
+        )
 
-        self.assertNotIn("<script>", rendered)
+        self.assertNotIn("<script>alert('target')</script>", rendered)
         self.assertNotIn("<img src=x", rendered)
         self.assertNotIn("<b>manually</b>", rendered)
         self.assertNotIn("<svg onload", rendered)
@@ -389,9 +820,22 @@ class DashboardReportRenderingTests(unittest.TestCase):
         self.assertNotIn("must-not-survive-either", rendered)
         self.assertIn("&lt;redacted&gt;", rendered)
         self.assertIn("Evidence appendix", rendered)
+        self.assertIn("PLAIN-LANGUAGE ASSESSMENT", rendered)
+        self.assertIn("No verified identity match yet", rendered)
+        self.assertIn("What to check first", rendered)
+        self.assertIn("What you must not conclude", rendered)
+        self.assertIn("Full technical provenance", rendered)
         self.assertIn("Evidence-first identity analysis", rendered)
+        self.assertIn('id="interactive-graph"', rendered)
+        self.assertIn('id="graph-direction"', rendered)
+        self.assertIn("Outgoing from selected", rendered)
+        self.assertIn('id="dv-graph-data"', rendered)
+        self.assertIn("report-node", rendered)
+        self.assertIn("evidence-EVID-ABC123", rendered)
+        self.assertIn("href='#evidence-EVID-ABC123'", rendered)
         self.assertIn("Changes since the previous comparable case", rendered)
         self.assertIn("&lt;svg onload=alert(&#x27;graph&#x27;)&gt;", rendered)
+        self.assertIn("\\u003csvg onload=alert('graph')\\u003e", rendered)
         self.assertIn("&lt;iframe src=bad&gt;", rendered)
         self.assertGreaterEqual(rendered.count("EVID-ABC123"), 3)
 

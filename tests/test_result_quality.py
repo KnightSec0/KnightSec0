@@ -47,13 +47,17 @@ class ResultQualityTests(unittest.TestCase):
 
         self.assertEqual(len(correlated), 1)
         self.assertEqual(correlated[0].value, "https://youtube.com/@alice")
-        self.assertEqual(correlated[0].confidence, 0.25)
+        self.assertEqual(correlated[0].confidence, 0.15)
         self.assertEqual(
             correlated[0].identity_status,
             IdentityStatus.INSUFFICIENT_EVIDENCE,
         )
         self.assertEqual(correlated[0].metadata["source_count"], 1)
         self.assertEqual(correlated[0].metadata["collector_count"], 2)
+        self.assertEqual(
+            correlated[0].metadata["quality"]["verification_status"],
+            "catalogue_only",
+        )
 
     def test_sensitive_username_only_candidate_is_quarantined(self):
         evidence = Evidence(
@@ -158,7 +162,8 @@ class ResultQualityTests(unittest.TestCase):
 
         summary = quality_summary(items)
 
-        self.assertEqual(summary["unverified"], 2)
+        self.assertEqual(summary["unverified"], 1)
+        self.assertEqual(summary["catalogue_only"], 1)
         self.assertEqual(summary["quarantined"], 1)
         self.assertEqual(summary["possible"], 0)
 
@@ -168,6 +173,110 @@ class ResultQualityTests(unittest.TestCase):
                 "http://www.digitalpoint.com/members/?username=alice&utm_source=x"
             ),
             "https://digitalpoint.com/members?username=alice",
+        )
+
+    def test_quality_deduplication_preserves_exact_navigation_url(self):
+        source_url = (
+            "http://www.digitalpoint.com/members/?username=alice&utm_source=x"
+        )
+        evidence = Evidence(
+            type="social_profile",
+            value=source_url,
+            source="sherlock",
+            source_url=source_url,
+            confidence=0.55,
+        )
+
+        refined = refine_evidence_quality([evidence], {"username": "alice"})[0]
+
+        self.assertEqual(
+            refined.value,
+            "https://digitalpoint.com/members?username=alice",
+        )
+        self.assertEqual(refined.source_url, source_url)
+
+    def test_username_punctuation_is_not_collapsed_for_identity_matching(self):
+        evidence = Evidence(
+            type="public_profile",
+            value="https://profiles.example/johnsmith",
+            source="public-directory",
+            confidence=0.60,
+            metadata={"observed_username": "johnsmith"},
+        )
+
+        refined = refine_evidence_quality(
+            [evidence],
+            {"username": "john.smith"},
+        )[0]
+
+        self.assertNotIn(
+            "username",
+            evidence_quality(refined)["matched_attributes"],
+        )
+        self.assertEqual(
+            refined.identity_status,
+            IdentityStatus.INSUFFICIENT_EVIDENCE,
+        )
+
+    def test_person_search_requires_two_identity_attributes(self):
+        name_only = Evidence(
+            type="person_search_result",
+            value="https://example.test/article/alice-example",
+            source="brave",
+            source_url="https://example.test/article/alice-example",
+            confidence=0.60,
+            metadata={"title": "Alice Example profile"},
+        )
+        contextual = Evidence(
+            type="person_search_result",
+            value="https://example.test/team/alice-example",
+            source="brave",
+            source_url="https://example.test/team/alice-example",
+            confidence=0.60,
+            metadata={
+                "title": "Alice Example — Example Security",
+                "description": "Alice leads research in Paris.",
+            },
+        )
+
+        refined = refine_evidence_quality(
+            [name_only, contextual],
+            {
+                "name": "Alice Example",
+                "employer": "Example Security",
+                "location": "Paris",
+            },
+        )
+
+        self.assertEqual(
+            evidence_quality(refined[0])["verification_status"],
+            "insufficient_context",
+        )
+        self.assertEqual(
+            evidence_quality(refined[1])["verification_status"],
+            "probable",
+        )
+
+    def test_unavailable_page_cannot_remain_confirmed(self):
+        evidence = Evidence(
+            type="social_profile",
+            value="https://example.test/alice",
+            source="sherlock",
+            source_url="https://example.test/alice",
+            confidence=0.99,
+            identity_status=IdentityStatus.CONFIRMED,
+            metadata={"http_status": 404, "profile_exists": False},
+        )
+
+        refined = refine_evidence_quality([evidence], {"username": "alice"})[0]
+
+        self.assertEqual(
+            evidence_quality(refined)["verification_status"],
+            "rejected",
+        )
+        self.assertEqual(
+            refined.identity_status,
+            IdentityStatus.INSUFFICIENT_EVIDENCE,
         )
 
     def test_noisy_case_is_inconclusive_and_grouped_away_from_identity(self):
@@ -206,10 +315,11 @@ class ResultQualityTests(unittest.TestCase):
         self.assertEqual(report.identity_confidence, "insufficient_evidence")
         self.assertEqual(report.overall_risk.value, "unknown")
         self.assertEqual(report.coverage_assessment, "insufficient")
-        self.assertEqual(report.result_quality["unverified"], 3)
+        self.assertEqual(report.result_quality["unverified"], 1)
+        self.assertEqual(report.result_quality["catalogue_only"], 2)
         self.assertEqual(
             {item.category for item in report.findings},
-            {"service_signals", "unverified_profiles"},
+            {"catalogue_leads", "service_signals"},
         )
         self.assertIn("inconclusive rather than low", report.executive_summary)
 

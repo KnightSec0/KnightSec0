@@ -9,7 +9,7 @@ import shutil
 import tempfile
 import time
 from typing import Any, Iterator
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from config import settings
 from intelligence.models import (
@@ -84,6 +84,36 @@ def _site_name(record: dict[str, Any]) -> str | None:
     return None
 
 
+def _http_status(record: dict[str, Any]) -> int | None:
+    layers = [record]
+    if isinstance(record.get("status"), dict):
+        layers.append(record["status"])
+    for layer in layers:
+        for key in ("http_status", "status_code", "httpStatus"):
+            value = layer.get(key)
+            if isinstance(value, int) and 100 <= value <= 599:
+                return value
+            if isinstance(value, str):
+                match = re.search(r"\b([1-5][0-9]{2})\b", value)
+                if match:
+                    return int(match.group(1))
+    return None
+
+
+def _username_profile_url(url: str, username: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    searchable = unquote(f"{parsed.path}?{parsed.query}").casefold()
+    token = username.casefold()
+    return bool(
+        re.search(rf"(?<![\w.-]){re.escape(token)}(?![\w.-])", searchable)
+    )
+
+
 class MaigretConnector(BaseConnector):
     name = "maigret"
     identifier_type = "username"
@@ -141,10 +171,11 @@ class MaigretConnector(BaseConnector):
                     continue
                 url = (
                     record.get("url_user")
-                    or record.get("url")
                     or record.get("profile_url")
                 )
                 if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                    continue
+                if not _username_profile_url(url, identifier):
                     continue
                 if url in dedupe:
                     continue
@@ -152,9 +183,19 @@ class MaigretConnector(BaseConnector):
                 metadata = {
                     "username": identifier,
                     "site": _site_from_url(url),
+                    "catalogue_claimed": True,
                 }
                 if display_name := _site_name(record):
                     metadata["site_name"] = display_name
+                status_code = _http_status(record)
+                if status_code is not None:
+                    metadata["http_status"] = status_code
+                    metadata["profile_accessible"] = status_code < 400
+                    if status_code in {404, 410}:
+                        metadata["profile_exists"] = False
+                        metadata["not_found"] = True
+                    elif status_code >= 400:
+                        metadata["inaccessible_profile"] = True
                 evidence.append(
                     Evidence(
                         type="social_profile",

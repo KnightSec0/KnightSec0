@@ -175,7 +175,7 @@ class GravatarProfileConnector(BaseConnector):
         email_hash = hashlib.sha256(email.encode("utf-8")).hexdigest()
         headers = {
             "Accept": "application/json",
-            "User-Agent": "DeepVault/2.0",
+            "User-Agent": "SIGMA-WorldAtlas/2.0",
         }
         if settings.gravatar_api_key:
             headers["Authorization"] = f"Bearer {settings.gravatar_api_key}"

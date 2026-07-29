@@ -1,13 +1,13 @@
 # Person-focused OSINT intelligence layer
 
 This phase adds a normalized evidence pipeline for authorized investigations of
-specific people. DeepVault treats every automated result as an observation, not
+specific people. WorldAtlas treats every automated result as an observation, not
 as proof that a person controls an account.
 
 ## Sources
 
 - Sherlock: public username presence
-- Maigret: independent username corroboration
+- Maigret: public username-catalogue discovery
 - Holehe: public service-registration signals
 - GitHub: public profile metadata only
 - HIBP: breach metadata and data classes only
@@ -23,10 +23,12 @@ identity status, notes and minimized metadata.
 
 ## Confidence rules
 
-A single username match begins as **possible**. Confidence rises only when
-independent sources return the same canonical profile URL. Analysts must still
-compare public profile attributes such as display name, employer, location and
-cross-linked accounts.
+A username-catalogue match is an **unattributed discovery lead** and is hidden
+from primary person results until public content supplies matching identity
+context or an analyst explicitly accepts it. Catalogue overlap is never
+independent corroboration. Person-search results require at least two matching
+supplied attributes, such as full name plus employer or location. Analysts must
+still inspect cited public content before attribution.
 
 ## Structured reports
 
@@ -47,7 +49,7 @@ LLM_INCLUDE_IDENTIFIERS=false
 ```
 
 Every finding must contain at least one valid evidence ID. If the provider
-returns unsupported references or fails, DeepVault falls back to a deterministic
+returns unsupported references or fails, WorldAtlas falls back to a deterministic
 evidence-only report.
 
 For consensus reporting, configure a comma-separated provider list:
@@ -63,14 +65,14 @@ coverage, limitations and analyst recommendations.
 
 ## Identity graph and case comparison
 
-After source normalization and conservative correlation, DeepVault builds a
+After source normalization and conservative correlation, WorldAtlas builds a
 local identity graph. Evidence records become nodes; cross-source agreement and
 explicit provenance become evidence-linked edges. The graph produces reviewable
 hypotheses and ranked analyst pivots, but never launches a new query by itself.
 Every edge, hypothesis and pivot cites the evidence IDs that support it.
 
 Case comparison is disabled by default. When the operator explicitly opts in,
-DeepVault can compare against the latest completed case with the same normalized
+WorldAtlas can compare against the latest completed case with the same normalized
 name, matching email (or username fallback), unexpired authorization reference,
 lawful purpose and source scope. The report labels observations as added,
 persisting, changed or not-observed. Not-observed never means deleted or
@@ -88,7 +90,7 @@ disabled unless explicitly enabled:
 ALLOW_SENSITIVE_PIVOTS=false
 ```
 
-DeepVault does not retain passwords, authentication tokens, cookies, private
+WorldAtlas does not retain passwords, authentication tokens, cookies, private
 messages or session material.
 
 ## Authorization and privacy
@@ -102,7 +104,7 @@ ALLOW_INFRASTRUCTURE_ENRICHMENT=true
 ```
 
 The case itself must contain a written authorization reference, infrastructure
-consent, and literal authorized IPs. DeepVault does not perform broad Shodan or
+consent, and literal authorized IPs. WorldAtlas does not perform broad Shodan or
 Censys discovery from a person's name or email.
 
 Do not put API keys in targets, evidence, logs or reports. Store them only in
@@ -160,7 +162,7 @@ metadata behind each cited evidence ID. A report is unavailable until
 processing finishes. Treat all results as leads until the cited evidence IDs
 and identity context have been reviewed by an analyst.
 
-When `LLM_INCLUDE_IDENTIFIERS=false` (the default), DeepVault pseudonymizes
+When `LLM_INCLUDE_IDENTIFIERS=false` (the default), WorldAtlas pseudonymizes
 identifiers in the target and evidence payload before contacting an external
 LLM provider. The local stored report and evidence appendix remain auditable.
 
@@ -185,7 +187,7 @@ docker compose restart orchestrator dashboard
 ```
 
 Do not use `docker compose down -v` as a password-reset shortcut unless deleting
-all local DeepVault volumes and case data is intentional.
+all local WorldAtlas volumes and case data is intentional.
 
 ## Connector configuration
 

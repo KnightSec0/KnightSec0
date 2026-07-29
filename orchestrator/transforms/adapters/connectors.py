@@ -1,4 +1,4 @@
-"""Transform wrappers around DeepVault's normalized first-party connectors."""
+"""Transform wrappers around WorldAtlas's normalized first-party connectors."""
 
 from __future__ import annotations
 

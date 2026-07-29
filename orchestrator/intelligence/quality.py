@@ -10,13 +10,15 @@ from __future__ import annotations
 from collections import Counter
 import re
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import unicodedata
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from .models import Evidence, IdentityStatus
 
 
 PROFILE_TYPES = {
     "github_profile",
+    "person_search_result",
     "public_profile",
     "social_profile",
     "web_profile",
@@ -52,6 +54,9 @@ _REJECTING_FLAGS = {
     "not_found",
     "profile_missing",
     "soft_404",
+}
+_INACCESSIBLE_FLAGS = {
+    "inaccessible_profile",
 }
 _VALIDATION_FLAGS = {
     "canonical_profile_match",
@@ -111,6 +116,27 @@ def _normalized_text(value: Any) -> str:
 
 def _token_key(value: Any) -> str:
     return _NON_ALNUM.sub("", _normalized_text(value))
+
+
+def _username_key(value: Any) -> str:
+    if not isinstance(value, (str, int, float)):
+        return ""
+    return unicodedata.normalize("NFKC", str(value)).strip().casefold()
+
+
+def _search_text_key(value: Any) -> str:
+    if not isinstance(value, (str, int, float)):
+        return ""
+    normalized = unicodedata.normalize("NFKD", str(value)).casefold()
+    ascii_text = "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    )
+    return " ".join(re.findall(r"[a-z0-9]+", ascii_text))
+
+
+def _contains_phrase(haystack: str, value: Any) -> bool:
+    needle = _search_text_key(value)
+    return bool(needle and f" {needle} " in f" {haystack} ")
 
 
 def _metadata_layers(metadata: dict[str, Any]) -> list[dict[str, Any]]:
@@ -185,7 +211,7 @@ def _matched_attributes(item: Evidence, target: dict[str, Any]) -> list[str]:
         matches.append("location")
 
     target_usernames = {
-        _token_key(value)
+        _username_key(value)
         for value in _target_values(
             target,
             "username",
@@ -193,7 +219,7 @@ def _matched_attributes(item: Evidence, target: dict[str, Any]) -> list[str]:
             "target_username",
             "additional_usernames",
         )
-        if _token_key(value)
+        if _username_key(value)
     }
     # Query-echo fields emitted by catalogue collectors are deliberately not
     # accepted.  Only fields explicitly labelled as observed profile content
@@ -203,9 +229,39 @@ def _matched_attributes(item: Evidence, target: dict[str, Any]) -> list[str]:
         {"login", "observed_username", "preferred_username", "profile_username"},
     )
     if target_usernames and any(
-        _token_key(value) in target_usernames for value in observed_usernames
+        _username_key(value) in target_usernames for value in observed_usernames
     ):
         matches.append("username")
+
+    if item.type.casefold() == "person_search_result":
+        result_text = " ".join(
+            str(value)
+            for value in (
+                metadata.get("title"),
+                metadata.get("description"),
+                unquote(str(item.source_url or item.value or "")),
+            )
+            if value
+        )
+        searchable = _search_text_key(result_text)
+        if _contains_phrase(
+            searchable,
+            _target_value(target, "name", "target_name"),
+        ):
+            matches.append("name")
+        if _contains_phrase(searchable, _target_value(target, "employer")):
+            matches.append("employer")
+        if _contains_phrase(searchable, _target_value(target, "location")):
+            matches.append("location")
+        raw_result = unicodedata.normalize("NFKC", result_text).casefold()
+        if target_usernames and any(
+            re.search(
+                rf"(?<![\w.-]){re.escape(username)}(?![\w.-])",
+                raw_result,
+            )
+            for username in target_usernames
+        ):
+            matches.append("username")
 
     return list(dict.fromkeys(matches))
 
@@ -213,15 +269,40 @@ def _matched_attributes(item: Evidence, target: dict[str, Any]) -> list[str]:
 def _quality_flags(item: Evidence, canonical_url: str | None) -> set[str]:
     metadata = item.metadata if isinstance(item.metadata, dict) else {}
     flags: set[str] = set()
-    for flag in _REJECTING_FLAGS | _VALIDATION_FLAGS:
+    for flag in _REJECTING_FLAGS | _INACCESSIBLE_FLAGS | _VALIDATION_FLAGS:
         if metadata.get(flag) is True:
             flags.add(flag)
     if metadata.get("profile_exists") is False:
         flags.add("profile_missing")
+    status_value = metadata.get("http_status") or metadata.get("status_code")
+    try:
+        status_code = int(status_value)
+    except (TypeError, ValueError):
+        status_code = None
+    if status_code in {404, 410}:
+        flags.add("not_found")
+    elif status_code is not None and status_code >= 400:
+        flags.add("inaccessible_profile")
+    if metadata.get("profile_accessible") is False:
+        flags.add("inaccessible_profile")
     if canonical_url is None and item.type.casefold() in PROFILE_TYPES:
         flags.add("invalid_profile_url")
     elif canonical_url and "/api/" in urlsplit(canonical_url).path.casefold():
         flags.add("non_profile_endpoint")
+    elif canonical_url:
+        parsed = urlsplit(canonical_url)
+        path = (parsed.path or "/").rstrip("/") or "/"
+        query_keys = {key.casefold() for key, _ in parse_qsl(parsed.query)}
+        if path == "/" and not query_keys.intersection(_IDENTITY_QUERY_KEYS):
+            flags.add("non_profile_endpoint")
+        elif path.casefold() in {
+            "/directory",
+            "/login",
+            "/search",
+            "/signin",
+            "/users",
+        }:
+            flags.add("non_profile_endpoint")
     return flags
 
 
@@ -236,8 +317,19 @@ def _quality_update(
     host = urlsplit(canonical_url).hostname if canonical_url else None
     sensitive = bool(host and host in _SENSITIVE_PROFILE_HOSTS)
     validated = bool(flags & _VALIDATION_FLAGS)
+    inaccessible = bool(flags & _INACCESSIBLE_FLAGS)
     rejected = bool(
         flags & (_REJECTING_FLAGS | {"invalid_profile_url", "non_profile_endpoint"})
+    )
+    source_family = profile_source_family(item)
+    catalogue_only = bool(
+        evidence_type == "social_profile"
+        and source_family == "username-catalogue"
+        and not validated
+        and not matches
+    )
+    insufficient_search_context = bool(
+        evidence_type == "person_search_result" and len(matches) < 2
     )
 
     confidence = item.confidence
@@ -254,19 +346,34 @@ def _quality_update(
         category = "service_signals"
         verification = "unverified"
     elif evidence_type in PROFILE_TYPES:
-        if status == IdentityStatus.CONFIRMED:
-            category = "corroborated_facts"
-            verification = "confirmed"
-        elif rejected:
+        if rejected:
             confidence = min(item.confidence, 0.05)
             status = IdentityStatus.INSUFFICIENT_EVIDENCE
             category = "rejected_observations"
             verification = "rejected"
+        elif inaccessible:
+            confidence = min(item.confidence, 0.10)
+            status = IdentityStatus.INSUFFICIENT_EVIDENCE
+            category = "inaccessible_profiles"
+            verification = "inaccessible"
+        elif status == IdentityStatus.CONFIRMED:
+            category = "corroborated_facts"
+            verification = "confirmed"
         elif sensitive and len(matches) < 2:
             confidence = min(item.confidence, 0.15)
             status = IdentityStatus.INSUFFICIENT_EVIDENCE
             category = "quarantined_candidates"
             verification = "quarantined"
+        elif catalogue_only:
+            confidence = min(item.confidence, 0.15)
+            status = IdentityStatus.INSUFFICIENT_EVIDENCE
+            category = "catalogue_leads"
+            verification = "catalogue_only"
+        elif insufficient_search_context:
+            confidence = min(item.confidence, 0.20)
+            status = IdentityStatus.INSUFFICIENT_EVIDENCE
+            category = "unverified_search_results"
+            verification = "insufficient_context"
         elif evidence_type == "social_profile" and not validated and not matches:
             confidence = min(item.confidence, 0.25)
             status = IdentityStatus.INSUFFICIENT_EVIDENCE
@@ -318,7 +425,7 @@ def _quality_update(
         "flags": sorted(flags),
         "sensitive": sensitive,
         "canonical_url": canonical_url,
-        "source_family": profile_source_family(item),
+        "source_family": source_family,
     }
     return confidence, status, quality
 
@@ -337,12 +444,16 @@ def refine_evidence_quality(
         }
         notes = list(item.notes)
         if quality["verification_status"] in {
+            "catalogue_only",
+            "inaccessible",
+            "insufficient_context",
             "quarantined",
             "rejected",
             "unverified",
         }:
             notes.append(
-                "Result prominence was reduced by the DeepVault evidence-quality gate."
+                "Result prominence was reduced by the WorldAtlas "
+                "evidence-quality gate."
             )
         canonical_url = quality.get("canonical_url")
         update: dict[str, Any] = {
@@ -353,7 +464,9 @@ def refine_evidence_quality(
         }
         if canonical_url and item.type.casefold() in PROFILE_TYPES:
             update["value"] = canonical_url
-            update["source_url"] = canonical_url
+            # The canonical form is a stable deduplication key only. Preserve
+            # the exact collector URL for navigation; query-based profile URLs
+            # can break when rewritten or stripped.
         refined.append(item.model_copy(update=update))
     return refined
 
@@ -389,6 +502,9 @@ def quality_summary(evidence_items: list[Evidence]) -> dict[str, int]:
         "observed": counts["observed"],
         "unverified": counts["unverified"]
         + counts["observed_not_attributed"],
+        "catalogue_only": counts["catalogue_only"],
+        "insufficient_context": counts["insufficient_context"],
+        "inaccessible": counts["inaccessible"],
         "quarantined": counts["quarantined"],
         "rejected": counts["rejected"],
     }

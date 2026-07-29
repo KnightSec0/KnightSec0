@@ -7,11 +7,21 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "orchestrator"))
 
-from intelligence.correlation import correlate_evidence, identity_confidence_summary
+from intelligence.correlation import (
+    correlate_evidence,
+    identity_confidence_summary,
+    status_from_score,
+)
 from intelligence.models import Evidence, IdentityStatus, SourceReliability
 
 
 class CorrelationConfidenceTests(unittest.TestCase):
+    def test_score_alone_never_marks_identity_confirmed(self):
+        self.assertEqual(
+            status_from_score(0.99),
+            IdentityStatus.HIGHLY_PROBABLE,
+        )
+
     def test_single_source_reliability_does_not_raise_identity_status(self):
         cases = [
             (0.62, SourceReliability.MEDIUM, IdentityStatus.POSSIBLE),

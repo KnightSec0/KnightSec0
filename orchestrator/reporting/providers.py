@@ -50,7 +50,7 @@ class OpenAIReportProvider(BaseReportProvider):
             text={
                 "format": {
                     "type": "json_schema",
-                    "name": "deepvault_person_report",
+                    "name": "worldatlas_person_report",
                     "schema": InvestigationReport.model_json_schema(),
                     "strict": True,
                 }

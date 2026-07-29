@@ -1,4 +1,4 @@
-"""Normalized evidence models used by every DeepVault connector."""
+"""Normalized evidence models used by every WorldAtlas connector."""
 
 from __future__ import annotations
 

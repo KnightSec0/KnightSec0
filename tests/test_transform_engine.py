@@ -178,11 +178,15 @@ class TransformEngineTests(unittest.TestCase):
         ):
             del timeout, max_output_bytes
             self.assertNotIn("--ai", args)
-            self.assertEqual(Path(cwd), tool_root)
+            self.assertEqual(Path(cwd).resolve(), tool_root.resolve())
             output = tool_root / "results" / "alice" / "alice.json"
             output.parent.mkdir(parents=True)
             output.write_text(
-                '[{"name":"Example","url":"https://example.test/alice"}]',
+                '[{"name":"Example","url":"https://example.test/alice"},'
+                '{"name":"Missing","url":"https://missing.test/alice",'
+                '"exists":false},'
+                '{"name":"Partial","url":"https://example.test/malice",'
+                '"status":"found"}]',
                 encoding="utf-8",
             )
             return CLIResult(

@@ -1,5 +1,5 @@
 """
-SQLAlchemy models for DeepVault.
+SQLAlchemy models for WorldAtlas.
 """
 import uuid
 import enum

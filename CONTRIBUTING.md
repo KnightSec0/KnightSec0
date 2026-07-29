@@ -1,4 +1,4 @@
-# Contributing to DeepVault
+# Contributing to WorldAtlas
 
 ## Getting Started
 

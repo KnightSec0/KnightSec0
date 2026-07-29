@@ -1,7 +1,7 @@
 """Policy-safe temporal comparison for normalized evidence snapshots.
 
 This module is deliberately pure: it compares evidence already collected by
-DeepVault and never calls a source.  An item that was not observed means only
+WorldAtlas and never calls a source.  An item that was not observed means only
 that the observation was not present in the current snapshot.  It must not be
 treated as proof that an account, identifier, or person no longer exists.
 """

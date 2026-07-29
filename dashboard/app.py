@@ -1,13 +1,16 @@
-"""Local FastAPI dashboard for authorized DeepVault investigations."""
+"""Local FastAPI dashboard for governed SIGMA WorldAtlas investigations."""
 
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+import csv
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from html import escape
 import ipaddress
+import io
 import json
 import os
 from pathlib import Path
@@ -15,16 +18,25 @@ import re
 from typing import Any
 from urllib.parse import quote_plus, urlsplit
 from uuid import UUID, uuid4
+from xml.etree import ElementTree as ET
 
 from celery import Celery
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import DateTime, ForeignKey, JSON, String, func, select
 from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+PRODUCT_NAME = "WorldAtlas"
+PRODUCT_FULL_NAME = "SIGMA WorldAtlas Intelligence"
+PRODUCT_VENDOR = "SIGMA"
+PRODUCT_TAGLINE = "From public evidence to defensible insight"
+EXPORT_PREFIX = "sigma-worldatlas"
 
 
 class Base(DeclarativeBase):
@@ -370,7 +382,7 @@ class InvestigationCreate(BaseModel):
                     for label in domain.split(".")
                 )
             ):
-                raise ValueError(f"Invalid authorized domain: {value}")
+                raise ValueError(f"Invalid in-scope domain: {value}")
             if (
                 domain in _RESERVED_OSINT_DOMAINS
                 or any(domain.endswith(suffix) for suffix in _RESERVED_OSINT_SUFFIXES)
@@ -389,7 +401,7 @@ class InvestigationCreate(BaseModel):
             try:
                 normalized.append(str(ipaddress.ip_address(value.strip())))
             except ValueError as exc:
-                raise ValueError(f"Invalid authorized IP address: {value}") from exc
+                raise ValueError(f"Invalid in-scope IP address: {value}") from exc
         return list(dict.fromkeys(normalized))
 
     @field_validator("depth")
@@ -402,13 +414,13 @@ class InvestigationCreate(BaseModel):
     @model_validator(mode="after")
     def validate_authorization(self) -> "InvestigationCreate":
         if not self.authorization_confirmed:
-            raise ValueError("Written authorization must be confirmed")
+            raise ValueError("Documented case approval must be confirmed")
         expiry = self.authorization_expires_at
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=timezone.utc)
             self.authorization_expires_at = expiry
         if expiry <= datetime.now(timezone.utc):
-            raise ValueError("Authorization expiry must be in the future")
+            raise ValueError("Case mandate expiry must be in the future")
         if (
             not self.target_username
             and not self.additional_usernames
@@ -426,7 +438,7 @@ class InvestigationCreate(BaseModel):
             not self.allow_infrastructure_enrichment or not self.authorized_ips
         ):
             raise ValueError(
-                "Shodan and Censys require infrastructure consent and an authorized IP"
+                "Shodan and Censys require infrastructure consent and an in-scope IP"
             )
         if infrastructure_sources:
             non_public_ips = [
@@ -444,7 +456,7 @@ class InvestigationCreate(BaseModel):
             or not self.allow_infrastructure_enrichment
         ):
             raise ValueError(
-                "httpx requires infrastructure consent and an authorized domain"
+                "httpx requires infrastructure consent and an in-scope domain"
             )
         if (
             "ghunt" in self.permitted_sources
@@ -514,6 +526,41 @@ class GraphLayoutUpdate(BaseModel):
         return output
 
 
+class EvidenceDecisionStatus(str, Enum):
+    ACCEPTED = "accepted"
+    FALSE_POSITIVE = "false_positive"
+    NEEDS_REVIEW = "needs_review"
+
+
+class EvidenceAdjudicationRequest(BaseModel):
+    evidence_ids: list[str] = Field(min_length=1, max_length=100)
+    status: EvidenceDecisionStatus
+    reason_code: str = Field(default="analyst_review", min_length=2, max_length=80)
+    note: str = Field(default="", max_length=1000)
+    reviewer: str = Field(default="Local analyst", min_length=2, max_length=120)
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def validate_adjudication_ids(cls, values: list[str]) -> list[str]:
+        normalized = list(
+            dict.fromkeys(value.strip() for value in values if value.strip())
+        )
+        if not normalized:
+            raise ValueError("Select at least one evidence ID")
+        return normalized
+
+    @field_validator("reason_code", "note", "reviewer")
+    @classmethod
+    def clean_adjudication_text(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def validate_false_positive_reason(self) -> "EvidenceAdjudicationRequest":
+        if self.status == EvidenceDecisionStatus.FALSE_POSITIVE and not self.note:
+            raise ValueError("A false-positive decision requires an analyst note")
+        return self
+
+
 def _database_url() -> str:
     explicit = os.getenv("DB_URL")
     if explicit:
@@ -540,11 +587,15 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="DeepVault",
-    description="Local authorized person-OSINT dashboard",
+    title=PRODUCT_FULL_NAME,
+    description=(
+        "Local governed person-intelligence dashboard by "
+        f"{PRODUCT_VENDOR}"
+    ),
     version="0.2.0",
     lifespan=lifespan,
 )
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.middleware("http")
@@ -628,10 +679,8 @@ async def _serialize(
     include_report: bool = False,
 ) -> dict[str, Any]:
     metadata = investigation.case_metadata or {}
-    stored_report = metadata.get("structured_report")
-    report = (
-        _redact_for_display(stored_report) if isinstance(stored_report, dict) else None
-    )
+    report = _effective_report(investigation)
+    adjudications = _evidence_adjudications(investigation)
     output: dict[str, Any] = {
         "id": str(investigation.id),
         "target_name": investigation.target_name,
@@ -653,6 +702,16 @@ async def _serialize(
         "transform_runs": _redact_for_display(metadata.get("transform_runs", [])),
         "compare_previous_cases": bool(metadata.get("compare_previous_cases")),
         "source_status": metadata.get("source_status", []),
+        "evidence_adjudications": _redact_for_display(adjudications),
+        "adjudication_audit": _redact_for_display(
+            metadata.get("adjudication_audit", [])
+        ),
+        "false_positive_count": sum(
+            1
+            for decision in adjudications.values()
+            if decision.get("status")
+            == EvidenceDecisionStatus.FALSE_POSITIVE.value
+        ),
         "artifact_count": await _artifact_count(session, investigation.id),
         "has_report": report is not None,
         "progress": metadata.get("progress")
@@ -686,9 +745,1026 @@ def _stored_graph(investigation: Investigation) -> dict[str, Any]:
     return _redact_for_display(graph)
 
 
+def _graph_parts(
+    investigation: Investigation,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    """Return a validated graph and its evidence index for public export."""
+    graph = _stored_graph(investigation)
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    evidence = graph.get("evidence_index", [])
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        raise HTTPException(status_code=409, detail="Identity graph is malformed")
+    clean_nodes = [node for node in nodes if isinstance(node, dict)]
+    clean_edges = [edge for edge in edges if isinstance(edge, dict)]
+    evidence_items = [item for item in evidence if isinstance(item, dict)]
+    report = (investigation.case_metadata or {}).get("structured_report")
+    ledger = report.get("evidence_ledger", []) if isinstance(report, dict) else []
+    if isinstance(ledger, list):
+        evidence_items.extend(item for item in ledger if isinstance(item, dict))
+    node_ids = {
+        str(node.get("id"))
+        for node in clean_nodes
+        if node.get("id")
+    }
+    edge_ids = {
+        str(edge.get("id"))
+        for edge in clean_edges
+        if edge.get("id")
+    }
+    evidence_index: dict[str, dict[str, Any]] = {}
+    for item in evidence_items:
+        if item.get("id"):
+            evidence_index[str(item["id"])] = item
+    if len(node_ids) != len(clean_nodes):
+        raise HTTPException(
+            status_code=409,
+            detail="Identity graph contains missing or duplicate node IDs",
+        )
+    if len(edge_ids) != len(clean_edges):
+        raise HTTPException(
+            status_code=409,
+            detail="Identity graph contains missing or duplicate relationship IDs",
+        )
+    for node in clean_nodes:
+        cited = {str(value) for value in node.get("evidence_ids", [])}
+        if cited - set(evidence_index):
+            raise HTTPException(
+                status_code=409,
+                detail="Identity graph node cites unknown evidence",
+            )
+    for edge in clean_edges:
+        endpoints = {
+            str(edge.get("source_node_id")),
+            str(edge.get("target_node_id")),
+        }
+        cited = {str(value) for value in edge.get("evidence_ids", [])}
+        if endpoints - node_ids or not cited or cited - set(evidence_index):
+            raise HTTPException(
+                status_code=409,
+                detail="Identity graph relationship failed evidence validation",
+            )
+    return graph, clean_nodes, clean_edges, evidence_index
+
+
+def _evidence_adjudications(
+    investigation: Investigation,
+) -> dict[str, dict[str, Any]]:
+    metadata = investigation.case_metadata or {}
+    decisions = metadata.get("evidence_adjudications", {})
+    if not isinstance(decisions, dict):
+        return {}
+    return {
+        str(evidence_id): item
+        for evidence_id, item in decisions.items()
+        if evidence_id and isinstance(item, dict)
+    }
+
+
+def _false_positive_evidence_ids(investigation: Investigation) -> set[str]:
+    return {
+        evidence_id
+        for evidence_id, decision in _evidence_adjudications(
+            investigation
+        ).items()
+        if decision.get("status") == EvidenceDecisionStatus.FALSE_POSITIVE.value
+    }
+
+
+def _adjudicated_graph_parts(
+    investigation: Investigation,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    """Remove analyst-rejected evidence from conclusions without deleting it."""
+    graph, nodes, edges, evidence_index = _graph_parts(investigation)
+    false_positive_ids = _false_positive_evidence_ids(investigation)
+    if not false_positive_ids:
+        return graph, nodes, edges, evidence_index
+
+    filtered_nodes: list[dict[str, Any]] = []
+    for item in nodes:
+        node = deepcopy(item)
+        original_ids = [str(value) for value in node.get("evidence_ids", [])]
+        surviving_ids = [
+            value for value in original_ids if value not in false_positive_ids
+        ]
+        if original_ids and not surviving_ids:
+            continue
+        node["evidence_ids"] = surviving_ids
+        filtered_nodes.append(node)
+    candidate_node_ids = {str(node["id"]) for node in filtered_nodes}
+
+    filtered_edges: list[dict[str, Any]] = []
+    for item in edges:
+        edge = deepcopy(item)
+        surviving_ids = [
+            str(value)
+            for value in edge.get("evidence_ids", [])
+            if str(value) not in false_positive_ids
+        ]
+        endpoints = {
+            str(edge.get("source_node_id")),
+            str(edge.get("target_node_id")),
+        }
+        if not surviving_ids or endpoints - candidate_node_ids:
+            continue
+        edge["evidence_ids"] = surviving_ids
+        edge["provenance_chain"] = [
+            step
+            for step in edge.get("provenance_chain", [])
+            if not isinstance(step, dict)
+            or str(step.get("evidence_id")) not in false_positive_ids
+        ]
+        filtered_edges.append(edge)
+
+    connected_node_ids = {
+        str(value)
+        for edge in filtered_edges
+        for value in (edge.get("source_node_id"), edge.get("target_node_id"))
+        if value
+    }
+    target_node_id = str(graph.get("target_node_id") or "")
+    filtered_nodes = [
+        node
+        for node in filtered_nodes
+        if str(node["id"]) == target_node_id
+        or node.get("kind") == "authorized_target"
+        or str(node["id"]) in connected_node_ids
+        or (
+            node.get("kind") != "public_source"
+            and bool(node.get("evidence_ids"))
+        )
+    ]
+    retained_node_ids = {str(node["id"]) for node in filtered_nodes}
+    filtered_edges = [
+        edge
+        for edge in filtered_edges
+        if {
+            str(edge.get("source_node_id")),
+            str(edge.get("target_node_id")),
+        }
+        <= retained_node_ids
+    ]
+
+    filtered_graph = deepcopy(graph)
+    filtered_graph["nodes"] = filtered_nodes
+    filtered_graph["edges"] = filtered_edges
+    filtered_graph["evidence_index"] = [
+        item
+        for evidence_id, item in evidence_index.items()
+        if evidence_id not in false_positive_ids
+    ]
+    for field, node_field in (
+        ("hypotheses", "object_node_id"),
+        ("pivots", "node_id"),
+    ):
+        values = graph.get(field, [])
+        filtered_graph[field] = [
+            deepcopy(item)
+            for item in values
+            if isinstance(item, dict)
+            and str(item.get(node_field)) in retained_node_ids
+            and not (
+                item.get("evidence_ids")
+                and not {
+                    str(value)
+                    for value in item.get("evidence_ids", [])
+                }
+                - false_positive_ids
+            )
+        ] if isinstance(values, list) else []
+
+    filtered_evidence = {
+        evidence_id: item
+        for evidence_id, item in evidence_index.items()
+        if evidence_id not in false_positive_ids
+    }
+    return filtered_graph, filtered_nodes, filtered_edges, filtered_evidence
+
+
+def _filter_report_items(
+    values: Any,
+    false_positive_ids: set[str],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for raw_item in values if isinstance(values, list) else []:
+        if not isinstance(raw_item, dict):
+            continue
+        item = deepcopy(raw_item)
+        original_ids = [
+            str(value) for value in item.get("evidence_ids", []) if value
+        ]
+        if original_ids:
+            if set(original_ids) & false_positive_ids:
+                continue
+        output.append(item)
+    return output
+
+
+def _effective_report(investigation: Investigation) -> dict[str, Any] | None:
+    """Build the report currently approved for analyst and customer use."""
+    metadata = investigation.case_metadata or {}
+    stored_report = metadata.get("structured_report")
+    if not isinstance(stored_report, dict):
+        return None
+    report = deepcopy(stored_report)
+    false_positive_ids = _false_positive_evidence_ids(investigation)
+    decisions = _evidence_adjudications(investigation)
+    if not false_positive_ids and not decisions:
+        return _redact_for_display(report)
+
+    ledger = report.get("evidence_ledger", [])
+    surviving_ledger = [
+        item
+        for item in ledger if isinstance(item, dict)
+        and str(item.get("id")) not in false_positive_ids
+    ] if isinstance(ledger, list) else []
+    report["evidence_ledger"] = surviving_ledger
+    report["evidence_count"] = len(surviving_ledger)
+    for field in ("findings", "timeline", "contradictions"):
+        report[field] = _filter_report_items(
+            report.get(field, []),
+            false_positive_ids,
+        )
+
+    graph, graph_nodes, graph_edges, evidence_index = _adjudicated_graph_parts(
+        investigation
+    )
+    report["identity_graph"] = graph
+    surviving_ids = sorted(
+        str(item.get("id"))
+        for item in surviving_ledger
+        if item.get("id")
+    )
+    if false_positive_ids:
+        normalized = _normalized_graph_view(
+            investigation,
+            graph,
+            graph_nodes,
+            graph_edges,
+            evidence_index,
+        )
+        review_counts = normalized.get("review_summary", {}).get("counts", {})
+        supported_count = int(review_counts.get("supported") or 0)
+        review_first_count = int(review_counts.get("review_first") or 0)
+        low_signal_count = int(review_counts.get("low_signal") or 0)
+        report["executive_summary"] = (
+            "No identity association is verified by the current evidence. "
+            f"After analyst review, {len(surviving_ledger)} active public "
+            f"record(s) remain: {supported_count} supported candidate(s), "
+            f"{review_first_count} candidate(s) to check first, and "
+            f"{low_signal_count} unverified lead(s). "
+            f"{len(false_positive_ids)} observation(s) were excluded as false "
+            "positives and are not used in conclusions."
+        )
+        report["executive_summary_evidence_ids"] = surviving_ids
+        report["overall_risk"] = "not_assessed_after_review"
+        limitations = report.get("limitations", [])
+        limitations = list(limitations) if isinstance(limitations, list) else []
+        limitations.append(
+            "Analyst false-positive decisions changed this report after "
+            "collection; excluded records remain available only in the audit history."
+        )
+        report["limitations"] = list(dict.fromkeys(limitations))
+        temporal = report.get("temporal_comparison")
+        if isinstance(temporal, dict):
+            for field in ("added", "changed", "persisting", "not_observed"):
+                items = temporal.get(field, [])
+                temporal[field] = [
+                    item
+                    for item in items
+                    if isinstance(item, dict)
+                    and not false_positive_ids
+                    & {
+                        str(value)
+                        for key, value in item.items()
+                        if key == "evidence_id"
+                        or key.endswith("_evidence_id")
+                    }
+                ] if isinstance(items, list) else []
+            temporal["counts"] = {
+                field: len(temporal.get(field, []))
+                for field in ("added", "changed", "persisting", "not_observed")
+            }
+    counts_by_source: dict[str, int] = {}
+    for item in surviving_ledger:
+        source = str(item.get("source") or "")
+        if source:
+            counts_by_source[source] = counts_by_source.get(source, 0) + 1
+    coverage = report.get("source_coverage", [])
+    if isinstance(coverage, list):
+        for item in coverage:
+            if isinstance(item, dict):
+                item["evidence_count"] = counts_by_source.get(
+                    str(item.get("source") or ""),
+                    0,
+                )
+
+    report["adjudication_summary"] = {
+        "false_positive_count": len(false_positive_ids),
+        "active_decision_count": len(decisions),
+        "notice": (
+            "Analyst-rejected observations are excluded from conclusions and "
+            "exports but retained in the append-only case audit history."
+        ),
+        "decisions": [
+            {"evidence_id": evidence_id, **deepcopy(decision)}
+            for evidence_id, decision in sorted(decisions.items())
+        ],
+    }
+    return _redact_for_display(report)
+
+
+_IDENTITY_STATUS_ORDER = {
+    "unrelated": -1,
+    "insufficient_evidence": 0,
+    "possible": 1,
+    "probable": 2,
+    "highly_probable": 3,
+    "confirmed": 4,
+}
+
+_USERNAME_CATALOGUE_SOURCES = {
+    "blackbird",
+    "maigret",
+    "sherlock",
+    "whatsmyname",
+}
+_NON_NAVIGABLE_QUALITY_STATUSES = {
+    "catalogue_only",
+    "inaccessible",
+    "insufficient_context",
+    "quarantined",
+    "rejected",
+}
+
+_PLAIN_RELATIONSHIP_LABELS = {
+    "candidate_profile": "Possible public profile",
+    "candidate_observation": "Possible public observation",
+    "publishes_attribute": "Discovery tool returned this result",
+    "breach_association": "Breach metadata references this identifier",
+    "service_registration": "Service registration signal",
+}
+
+
+def _is_generic_profile_endpoint(value: Any) -> bool:
+    """Identify search/home endpoints that cannot represent a person profile."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").casefold().removeprefix("www.")
+    path = (parsed.path or "/").rstrip("/") or "/"
+    return (
+        (host == "discord.com" and path == "/")
+        or (host == "scholar.google.com" and path.casefold() == "/scholar")
+        or (host == "op.gg" and path.casefold() == "/lol/summoners/search")
+    )
+
+
+def _entity_review_details(
+    *,
+    entity: dict[str, Any],
+    publisher_count: int,
+) -> dict[str, Any]:
+    """Translate technical confidence into a conservative review instruction."""
+    metadata = entity.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    quality_status = str(metadata.get("verification_status") or "unverified")
+    identity_status = str(
+        entity.get("identity_status") or "insufficient_evidence"
+    )
+    entity_type = str(entity.get("entity_type") or "public_observation")
+    confidence = float(entity.get("confidence") or 0)
+    source_tools = {
+        str(source).casefold()
+        for source in entity.get("source_tools", [])
+        if source
+    }
+    matched_attributes = metadata.get("matched_attributes")
+    matched_attributes = (
+        matched_attributes if isinstance(matched_attributes, list) else []
+    )
+    flags = metadata.get("flags")
+    flags = {str(flag) for flag in flags} if isinstance(flags, list) else set()
+    content_validated = bool(
+        flags
+        & {
+            "canonical_profile_match",
+            "content_validated",
+            "profile_content_validated",
+            "username_in_page",
+        }
+    )
+    catalogue_only = bool(
+        entity_type == "public_profile"
+        and source_tools
+        and source_tools.issubset(_USERNAME_CATALOGUE_SOURCES)
+        and not matched_attributes
+        and not content_validated
+    )
+    generic_endpoint = _is_generic_profile_endpoint(
+        entity.get("canonical_value") or entity.get("label")
+    )
+    sensitive = bool(metadata.get("sensitive")) or quality_status == "quarantined"
+    suppressed = (
+        quality_status in _NON_NAVIGABLE_QUALITY_STATUSES
+        or generic_endpoint
+        or catalogue_only
+    )
+    analyst_status = str(entity.get("adjudication_status") or "")
+
+    if entity_type == "authorized_target":
+        priority = "target"
+        confidence_label = "Case subject"
+        explanation = (
+            "This node contains the identifiers supplied in the approved case "
+            "scope; it is not a collected identity claim."
+        )
+    elif entity_type == "public_source":
+        priority = "publisher"
+        confidence_label = "Evidence publisher"
+        explanation = (
+            "This technical node records which discovery tool published cited "
+            "observations."
+        )
+    elif analyst_status == EvidenceDecisionStatus.ACCEPTED.value:
+        priority = "supported"
+        confidence_label = "Analyst accepted"
+        explanation = (
+            "A case analyst accepted the cited observation after manual review. "
+            "The original technical confidence remains visible."
+        )
+    elif analyst_status == EvidenceDecisionStatus.NEEDS_REVIEW.value:
+        priority = "review_first"
+        confidence_label = "Analyst review required"
+        explanation = (
+            "A case analyst explicitly retained this observation for further "
+            "verification."
+        )
+    elif suppressed:
+        priority = "suppressed"
+        confidence_label = "Hidden by default"
+        if sensitive:
+            explanation = (
+                "Sensitive-site username similarity is quarantined. It must not "
+                "be attributed to the person without separate, strong evidence."
+            )
+        elif generic_endpoint:
+            explanation = (
+                "This is a generic home or search page, not a person-specific "
+                "profile, so it is hidden from the simplified graph."
+            )
+        elif quality_status == "inaccessible":
+            explanation = (
+                "The collector reported that this public page was unavailable "
+                "or returned an HTTP error, so it is retained only for audit."
+            )
+        elif quality_status == "insufficient_context":
+            explanation = (
+                "This search result does not contain enough matching public "
+                "identity context to associate it with the person."
+            )
+        elif catalogue_only:
+            explanation = (
+                "A username catalogue returned this URL, but no observed name, "
+                "employer, location, or profile content ties it to the person. "
+                "It is retained only as an audit lead."
+            )
+        else:
+            explanation = (
+                "The quality gate identified a non-profile endpoint, so this "
+                "observation is hidden from the simplified graph."
+            )
+    elif identity_status in {"confirmed", "highly_probable", "probable"}:
+        priority = "supported"
+        confidence_label = {
+            "confirmed": "Confirmed",
+            "highly_probable": "Strongly supported",
+            "probable": "Probable",
+        }[identity_status]
+        explanation = (
+            "The cited evidence supports this identity association. Review the "
+            "evidence IDs before relying on it."
+        )
+    elif identity_status == "possible":
+        priority = "review_first"
+        confidence_label = "Possible match"
+        explanation = (
+            "This candidate has some identity support but still needs manual "
+            "verification against public profile details."
+        )
+    elif entity_type == "service":
+        priority = "review_first"
+        confidence_label = "Service signal"
+        explanation = (
+            "A public service-registration check returned a signal. It does not "
+            "prove account access, current ownership, or activity."
+        )
+    else:
+        priority = "low_signal"
+        confidence_label = "Unverified lead"
+        explanation = (
+            "One discovery tool returned a page matching the supplied username. "
+            "Compare public profile details before attributing it to the person."
+        )
+    return {
+        "review_priority": priority,
+        "confidence_label": confidence_label,
+        "plain_language_explanation": explanation,
+        "quality_status": quality_status,
+        "publisher_count": publisher_count,
+        "sensitive": sensitive,
+        "generic_endpoint": generic_endpoint,
+        "technical_confidence": confidence,
+    }
+
+
+def _review_summary(
+    *,
+    entities: list[dict[str, Any]],
+    relationships: list[dict[str, Any]],
+    target_entity_id: Any,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a cited, non-technical assessment over the normalized graph."""
+    candidates = [
+        entity
+        for entity in entities
+        if entity.get("entity_id") != target_entity_id
+        and entity.get("entity_type")
+        not in {"authorized_target", "public_source"}
+    ]
+    supported = [
+        entity
+        for entity in candidates
+        if entity.get("review_priority") == "supported"
+    ]
+    review_first = [
+        entity
+        for entity in candidates
+        if entity.get("review_priority") == "review_first"
+    ]
+    low_signal = [
+        entity
+        for entity in candidates
+        if entity.get("review_priority") == "low_signal"
+    ]
+    suppressed = [
+        entity
+        for entity in candidates
+        if entity.get("review_priority") == "suppressed"
+    ]
+    cited_ids = sorted(
+        {
+            evidence_id
+            for entity in candidates
+            for evidence_id in entity.get("evidence_ids", [])
+        }
+    )
+
+    if supported:
+        verdict_status = "supported_matches"
+        verdict_title = "Supported identity matches require analyst review"
+        verdict_explanation = (
+            f"{len(supported)} candidate"
+            f"{'s' if len(supported) != 1 else ''} reached probable or stronger "
+            "identity support. Confirm the cited public evidence before use."
+        )
+    elif review_first:
+        verdict_status = "manual_verification_required"
+        verdict_title = "No verified identity match yet"
+        verdict_explanation = (
+            f"{len(review_first)} candidate"
+            f"{'s' if len(review_first) != 1 else ''} should be checked first, "
+            "but none is safe to attribute to the person automatically."
+        )
+    else:
+        verdict_status = "no_verified_identity_match"
+        verdict_title = "No verified identity match"
+        verdict_explanation = (
+            "The collected observations are low-signal leads. More public "
+            "identity attributes or independent sources are needed."
+        )
+
+    priority_rank = {"supported": 0, "review_first": 1}
+    priority_leads = sorted(
+        [
+            entity
+            for entity in candidates
+            if entity.get("review_priority") in {"supported", "review_first"}
+        ],
+        key=lambda entity: (
+            priority_rank.get(str(entity.get("review_priority")), 9),
+            -int(entity.get("publisher_count") or 0),
+            -float(entity.get("confidence") or 0),
+            str(entity.get("label") or "").casefold(),
+        ),
+    )[:12]
+    priority_leads = [
+        {
+            "entity_id": entity.get("entity_id"),
+            "entity_type": entity.get("entity_type"),
+            "label": entity.get("label"),
+            "public_url": (
+                entity.get("public_url")
+                if isinstance(entity.get("public_url"), str)
+                and str(entity.get("public_url")).startswith(
+                    ("http://", "https://")
+                )
+                else None
+            ),
+            "review_priority": entity.get("review_priority"),
+            "confidence_label": entity.get("confidence_label"),
+            "technical_confidence": entity.get("confidence"),
+            "source_tools": entity.get("source_tools", []),
+            "publisher_count": entity.get("publisher_count", 0),
+            "explanation": entity.get("plain_language_explanation"),
+            "evidence_ids": entity.get("evidence_ids", []),
+        }
+        for entity in priority_leads
+    ]
+
+    overlap = [
+        entity
+        for entity in candidates
+        if int(entity.get("publisher_count") or 0) > 1
+        and entity.get("review_priority") != "suppressed"
+    ]
+    service_signals = [
+        entity
+        for entity in candidates
+        if entity.get("entity_type") == "service"
+        and entity.get("review_priority") != "suppressed"
+    ]
+    analyst_review_required = [
+        entity
+        for entity in candidates
+        if entity.get("adjudication_status")
+        == EvidenceDecisionStatus.NEEDS_REVIEW.value
+    ]
+    analyst_accepted = [
+        entity
+        for entity in candidates
+        if entity.get("adjudication_status")
+        == EvidenceDecisionStatus.ACCEPTED.value
+    ]
+    key_points = [
+        {
+            "title": "Candidate observations",
+            "statement": (
+                f"{len(candidates)} public observations were retained; "
+                f"{len(supported)} reached probable or stronger identity support."
+            ),
+            "evidence_ids": cited_ids,
+        }
+    ]
+    if overlap:
+        key_points.append(
+            {
+                "title": "Cross-tool overlap",
+                "statement": (
+                    f"{len(overlap)} public page"
+                    f"{'s were' if len(overlap) != 1 else ' was'} returned by "
+                    "more than one discovery tool. Catalogue overlap makes these "
+                    "review priorities, not verified identities."
+                ),
+                "evidence_ids": sorted(
+                    {
+                        evidence_id
+                        for entity in overlap
+                        for evidence_id in entity.get("evidence_ids", [])
+                    }
+                ),
+            }
+        )
+    if service_signals:
+        key_points.append(
+            {
+                "title": "Service-registration signals",
+                "statement": (
+                    f"{len(service_signals)} public service signal"
+                    f"{'s were' if len(service_signals) != 1 else ' was'} "
+                    "returned. A signal does not prove access or current ownership."
+                ),
+                "evidence_ids": sorted(
+                    {
+                        evidence_id
+                        for entity in service_signals
+                        for evidence_id in entity.get("evidence_ids", [])
+                    }
+                ),
+            }
+        )
+
+    coverage = report.get("source_coverage", [])
+    coverage = coverage if isinstance(coverage, list) else []
+    coverage_groups: dict[str, list[dict[str, Any]]] = {
+        "observed": [],
+        "no_results": [],
+        "unavailable": [],
+        "not_run": [],
+    }
+    for item in coverage:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "not_run").casefold()
+        evidence_count = int(item.get("evidence_count") or 0)
+        if evidence_count:
+            group = "observed"
+        elif status in {"unavailable", "not_configured", "missing_configuration"}:
+            group = "unavailable"
+        elif status in {"no_results", "no_result", "covered_no_results"}:
+            group = "no_results"
+        else:
+            group = "not_run"
+        coverage_groups[group].append(
+            {
+                "source": item.get("source"),
+                "status": item.get("status"),
+                "evidence_count": evidence_count,
+                "reason": item.get("reason"),
+            }
+        )
+
+    return {
+        "verdict": {
+            "status": verdict_status,
+            "title": verdict_title,
+            "explanation": verdict_explanation,
+            "evidence_ids": cited_ids,
+        },
+        "counts": {
+            "candidate_observations": len(candidates),
+            "supported": len(supported),
+            "review_first": len(review_first),
+            "low_signal": len(low_signal),
+            "suppressed": len(suppressed),
+            "cross_tool_overlap": len(overlap),
+            "service_signals": len(service_signals),
+            "analyst_review_required": len(analyst_review_required),
+            "analyst_accepted": len(analyst_accepted),
+            "relationships": len(relationships),
+        },
+        "priority_leads": priority_leads,
+        "key_points": key_points,
+        "coverage": coverage_groups,
+        "cautions": [
+            {
+                "statement": (
+                    "A matching username or public page does not by itself prove "
+                    "that the investigated person owns the account."
+                ),
+                "evidence_ids": cited_ids,
+            },
+            {
+                "statement": (
+                    "Agreement between username discovery tools may come from "
+                    "shared site catalogues and is not independent identity proof."
+                ),
+                "evidence_ids": sorted(
+                    {
+                        evidence_id
+                        for entity in overlap
+                        for evidence_id in entity.get("evidence_ids", [])
+                    }
+                ),
+            },
+        ],
+    }
+
+
+def _normalized_graph_view(
+    investigation: Investigation,
+    graph: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    evidence_index: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Create a UI-friendly entity model without weakening graph provenance."""
+    metadata = investigation.case_metadata or {}
+    report = metadata.get("structured_report")
+    report = report if isinstance(report, dict) else {}
+    adjudications = _evidence_adjudications(investigation)
+    ledger = report.get("evidence_ledger", [])
+    ledger_by_id = {
+        str(item.get("id")): item
+        for item in ledger
+        if isinstance(item, dict) and item.get("id")
+    } if isinstance(ledger, list) else {}
+    hypotheses = graph.get("hypotheses", [])
+    hypothesis_by_node = {
+        str(item.get("object_node_id")): item
+        for item in hypotheses
+        if isinstance(item, dict) and item.get("object_node_id")
+    } if isinstance(hypotheses, list) else {}
+    edges_by_node: dict[str, list[dict[str, Any]]] = {}
+    for edge in edges:
+        for node_id in (edge.get("source_node_id"), edge.get("target_node_id")):
+            if node_id:
+                edges_by_node.setdefault(str(node_id), []).append(edge)
+
+    entities: list[dict[str, Any]] = []
+    cluster_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    for node in nodes:
+        node_id = str(node["id"])
+        kind = str(node.get("kind") or "public_observation")
+        evidence_ids = [str(value) for value in node.get("evidence_ids", [])]
+        evidence_items = [
+            ledger_by_id.get(value) or evidence_index.get(value, {})
+            for value in evidence_ids
+        ]
+        sources = sorted(
+            {
+                str(item.get("source"))
+                for item in evidence_items
+                if item.get("source")
+            }
+            | {
+                str(step.get("source"))
+                for edge in edges_by_node.get(node_id, [])
+                for step in edge.get("provenance_chain", [])
+                if isinstance(step, dict) and step.get("source")
+            },
+            key=str.casefold,
+        )
+        if node_id == graph.get("target_node_id") or kind == "authorized_target":
+            sources = []
+        for source in sources:
+            source_counts[source] = source_counts.get(source, 0) + 1
+        observed = sorted(
+            str(item.get("observed_at"))
+            for item in evidence_items
+            if item.get("observed_at")
+        )
+        attributes = node.get("attributes")
+        attributes = attributes if isinstance(attributes, dict) else {}
+        hypothesis = hypothesis_by_node.get(node_id, {})
+        confidence = hypothesis.get("confidence")
+        identity_status = hypothesis.get("identity_status")
+        related_edges = edges_by_node.get(node_id, [])
+        if confidence is None and related_edges:
+            confidence = max(
+                float(edge.get("confidence") or 0)
+                for edge in related_edges
+            )
+            identity_status = max(
+                (
+                    str(edge.get("identity_status") or "insufficient_evidence")
+                    for edge in related_edges
+                ),
+                key=lambda status: _IDENTITY_STATUS_ORDER.get(status, 0),
+            )
+        if (
+            node_id == graph.get("target_node_id")
+            or kind == "authorized_target"
+        ):
+            confidence = 1.0
+            identity_status = "authorized_target"
+        cluster_counts[kind] = cluster_counts.get(kind, 0) + 1
+        is_reviewable_entity = kind not in {
+            "authorized_target",
+            "public_source",
+        }
+        entity = {
+            "entity_id": node_id,
+            "entity_type": kind,
+            "label": node.get("label") or node_id,
+            "canonical_value": (
+                attributes.get("url")
+                or attributes.get("email")
+                or attributes.get("address")
+                or node.get("label")
+            ),
+            "public_url": attributes.get("open_url") or attributes.get("url"),
+            "aliases": attributes.get("aliases", []),
+            "source_tools": sources,
+            "source_urls": sorted(
+                {
+                    str(item.get("source_url"))
+                    for item in evidence_items
+                    if item.get("source_url")
+                }
+            ),
+            "confidence": confidence,
+            "identity_status": identity_status or "insufficient_evidence",
+            "first_seen": observed[0] if observed else None,
+            "last_seen": observed[-1] if observed else None,
+            "metadata": attributes,
+            "evidence_ids": evidence_ids,
+            "adjudication_status": (
+                EvidenceDecisionStatus.ACCEPTED.value
+                if is_reviewable_entity
+                and evidence_ids
+                and all(
+                    adjudications.get(evidence_id, {}).get("status")
+                    == EvidenceDecisionStatus.ACCEPTED.value
+                    for evidence_id in evidence_ids
+                )
+                else (
+                    EvidenceDecisionStatus.NEEDS_REVIEW.value
+                    if is_reviewable_entity
+                    and any(
+                        adjudications.get(evidence_id, {}).get("status")
+                        == EvidenceDecisionStatus.NEEDS_REVIEW.value
+                        for evidence_id in evidence_ids
+                    )
+                    else None
+                )
+            ),
+            "adjudication_notes": [
+                adjudications[evidence_id]
+                for evidence_id in evidence_ids
+                if is_reviewable_entity and evidence_id in adjudications
+            ],
+        }
+        entity.update(
+            _entity_review_details(
+                entity=entity,
+                publisher_count=len(sources),
+            )
+        )
+        entities.append(entity)
+
+    relationships = [
+        {
+            "edge_id": str(edge["id"]),
+            "from_entity_id": edge.get("source_node_id"),
+            "to_entity_id": edge.get("target_node_id"),
+            "relationship_type": edge.get("relationship"),
+            "plain_language_type": _PLAIN_RELATIONSHIP_LABELS.get(
+                str(edge.get("relationship")),
+                str(edge.get("relationship") or "Cited relationship").replace(
+                    "_", " "
+                ).capitalize(),
+            ),
+            "confidence": edge.get("confidence"),
+            "identity_status": edge.get("identity_status"),
+            "source_tools": sorted(
+                {
+                    str(step.get("source"))
+                    for step in edge.get("provenance_chain", [])
+                    if isinstance(step, dict) and step.get("source")
+                },
+                key=str.casefold,
+            ),
+            "evidence_ids": [str(value) for value in edge.get("evidence_ids", [])],
+            "reason": edge.get("explanation")
+            or next(
+                (
+                    step.get("explanation")
+                    for step in edge.get("provenance_chain", [])
+                    if isinstance(step, dict) and step.get("explanation")
+                ),
+                "Cited evidence relationship.",
+            ),
+            "independent_source_count": edge.get("independent_source_count", 1),
+            "provenance_chain": edge.get("provenance_chain", []),
+        }
+        for edge in edges
+    ]
+    normalized = {
+        "target_entity_id": graph.get("target_node_id"),
+        "entities": entities,
+        "relationships": relationships,
+        "clusters": [
+            {"entity_type": kind, "count": count}
+            for kind, count in sorted(cluster_counts.items())
+        ],
+        "stats": {
+            "entity_count": len(entities),
+            "relationship_count": len(relationships),
+            "evidence_count": len(evidence_index),
+            "source_count": len(source_counts),
+            "entities_by_type": dict(sorted(cluster_counts.items())),
+            "entities_by_source": dict(sorted(source_counts.items())),
+        },
+    }
+    normalized["review_summary"] = _review_summary(
+        entities=entities,
+        relationships=relationships,
+        target_entity_id=graph.get("target_node_id"),
+        report=report,
+    )
+    return normalized
+
+
 def _graph_document(investigation: Investigation) -> dict[str, Any]:
     metadata = investigation.case_metadata or {}
-    graph = _stored_graph(investigation)
+    graph, nodes, edges, evidence_index = _adjudicated_graph_parts(investigation)
+    adjudications = _evidence_adjudications(investigation)
     permitted = {
         str(source).casefold()
         for source in metadata.get("permitted_sources", [])
@@ -700,6 +1776,12 @@ def _graph_document(investigation: Investigation) -> dict[str, Any]:
     ]
     return {
         "schemaVersion": 2,
+        "product": {
+            "name": PRODUCT_FULL_NAME,
+            "shortName": PRODUCT_NAME,
+            "vendor": PRODUCT_VENDOR,
+            "tagline": PRODUCT_TAGLINE,
+        },
         "caseId": str(investigation.id),
         "authorizationReference": metadata.get("authorization_reference"),
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -707,7 +1789,263 @@ def _graph_document(investigation: Investigation) -> dict[str, Any]:
         "layout": _redact_for_display(metadata.get("graph_layout", {})),
         "transforms": transforms,
         "transformRuns": _redact_for_display(metadata.get("transform_runs", [])),
+        "adjudications": _redact_for_display(adjudications),
+        "adjudicationAudit": _redact_for_display(
+            metadata.get("adjudication_audit", [])
+        ),
+        "falsePositiveCount": len(_false_positive_evidence_ids(investigation)),
+        **_normalized_graph_view(
+            investigation,
+            graph,
+            nodes,
+            edges,
+            evidence_index,
+        ),
     }
+
+
+def _graphml_document(investigation: Investigation) -> bytes:
+    graph, nodes, edges, _ = _adjudicated_graph_parts(investigation)
+    namespace = "http://graphml.graphdrawing.org/xmlns"
+    ET.register_namespace("", namespace)
+    root = ET.Element(f"{{{namespace}}}graphml")
+    for key_id, target, name, attr_type in (
+        ("n_label", "node", "label", "string"),
+        ("n_type", "node", "entity_type", "string"),
+        ("n_evidence", "node", "evidence_ids", "string"),
+        ("n_attributes", "node", "attributes", "string"),
+        ("e_type", "edge", "relationship_type", "string"),
+        ("e_confidence", "edge", "confidence", "double"),
+        ("e_status", "edge", "identity_status", "string"),
+        ("e_reason", "edge", "reason", "string"),
+        ("e_evidence", "edge", "evidence_ids", "string"),
+    ):
+        ET.SubElement(
+            root,
+            f"{{{namespace}}}key",
+            {
+                "id": key_id,
+                "for": target,
+                "attr.name": name,
+                "attr.type": attr_type,
+            },
+        )
+    graph_element = ET.SubElement(
+        root,
+        f"{{{namespace}}}graph",
+        {
+            "id": str(investigation.id),
+            "edgedefault": "directed",
+        },
+    )
+
+    def add_data(parent: ET.Element, key: str, value: Any) -> None:
+        child = ET.SubElement(parent, f"{{{namespace}}}data", {"key": key})
+        child.text = str(value)
+
+    for node in nodes:
+        element = ET.SubElement(
+            graph_element,
+            f"{{{namespace}}}node",
+            {"id": str(node["id"])},
+        )
+        add_data(element, "n_label", node.get("label") or node["id"])
+        add_data(element, "n_type", node.get("kind") or "public_observation")
+        add_data(element, "n_evidence", json.dumps(node.get("evidence_ids", [])))
+        add_data(
+            element,
+            "n_attributes",
+            json.dumps(node.get("attributes", {}), sort_keys=True),
+        )
+    for edge in edges:
+        element = ET.SubElement(
+            graph_element,
+            f"{{{namespace}}}edge",
+            {
+                "id": str(edge["id"]),
+                "source": str(edge["source_node_id"]),
+                "target": str(edge["target_node_id"]),
+            },
+        )
+        add_data(element, "e_type", edge.get("relationship") or "related_to")
+        add_data(element, "e_confidence", edge.get("confidence", 0))
+        add_data(
+            element,
+            "e_status",
+            edge.get("identity_status") or "insufficient_evidence",
+        )
+        add_data(element, "e_reason", edge.get("explanation") or "")
+        add_data(element, "e_evidence", json.dumps(edge.get("evidence_ids", [])))
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _gexf_document(investigation: Investigation) -> bytes:
+    _, nodes, edges, _ = _adjudicated_graph_parts(investigation)
+    namespace = "http://www.gexf.net/1.3"
+    ET.register_namespace("", namespace)
+    root = ET.Element(
+        f"{{{namespace}}}gexf",
+        {"version": "1.3"},
+    )
+    graph_element = ET.SubElement(
+        root,
+        f"{{{namespace}}}graph",
+        {"defaultedgetype": "directed", "mode": "static"},
+    )
+    nodes_element = ET.SubElement(graph_element, f"{{{namespace}}}nodes")
+    for node in nodes:
+        ET.SubElement(
+            nodes_element,
+            f"{{{namespace}}}node",
+            {
+                "id": str(node["id"]),
+                "label": str(node.get("label") or node["id"]),
+            },
+        )
+    edges_element = ET.SubElement(graph_element, f"{{{namespace}}}edges")
+    for edge in edges:
+        ET.SubElement(
+            edges_element,
+            f"{{{namespace}}}edge",
+            {
+                "id": str(edge["id"]),
+                "source": str(edge["source_node_id"]),
+                "target": str(edge["target_node_id"]),
+                "label": str(edge.get("relationship") or "related_to"),
+                "weight": str(edge.get("confidence", 0)),
+            },
+        )
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _graph_csv_document(investigation: Investigation) -> str:
+    document = _graph_document(investigation)
+    entities = document.get("entities", [])
+    relationships = document.get("relationships", [])
+    review_summary = document.get("review_summary", {})
+
+    def csv_safe(value: Any) -> Any:
+        """Prevent spreadsheet formula execution without changing audit values."""
+        if not isinstance(value, str):
+            return value
+        return f"'{value}" if value.startswith(("=", "+", "-", "@")) else value
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        (
+            "record_type",
+            "id",
+            "entity_type",
+            "label",
+            "source_entity_id",
+            "target_entity_id",
+            "relationship_type",
+            "confidence",
+            "identity_status",
+            "evidence_ids",
+            "reason",
+            "review_priority",
+            "review_label",
+            "source_tools",
+            "publisher_count",
+            "hidden_by_default",
+            "plain_language",
+            "adjudication_status",
+            "adjudication_notes",
+        )
+    )
+    verdict = review_summary.get("verdict", {})
+    if isinstance(verdict, dict) and verdict:
+        writer.writerow(
+            (
+                "summary",
+                "verdict",
+                "",
+                csv_safe(verdict.get("title")),
+                "",
+                "",
+                "",
+                "",
+                verdict.get("status"),
+                "|".join(str(value) for value in verdict.get("evidence_ids", [])),
+                csv_safe(verdict.get("explanation")),
+                verdict.get("status"),
+                csv_safe(verdict.get("title")),
+                "",
+                "",
+                "false",
+                csv_safe(verdict.get("explanation")),
+                "",
+                "",
+            )
+        )
+    for entity in entities:
+        writer.writerow(
+            (
+                "entity",
+                entity.get("entity_id"),
+                entity.get("entity_type"),
+                csv_safe(entity.get("label")),
+                "",
+                "",
+                "",
+                entity.get("confidence"),
+                entity.get("identity_status"),
+                "|".join(
+                    str(value) for value in entity.get("evidence_ids", [])
+                ),
+                csv_safe(entity.get("plain_language_explanation")),
+                entity.get("review_priority"),
+                csv_safe(entity.get("confidence_label")),
+                "|".join(
+                    csv_safe(str(value))
+                    for value in entity.get("source_tools", [])
+                ),
+                entity.get("publisher_count"),
+                str(entity.get("review_priority") == "suppressed").casefold(),
+                csv_safe(entity.get("plain_language_explanation")),
+                entity.get("adjudication_status"),
+                csv_safe(
+                    json.dumps(
+                        entity.get("adjudication_notes", []),
+                        sort_keys=True,
+                        default=str,
+                    )
+                ),
+            )
+        )
+    for relationship in relationships:
+        writer.writerow(
+            (
+                "relationship",
+                relationship.get("edge_id"),
+                "",
+                "",
+                relationship.get("from_entity_id"),
+                relationship.get("to_entity_id"),
+                relationship.get("relationship_type"),
+                relationship.get("confidence"),
+                relationship.get("identity_status"),
+                "|".join(
+                    str(value)
+                    for value in relationship.get("evidence_ids", [])
+                ),
+                csv_safe(relationship.get("reason")),
+                "",
+                csv_safe(relationship.get("plain_language_type")),
+                "|".join(
+                    csv_safe(str(value))
+                    for value in relationship.get("source_tools", [])
+                ),
+                "",
+                "false",
+                csv_safe(relationship.get("reason")),
+                "",
+                "",
+            )
+        )
+    return output.getvalue()
 
 
 def _node_mapping_type(node: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -725,7 +2063,11 @@ def _node_mapping_type(node: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if kind == "username_observation":
         return "custom", {"title": "Username", "value": label}
     if kind == "public_profile":
-        url = label if label.startswith(("http://", "https://")) else attributes.get("url")
+        url = (
+            attributes.get("open_url")
+            or attributes.get("url")
+            or (label if label.startswith(("http://", "https://")) else None)
+        )
         hostname = ""
         if isinstance(url, str):
             try:
@@ -775,13 +2117,8 @@ def _node_mapping_type(node: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 
 def _mapping_document(investigation: Investigation) -> dict[str, Any]:
     metadata = investigation.case_metadata or {}
-    report = metadata.get("structured_report")
-    report = report if isinstance(report, dict) else {}
-    graph = _stored_graph(investigation)
-    nodes = graph.get("nodes", [])
-    nodes = nodes if isinstance(nodes, list) else []
-    edges = graph.get("edges", [])
-    edges = edges if isinstance(edges, list) else []
+    report = _effective_report(investigation) or {}
+    graph, nodes, edges, _ = _adjudicated_graph_parts(investigation)
     layout = metadata.get("graph_layout")
     layout = layout if isinstance(layout, dict) else {}
     layout_nodes = layout.get("nodes", [])
@@ -863,7 +2200,7 @@ def _mapping_document(investigation: Investigation) -> dict[str, Any]:
                     for key, value in fields.items()
                     if value is not None
                 },
-                "notes": "Evidence-backed DeepVault graph node.",
+                "notes": f"Evidence-backed {PRODUCT_NAME} graph node.",
                 "position": positions.get(
                     node_id,
                     {
@@ -939,7 +2276,7 @@ def _mapping_document(investigation: Investigation) -> dict[str, Any]:
     return {
         "schemaVersion": 2,
         "id": str(investigation.id),
-        "name": f"DeepVault — {investigation.target_name}",
+        "name": f"{PRODUCT_FULL_NAME} — {investigation.target_name}",
         "createdAt": (
             investigation.created_at.isoformat()
             if investigation.created_at
@@ -949,7 +2286,7 @@ def _mapping_document(investigation: Investigation) -> dict[str, Any]:
         "target": {
             "name": investigation.target_name,
             "notes": (
-                "Imported from an authorized DeepVault case. Every derived "
+                f"Imported from a governed {PRODUCT_NAME} case. Every derived "
                 "relationship retains its evidence IDs."
             ),
         },
@@ -979,7 +2316,7 @@ def _require_transform_authorization(
         )
     metadata = investigation.case_metadata or {}
     if not metadata.get("authorization_confirmed"):
-        raise HTTPException(status_code=403, detail="Authorization is not confirmed")
+        raise HTTPException(status_code=403, detail="Case approval is not confirmed")
     if payload.transform not in {
         str(source).casefold()
         for source in metadata.get("permitted_sources", [])
@@ -995,12 +2332,12 @@ def _require_transform_authorization(
     except (TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=403,
-            detail="Authorization expiry is invalid",
+            detail="Case mandate expiry is invalid",
         ) from exc
     if expiry.tzinfo is None:
         expiry = expiry.replace(tzinfo=timezone.utc)
     if expiry <= datetime.now(timezone.utc):
-        raise HTTPException(status_code=403, detail="Authorization has expired")
+        raise HTTPException(status_code=403, detail="Case mandate has expired")
     max_depth = max(0, int(os.getenv("MAX_PIVOT_DEPTH", "2")))
     if payload.pivot_depth > max_depth:
         raise HTTPException(status_code=400, detail="Pivot depth limit exceeded")
@@ -1142,12 +2479,61 @@ async def get_graph(investigation_id: UUID) -> dict[str, Any]:
         return _graph_document(investigation)
 
 
+@app.get("/api/investigations/{investigation_id}/graph.json")
+async def download_graph_json(investigation_id: UUID) -> Response:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        document = _redact_for_display(_graph_document(investigation))
+        filename = f"{EXPORT_PREFIX}-{investigation_id}-graph.json"
+        return Response(
+            json.dumps(document, indent=2, default=str),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+
+@app.get("/api/investigations/{investigation_id}/graph.graphml")
+async def download_graphml(investigation_id: UUID) -> Response:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        filename = f"{EXPORT_PREFIX}-{investigation_id}.graphml"
+        return Response(
+            _graphml_document(investigation),
+            media_type="application/graphml+xml",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+
+@app.get("/api/investigations/{investigation_id}/graph.gexf")
+async def download_gexf(investigation_id: UUID) -> Response:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        filename = f"{EXPORT_PREFIX}-{investigation_id}.gexf"
+        return Response(
+            _gexf_document(investigation),
+            media_type="application/gexf+xml",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+
+@app.get("/api/investigations/{investigation_id}/graph.csv")
+async def download_graph_csv(investigation_id: UUID) -> Response:
+    async with sessions() as session:
+        investigation = await _get_investigation(session, investigation_id)
+        filename = f"{EXPORT_PREFIX}-{investigation_id}-graph.csv"
+        return Response(
+            _graph_csv_document(investigation),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+
 @app.get("/api/investigations/{investigation_id}/mapping.osint.json")
 async def download_mapping_project(investigation_id: UUID) -> Response:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
         document = _redact_for_display(_mapping_document(investigation))
-        filename = f"deepvault-{investigation_id}.osint.json"
+        filename = f"{EXPORT_PREFIX}-{investigation_id}.osint.json"
         return Response(
             json.dumps(document, indent=2, default=str),
             media_type="application/json",
@@ -1188,6 +2574,82 @@ async def update_graph_layout(
             "caseId": str(investigation.id),
             "nodeCount": len(payload.nodes),
             "status": "saved",
+        }
+
+
+@app.post("/api/investigations/{investigation_id}/evidence-adjudications")
+async def update_evidence_adjudications(
+    investigation_id: UUID,
+    payload: EvidenceAdjudicationRequest,
+) -> dict[str, Any]:
+    async with sessions() as session:
+        investigation = (
+            await session.execute(
+                select(Investigation)
+                .where(Investigation.id == investigation_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if investigation is None:
+            raise HTTPException(status_code=404, detail="Investigation not found")
+        metadata = investigation.case_metadata or {}
+        report = metadata.get("structured_report")
+        if not isinstance(report, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="Evidence can be reviewed after the report is ready",
+            )
+        ledger = report.get("evidence_ledger", [])
+        valid_ids = {
+            str(item.get("id"))
+            for item in ledger
+            if isinstance(item, dict) and item.get("id")
+        } if isinstance(ledger, list) else set()
+        unknown_ids = set(payload.evidence_ids) - valid_ids
+        if unknown_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown evidence IDs: {sorted(unknown_ids)}",
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        decisions = _evidence_adjudications(investigation)
+        audit = metadata.get("adjudication_audit", [])
+        audit = list(audit) if isinstance(audit, list) else []
+        for evidence_id in payload.evidence_ids:
+            previous = deepcopy(decisions.get(evidence_id))
+            decision = {
+                "status": payload.status.value,
+                "reason_code": payload.reason_code.casefold().replace(" ", "_"),
+                "note": payload.note,
+                "reviewer": payload.reviewer,
+                "updated_at": now,
+            }
+            decisions[evidence_id] = decision
+            audit.append(
+                {
+                    "id": f"ADJ-{uuid4().hex[:12].upper()}",
+                    "evidence_id": evidence_id,
+                    "previous": previous,
+                    "decision": deepcopy(decision),
+                    "recorded_at": now,
+                }
+            )
+        investigation.case_metadata = {
+            **metadata,
+            "evidence_adjudications": decisions,
+            "adjudication_audit": audit[-5000:],
+        }
+        investigation.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        await session.commit()
+        return {
+            "caseId": str(investigation.id),
+            "updatedEvidenceIds": payload.evidence_ids,
+            "status": payload.status.value,
+            "falsePositiveCount": len(
+                _false_positive_evidence_ids(investigation)
+            ),
+            "recordedAt": now,
         }
 
 
@@ -1314,13 +2776,18 @@ async def stream_case_events(investigation_id: UUID) -> StreamingResponse:
 async def download_json_report(investigation_id: UUID) -> Response:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
-        report = (investigation.case_metadata or {}).get("structured_report")
-        if not isinstance(report, dict):
+        report = _effective_report(investigation)
+        if report is None:
             raise HTTPException(status_code=409, detail="Report is not ready")
-        report = _redact_for_display(report)
         metadata = investigation.case_metadata or {}
         document = {
             **report,
+            "product": {
+                "name": PRODUCT_FULL_NAME,
+                "short_name": PRODUCT_NAME,
+                "vendor": PRODUCT_VENDOR,
+                "tagline": PRODUCT_TAGLINE,
+            },
             "case_context": {
                 "case_id": str(investigation.id),
                 "target_name": investigation.target_name,
@@ -1331,7 +2798,7 @@ async def download_json_report(investigation_id: UUID) -> Response:
                 "permitted_sources": metadata.get("permitted_sources", []),
             },
         }
-        filename = f"deepvault-{investigation_id}.json"
+        filename = f"{EXPORT_PREFIX}-{investigation_id}.json"
         return Response(
             json.dumps(document, indent=2, default=str),
             media_type="application/json",
@@ -1339,8 +2806,15 @@ async def download_json_report(investigation_id: UUID) -> Response:
         )
 
 
-def render_report_html(report: dict[str, Any], target_name: str) -> str:
+def render_report_html(
+    report: dict[str, Any],
+    target_name: str,
+    review_summary: dict[str, Any] | None = None,
+    graph_document: dict[str, Any] | None = None,
+) -> str:
     report = _redact_for_display(report)
+    review_summary = _redact_for_display(review_summary or {})
+    graph_document = _redact_for_display(graph_document or {})
 
     def safe(value: Any) -> str:
         return escape(str(value if value is not None else ""))
@@ -1353,6 +2827,218 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
         if 0.0 <= score <= 1.0:
             return f"{score * 100:.0f}%"
         return str(value)
+
+    def anchor_id(value: Any) -> str:
+        return re.sub(r"[^A-Za-z0-9_-]+", "-", str(value or "")).strip("-")
+
+    def identity_label(value: Any) -> str:
+        labels = {
+            "insufficient_evidence": "No identity verified",
+            "possible": "Possible — verify manually",
+            "probable": "Probable — analyst confirmation required",
+            "highly_probable": (
+                "Highly probable — analyst confirmation required"
+            ),
+            "confirmed": "Confirmed by reviewed public evidence",
+            "authorized_target": "Case subject",
+        }
+        return labels.get(str(value), str(value or "Not assessed").replace("_", " "))
+
+    def risk_label(value: Any) -> str:
+        labels = {
+            "review_required": "Not assessed — analyst review required",
+            "not_assessed_after_review": "Not assessed after analyst review",
+            "insufficient_evidence": "Not assessed — insufficient evidence",
+        }
+        return labels.get(str(value), str(value or "Not assessed").replace("_", " "))
+
+    def coverage_label(value: Any) -> str:
+        labels = {
+            "evidence_collected": "Public observations collected",
+            "no_results": "Checked — no public result",
+            "unavailable": "Unavailable — provider or configuration missing",
+            "not_queried": "Not run in this collection",
+            "insufficient": "Insufficient source coverage",
+        }
+        return labels.get(str(value), str(value or "Not assessed").replace("_", " "))
+
+    def evidence_citations(values: Any, limit: int = 8) -> str:
+        evidence_ids = [
+            str(value)
+            for value in (values if isinstance(values, list) else [])
+            if value
+        ]
+        visible = evidence_ids[:limit]
+        remaining = len(evidence_ids) - len(visible)
+        citation_links = " ".join(
+            f"<a href='#evidence-{safe(anchor_id(value))}'>{safe(value)}</a>"
+            for value in visible
+        )
+        if remaining:
+            citation_links += (
+                f" <span>+{remaining} more in the evidence appendix</span>"
+            )
+        return (
+            f"<span class='citations'>{citation_links}</span>"
+            if citation_links
+            else "<span class='citations'>No evidence ID</span>"
+        )
+
+    def public_named_link(value: Any, label: str) -> str:
+        if not isinstance(value, str):
+            return ""
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return ""
+        if parsed.scheme not in {"http", "https"}:
+            return ""
+        return (
+            f"<a class='review-link' href='{safe(value)}' "
+            f"target='_blank' rel='noreferrer'>{safe(label)}</a>"
+        )
+
+    def public_link(value: Any) -> str:
+        return public_named_link(value, "Open public page")
+
+    def evidence_link_state(item: dict[str, Any]) -> tuple[str | None, str]:
+        metadata = item.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        quality = metadata.get("quality")
+        quality = quality if isinstance(quality, dict) else {}
+        status = str(quality.get("verification_status") or "").casefold()
+        flags = quality.get("flags")
+        flags = {str(flag) for flag in flags} if isinstance(flags, list) else set()
+        if status in {"inaccessible", "rejected"} or flags & {
+            "inaccessible_profile",
+            "not_found",
+            "profile_missing",
+            "soft_404",
+        }:
+            return None, "Unavailable page"
+        matches = quality.get("matched_attributes")
+        matches = matches if isinstance(matches, list) else []
+        source = str(item.get("source") or "").casefold()
+        validated = bool(
+            flags
+            & {
+                "canonical_profile_match",
+                "content_validated",
+                "profile_content_validated",
+                "username_in_page",
+            }
+        )
+        if status in {
+            "catalogue_only",
+            "insufficient_context",
+            "quarantined",
+        } or (
+            source in _USERNAME_CATALOGUE_SOURCES
+            and not matches
+            and not validated
+        ):
+            return None, "Unvalidated discovery link"
+        value = item.get("source_url")
+        if isinstance(value, str) and public_link(value):
+            return value, "Open public page"
+        return None, "Not available"
+
+    verdict = review_summary.get("verdict", {})
+    verdict = verdict if isinstance(verdict, dict) else {}
+    review_counts = review_summary.get("counts", {})
+    review_counts = review_counts if isinstance(review_counts, dict) else {}
+    review_leads = review_summary.get("priority_leads", [])
+    review_leads = review_leads if isinstance(review_leads, list) else []
+    review_key_points = review_summary.get("key_points", [])
+    review_key_points = (
+        review_key_points if isinstance(review_key_points, list) else []
+    )
+    review_cautions = review_summary.get("cautions", [])
+    review_cautions = (
+        review_cautions if isinstance(review_cautions, list) else []
+    )
+
+    review_lead_cards = "".join(
+        (
+            "<article class='review-lead'>"
+            f"<div class='rank'>{safe(index)}</div>"
+            "<div>"
+            f"<h3>{safe(item.get('label') or item.get('entity_id'))}</h3>"
+            f"<span class='review-badge'>{safe(item.get('confidence_label'))}</span>"
+            f"<p>{safe(item.get('explanation'))}</p>"
+            f"<p class='meta'>Sources: "
+            f"{safe(' + '.join(item.get('source_tools', [])) or 'unknown')} · "
+            f"Technical confidence: "
+            f"{safe(confidence_label(item.get('technical_confidence')))}</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
+            f"{public_link(item.get('public_url'))}"
+            "</div>"
+            "</article>"
+        )
+        for index, item in enumerate(review_leads[:10], start=1)
+        if isinstance(item, dict)
+    )
+    review_points = "".join(
+        (
+            "<article class='plain-point'>"
+            f"<h3>{safe(item.get('title'))}</h3>"
+            f"<p>{safe(item.get('statement'))}</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
+            "</article>"
+        )
+        for item in review_key_points
+        if isinstance(item, dict)
+    )
+    caution_items = "".join(
+        (
+            "<li>"
+            f"{safe(item.get('statement'))}"
+            f"{evidence_citations(item.get('evidence_ids'))}"
+            "</li>"
+        )
+        for item in review_cautions
+        if isinstance(item, dict) and item.get("evidence_ids")
+    )
+    review_overview = ""
+    if verdict:
+        review_overview = (
+            "<section class='plain-review'>"
+            "<p class='eyebrow'>PLAIN-LANGUAGE ASSESSMENT</p>"
+            f"<h2>{safe(verdict.get('title'))}</h2>"
+            f"<p class='verdict-copy'>{safe(verdict.get('explanation'))}</p>"
+            f"{evidence_citations(verdict.get('evidence_ids'))}"
+            "<div class='review-counts'>"
+            f"<div><strong>{safe(review_counts.get('supported', 0))}</strong>"
+            "<span>Supported</span></div>"
+            f"<div><strong>{safe(review_counts.get('review_first', 0))}</strong>"
+            "<span>Check first</span></div>"
+            f"<div><strong>{safe(review_counts.get('low_signal', 0))}</strong>"
+            "<span>Unverified</span></div>"
+            f"<div><strong>{safe(review_counts.get('suppressed', 0))}</strong>"
+            "<span>Hidden noise</span></div>"
+            "</div>"
+            "<div class='how-to-read'><strong>How to read this report</strong>"
+            "<p>A candidate means a public trace is worth checking. It does not "
+            f"mean {PRODUCT_NAME} verified that the person owns the "
+            "account.</p></div>"
+            "<h2>What to check first</h2>"
+            f"{review_lead_cards or '<p>No prioritized review lead was produced.</p>'}"
+            "<div class='plain-grid'>"
+            f"<section><h2>What was actually found</h2>{review_points}</section>"
+            "<section><h2>What you must not conclude</h2>"
+            f"<ul class='cautions'>{caution_items}</ul>"
+            + (
+                "<div class='privacy-note'>"
+                f"{safe(review_counts.get('suppressed', 0))} misleading, generic, "
+                "rejected, or sensitive candidate(s) are hidden from this review "
+                "queue and retained only in the controlled evidence appendix."
+                "</div>"
+                if review_counts.get("suppressed")
+                else ""
+            )
+            + "</section></div>"
+            "</section>"
+        )
 
     finding_groups: dict[str, list[str]] = {}
     for item in report.get("findings", []):
@@ -1368,7 +3054,7 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             f"<p class='meta'>Status "
             f"{safe(item.get('verification_status') or 'unverified')} · "
             f"Confidence {safe(confidence_label(item.get('confidence')))} · "
-            f"Evidence {safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"Evidence</p>{evidence_citations(item.get('evidence_ids'))}"
             f"{f'<ul>{finding_limitations}</ul>' if finding_limitations else ''}"
             "</article>"
         )
@@ -1379,6 +3065,9 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
         "defensive_exposure": "Defensive exposure",
         "service_signals": "Service-presence signals",
         "unverified_profiles": "Unverified username leads",
+        "catalogue_leads": "Catalogue-only username leads",
+        "unverified_search_results": "Search results needing identity context",
+        "inaccessible_profiles": "Unavailable profile links",
         "quarantined_candidates": "Quarantined sensitive candidates",
         "rejected_observations": "Rejected observations",
         "other_observations": "Other observations",
@@ -1394,9 +3083,9 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             "<tr>"
             f"<td>{safe(item.get('source'))}</td>"
             f"<td>{safe(item.get('evidence_count'))}</td>"
-            f"<td>{safe(str(item.get('status') or '').replace('_', ' '))}</td>"
+            f"<td>{safe(coverage_label(item.get('status')))}</td>"
             f"<td>{safe(item.get('detail'))}</td>"
-            f"<td>{safe(', '.join(item.get('evidence_ids', [])))}</td>"
+            f"<td>{evidence_citations(item.get('evidence_ids'))}</td>"
             "</tr>"
         )
         for item in report.get("source_coverage", [])
@@ -1406,8 +3095,8 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             "<article class='finding'>"
             f"<p class='meta'>{safe(item.get('occurred_at'))}</p>"
             f"<p>{safe(item.get('description'))}</p>"
-            f"<p class='meta'>Evidence "
-            f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"<p class='meta'>Evidence</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
             "</article>"
         )
         for item in report.get("timeline", [])
@@ -1417,8 +3106,8 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             "<article class='finding'>"
             f"<p>{safe(item.get('description'))}</p>"
             f"<p>{safe(item.get('recommendation'))}</p>"
-            f"<p class='meta'>Evidence "
-            f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"<p class='meta'>Evidence</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
             "</article>"
         )
         for item in report.get("contradictions", [])
@@ -1447,6 +3136,15 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
         for item in graph_nodes
         if isinstance(item, dict) and item.get("id")
     }
+
+    def graph_node_link(node_id: Any) -> str:
+        node = node_by_id.get(str(node_id), {})
+        label = node_labels.get(str(node_id), node_id)
+        attributes = node.get("attributes")
+        attributes = attributes if isinstance(attributes, dict) else {}
+        value = attributes.get("open_url") or attributes.get("url") or label
+        return public_named_link(value, str(label)) or safe(label)
+
     reviewable_statuses = {"confirmed", "highly_probable", "probable", "possible"}
 
     def graph_item_is_reviewable(item: dict[str, Any], node_key: str) -> bool:
@@ -1471,8 +3169,8 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             f"<h3>{safe(item.get('identity_status'))} · "
             f"{safe(confidence_label(item.get('confidence')))}</h3>"
             f"<p>{safe(item.get('claim'))}</p>"
-            f"<p class='meta'>Evidence "
-            f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"<p class='meta'>Evidence</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
             + (
                 "<ul>"
                 + "".join(
@@ -1490,12 +3188,12 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
     graph_edges = "".join(
         (
             "<tr>"
-            f"<td>{safe(item.get('relationship'))}</td>"
-            f"<td>{safe(node_labels.get(str(item.get('source_node_id')), item.get('source_node_id')))}</td>"
-            f"<td>{safe(node_labels.get(str(item.get('target_node_id')), item.get('target_node_id')))}</td>"
+            f"<td>{safe(_PLAIN_RELATIONSHIP_LABELS.get(str(item.get('relationship')), str(item.get('relationship') or '').replace('_', ' ').capitalize()))}</td>"
+            f"<td>{graph_node_link(item.get('source_node_id'))}</td>"
+            f"<td>{graph_node_link(item.get('target_node_id'))}</td>"
             f"<td>{safe(confidence_label(item.get('confidence')))}</td>"
-            f"<td>{safe(item.get('identity_status'))}</td>"
-            f"<td>{safe(', '.join(item.get('evidence_ids', [])))}</td>"
+            f"<td>{safe(identity_label(item.get('identity_status')))}</td>"
+            f"<td>{evidence_citations(item.get('evidence_ids'))}</td>"
             "</tr>"
         )
         for item in graph_edge_items
@@ -1512,10 +3210,10 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             f"<h3>#{safe(item.get('rank'))} · {safe(item.get('title'))}</h3>"
             f"<p>{safe(item.get('rationale'))}</p>"
             f"<p>{safe(item.get('action'))}</p>"
-            "<p class='meta'>Manual review only · new authorization required · "
+            "<p class='meta'>Manual review only · new case approval required · "
             f"{safe(item.get('priority'))} priority</p>"
-            f"<p class='meta'>Evidence "
-            f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
+            f"<p class='meta'>Evidence</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
             "</article>"
         )
         for item in primary_graph_pivots
@@ -1556,8 +3254,9 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
                     if changed_fields
                     else ""
                 )
-                + f"<p class='meta'>Evidence {safe(' → '.join(evidence_ids))}</p>"
-                "</article>"
+                + f"<p class='meta'>Evidence</p>"
+                + evidence_citations(evidence_ids)
+                + "</article>"
             )
         if parts:
             temporal_groups.append(f"<h3>{safe(label)}</h3>{''.join(parts)}")
@@ -1579,21 +3278,46 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
             f"<div class='notice'>{safe(temporal.get('scope_note'))}</div>"
             + "".join(temporal_groups)
         )
-    evidence_ledger = "".join(
-        (
-            "<article class='finding'>"
+    evidence_records: list[str] = []
+    for item in report.get("evidence_ledger", []):
+        evidence_url, evidence_url_label = evidence_link_state(item)
+        evidence_records.append(
+            f"<article class='finding evidence-record' "
+            f"id='evidence-{safe(anchor_id(item.get('id')))}'>"
             f"<h3>{safe(item.get('id'))} · {safe(item.get('source'))}</h3>"
             f"<p><strong>Type:</strong> {safe(item.get('type'))} · "
             f"<strong>Confidence:</strong> "
             f"{safe(confidence_label(item.get('confidence')))} · "
-            f"<strong>Identity:</strong> {safe(item.get('identity_status'))}</p>"
+            f"<strong>Identity:</strong> "
+            f"{safe(identity_label(item.get('identity_status')))}</p>"
             f"<p><strong>Value:</strong> {safe(item.get('value'))}</p>"
-            f"<p><strong>Source URL:</strong> {safe(item.get('source_url'))}</p>"
+            f"<p><strong>Source URL:</strong> "
+            f"{public_named_link(evidence_url, evidence_url_label) if evidence_url else safe(evidence_url_label)}</p>"
             f"<p class='meta'>Observed {safe(item.get('observed_at'))}</p>"
+            "<p><a href='#interactive-graph'>Return to interactive graph</a> · "
+            "<a href='#report-top'>Return to report summary</a></p>"
             f"<pre>{safe(json.dumps(item.get('metadata', {}), indent=2, default=str))}</pre>"
             "</article>"
         )
-        for item in report.get("evidence_ledger", [])
+    evidence_ledger = "".join(evidence_records)
+    adjudication_summary = report.get("adjudication_summary", {})
+    adjudication_summary = (
+        adjudication_summary if isinstance(adjudication_summary, dict) else {}
+    )
+    adjudication_decisions = "".join(
+        (
+            "<article class='finding'>"
+            f"<h3><a href='#evidence-{safe(anchor_id(item.get('evidence_id')))}'>"
+            f"{safe(item.get('evidence_id'))}</a> · "
+            f"{safe(str(item.get('status') or '').replace('_', ' ').title())}</h3>"
+            f"<p><strong>Reason:</strong> {safe(item.get('reason_code'))}</p>"
+            f"<p>{safe(item.get('note'))}</p>"
+            f"<p class='meta'>Reviewed by {safe(item.get('reviewer'))} · "
+            f"{safe(item.get('updated_at'))}</p>"
+            "</article>"
+        )
+        for item in adjudication_summary.get("decisions", [])
+        if isinstance(item, dict)
     )
     recommendations = "".join(
         f"<li>{safe(item)}</li>" for item in report.get("recommendations", [])
@@ -1604,63 +3328,610 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
     methodology = "".join(
         f"<li>{safe(item)}</li>" for item in report.get("methodology", [])
     )
+    normalized_entities = graph_document.get("entities", [])
+    normalized_entities = (
+        normalized_entities if isinstance(normalized_entities, list) else []
+    )
+    normalized_relationships = graph_document.get("relationships", [])
+    normalized_relationships = (
+        normalized_relationships
+        if isinstance(normalized_relationships, list)
+        else []
+    )
+    if not normalized_entities:
+        normalized_entities = [
+            {
+                "entity_id": item.get("id"),
+                "entity_type": item.get("kind"),
+                "label": item.get("label") or item.get("id"),
+                "canonical_value": (
+                    item.get("attributes", {}).get("url")
+                    if isinstance(item.get("attributes"), dict)
+                    else None
+                ),
+                "confidence": (
+                    1
+                    if item.get("id") == identity_graph.get("target_node_id")
+                    else 0
+                ),
+                "identity_status": (
+                    "authorized_target"
+                    if item.get("id") == identity_graph.get("target_node_id")
+                    else "insufficient_evidence"
+                ),
+                "source_tools": [],
+                "evidence_ids": item.get("evidence_ids", []),
+            }
+            for item in graph_nodes
+            if isinstance(item, dict)
+        ]
+    if not normalized_relationships:
+        normalized_relationships = [
+            {
+                "edge_id": item.get("id"),
+                "from_entity_id": item.get("source_node_id"),
+                "to_entity_id": item.get("target_node_id"),
+                "relationship_type": item.get("relationship"),
+                "plain_language_type": _PLAIN_RELATIONSHIP_LABELS.get(
+                    str(item.get("relationship")),
+                    str(item.get("relationship") or "Cited relationship")
+                    .replace("_", " ")
+                    .capitalize(),
+                ),
+                "confidence": item.get("confidence"),
+                "identity_status": item.get("identity_status"),
+                "evidence_ids": item.get("evidence_ids", []),
+                "reason": item.get("explanation"),
+            }
+            for item in graph_edge_items
+            if isinstance(item, dict)
+        ]
+    interactive_payload = {
+        "target_entity_id": (
+            graph_document.get("target_entity_id")
+            or identity_graph.get("target_node_id")
+        ),
+        "entities": normalized_entities,
+        "relationships": normalized_relationships,
+    }
+    graph_data_json = json.dumps(
+        interactive_payload,
+        separators=(",", ":"),
+        default=str,
+    )
+    graph_data_json = (
+        graph_data_json.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+    interactive_graph = f"""
+    <section class="interactive-graph-section" id="interactive-graph">
+      <p class="eyebrow">INTERACTIVE EVIDENCE MAP</p>
+      <h2>Explore the identity graph</h2>
+      <p>Select a node to inspect it. Filter by type, confidence, text, or
+        incoming/outgoing connections. Every evidence ID opens its record below.</p>
+      <div class="graph-controls">
+        <label>Search
+          <input id="graph-search" type="search" placeholder="Name, URL, source or ID">
+        </label>
+        <label>Entity type
+          <select id="graph-type"><option value="all">All entity types</option></select>
+        </label>
+        <label>Connection view
+          <select id="graph-direction">
+            <option value="all">All visible connections</option>
+            <option value="neighbors">All neighbors of selected</option>
+            <option value="outgoing">Outgoing from selected</option>
+            <option value="incoming">Incoming to selected</option>
+          </select>
+        </label>
+        <label>Minimum confidence <span id="graph-confidence-value">0%</span>
+          <input id="graph-confidence" type="range" min="0" max="100" value="0">
+        </label>
+        <button id="graph-reset" type="button">Reset view</button>
+      </div>
+      <p class="graph-counter" id="graph-counter"></p>
+      <div class="interactive-graph-layout">
+        <div class="report-graph-stage">
+          <svg id="report-graph" viewBox="0 0 1000 620"
+            aria-label="Interactive evidence graph"></svg>
+          <p class="graph-instructions">Click or press Enter on a node · wheel
+            to zoom · drag the background to pan</p>
+        </div>
+        <aside id="report-graph-inspector">
+          <h3>Select an entity</h3>
+          <p>Its meaning, sources, relationships, public page, and cited evidence
+            will appear here.</p>
+        </aside>
+      </div>
+    </section>
+    <script type="application/json" id="dv-graph-data">{graph_data_json}</script>
+    """
+    interactive_graph += """
+    <script>
+    (() => {
+      "use strict";
+      const payload = JSON.parse(document.querySelector("#dv-graph-data").textContent);
+      const svg = document.querySelector("#report-graph");
+      if (!svg) return;
+      const entities = Array.isArray(payload.entities) ? payload.entities : [];
+      const relationships = Array.isArray(payload.relationships)
+        ? payload.relationships : [];
+      const byId = Object.fromEntries(entities.map(entity =>
+        [String(entity.entity_id), entity]));
+      const palette = {
+        authorized_target: "#72a9e8", public_source: "#72809b",
+        public_profile: "#8a6bd4", service: "#d8a51f",
+        breach_event: "#d34a52", email_observation: "#d34a52",
+        username_observation: "#7789d8", public_resource: "#4bb9b6"
+      };
+      const esc = value => String(value ?? "").replace(/[&<>"']/g, character =>
+        ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
+          "'": "&#039;"}[character]));
+      const anchor = value => String(value || "").replace(
+        /[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+      const percent = value => Number.isFinite(Number(value))
+        ? `${Math.round(Number(value) * 100)}%` : "not scored";
+      const label = value => String(value || "observation")
+        .replaceAll("_", " ").replace(/\\b\\w/g, letter => letter.toUpperCase());
+      const state = {
+        selected: payload.target_entity_id ? String(payload.target_entity_id) : null,
+        query: "", type: "all", direction: "all", minimum: 0,
+        viewport: {x: 0, y: 0, zoom: 1}
+      };
+      const positions = new Map();
+      entities.forEach((entity, index) => {
+        const id = String(entity.entity_id);
+        if (id === String(payload.target_entity_id)) {
+          positions.set(id, {x: 500, y: 310});
+          return;
+        }
+        const adjusted = index - (payload.target_entity_id ? 1 : 0);
+        const ring = Math.floor(Math.max(adjusted, 0) / 20);
+        const slot = Math.max(adjusted, 0) % 20;
+        const count = Math.min(20, Math.max(entities.length - 1 - ring * 20, 1));
+        const radius = 150 + ring * 88;
+        const angle = Math.PI * 2 * slot / count - Math.PI / 2;
+        positions.set(id, {
+          x: 500 + Math.cos(angle) * radius,
+          y: 310 + Math.sin(angle) * Math.min(radius, 270)
+        });
+      });
+      const typeSelect = document.querySelector("#graph-type");
+      [...new Set(entities.map(entity => entity.entity_type).filter(Boolean))]
+        .sort().forEach(type => {
+          const option = document.createElement("option");
+          option.value = type;
+          option.textContent = label(type);
+          typeSelect.append(option);
+        });
+      const baseSelection = () => {
+        const query = state.query.toLocaleLowerCase();
+        return entities.filter(entity => {
+          const id = String(entity.entity_id);
+          const text = [
+            entity.label, entity.canonical_value, entity.entity_type,
+            ...(entity.source_tools || []), ...(entity.evidence_ids || [])
+          ].join(" ").toLocaleLowerCase();
+          return id === String(payload.target_entity_id)
+            || id === state.selected
+            || ((!query || text.includes(query))
+              && (state.type === "all" || entity.entity_type === state.type)
+              && Number(entity.confidence || 0) >= state.minimum);
+        });
+      };
+      const visibleGraph = () => {
+        let nodes = baseSelection();
+        let ids = new Set(nodes.map(entity => String(entity.entity_id)));
+        let edges = relationships.filter(edge =>
+          ids.has(String(edge.from_entity_id)) && ids.has(String(edge.to_entity_id)));
+        if (state.selected && state.direction !== "all") {
+          edges = edges.filter(edge => {
+            const from = String(edge.from_entity_id);
+            const to = String(edge.to_entity_id);
+            if (state.direction === "outgoing") return from === state.selected;
+            if (state.direction === "incoming") return to === state.selected;
+            return from === state.selected || to === state.selected;
+          });
+          ids = new Set([state.selected]);
+          edges.forEach(edge => {
+            ids.add(String(edge.from_entity_id));
+            ids.add(String(edge.to_entity_id));
+          });
+          nodes = nodes.filter(entity => ids.has(String(entity.entity_id)));
+        }
+        return {nodes, edges};
+      };
+      const updateInspector = () => {
+        const inspector = document.querySelector("#report-graph-inspector");
+        const entity = byId[state.selected];
+        inspector.replaceChildren();
+        if (!entity) {
+          inspector.innerHTML = "<h3>Select an entity</h3><p>Click a graph node.</p>";
+          return;
+        }
+        const heading = document.createElement("h3");
+        heading.textContent = entity.label || entity.entity_id;
+        inspector.append(heading);
+        const status = document.createElement("p");
+        status.className = "inspector-status";
+        status.textContent = `${label(entity.entity_type)} · ${
+          entity.confidence_label || label(entity.identity_status)
+        } · ${percent(entity.confidence)}`;
+        inspector.append(status);
+        if (entity.plain_language_explanation) {
+          const explanation = document.createElement("p");
+          explanation.textContent = entity.plain_language_explanation;
+          inspector.append(explanation);
+        }
+        const sources = document.createElement("p");
+        sources.textContent = `Sources: ${
+          (entity.source_tools || []).join(" + ") || "case context"}`;
+        inspector.append(sources);
+        const value = entity.canonical_value;
+        try {
+          const url = new URL(value);
+          if (["http:", "https:"].includes(url.protocol)) {
+            const link = document.createElement("a");
+            link.href = url.href;
+            link.target = "_blank";
+            link.rel = "noreferrer";
+            link.textContent = "Open cited public page";
+            inspector.append(link);
+          }
+        } catch (_) {}
+        const evidenceTitle = document.createElement("h4");
+        evidenceTitle.textContent = "Evidence";
+        inspector.append(evidenceTitle);
+        const evidenceList = document.createElement("div");
+        evidenceList.className = "inspector-evidence";
+        (entity.evidence_ids || []).forEach(id => {
+          const link = document.createElement("a");
+          link.href = `#evidence-${anchor(id)}`;
+          link.textContent = id;
+          evidenceList.append(link);
+        });
+        if (!evidenceList.children.length) {
+          evidenceList.textContent = "No evidence ID — case subject context.";
+        }
+        inspector.append(evidenceList);
+        const adjacent = relationships.filter(edge =>
+          String(edge.from_entity_id) === state.selected
+          || String(edge.to_entity_id) === state.selected);
+        const relationTitle = document.createElement("h4");
+        relationTitle.textContent = `Relationships (${adjacent.length})`;
+        inspector.append(relationTitle);
+        adjacent.slice(0, 20).forEach(edge => {
+          const peerId = String(edge.from_entity_id) === state.selected
+            ? String(edge.to_entity_id) : String(edge.from_entity_id);
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "inspector-peer";
+          button.textContent = `${
+            edge.plain_language_type || label(edge.relationship_type)
+          }: ${byId[peerId]?.label || peerId}`;
+          button.addEventListener("click", () => {
+            state.selected = peerId;
+            render();
+          });
+          inspector.append(button);
+        });
+      };
+      const render = () => {
+        const {nodes, edges} = visibleGraph();
+        const world = state.viewport;
+        const edgeMarkup = edges.map(edge => {
+          const from = positions.get(String(edge.from_entity_id));
+          const to = positions.get(String(edge.to_entity_id));
+          if (!from || !to) return "";
+          const uncertain = ["possible", "insufficient_evidence"].includes(
+            edge.identity_status);
+          return `<line class="${uncertain ? "uncertain" : ""}"
+            x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}">
+            <title>${esc(edge.plain_language_type || edge.relationship_type)}
+              · ${(edge.evidence_ids || []).map(esc).join(", ")}</title></line>`;
+        }).join("");
+        const nodeMarkup = nodes.map(entity => {
+          const id = String(entity.entity_id);
+          const position = positions.get(id);
+          const selected = id === state.selected;
+          const color = palette[entity.entity_type] || "#94a3b8";
+          return `<g class="report-node ${selected ? "selected" : ""}"
+            data-node-id="${esc(id)}" tabindex="0" role="button"
+            aria-label="${esc(entity.label || id)}"
+            transform="translate(${position.x} ${position.y})">
+            <circle r="31" fill="${color}"></circle>
+            <text y="5">${esc(entity.entity_type === "authorized_target" ? "P" :
+              entity.entity_type === "public_source" ? "S" :
+              entity.entity_type === "service" ? "✓" : "@")}</text>
+            <text class="report-node-label" y="51">${
+              esc(String(entity.label || id).slice(0, 32))}</text>
+            <title>${esc(entity.label || id)} · ${percent(entity.confidence)}</title>
+          </g>`;
+        }).join("");
+        svg.innerHTML = `<defs><marker id="report-arrow" viewBox="0 0 10 10"
+          refX="26" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+          <path d="M0 0 L10 5 L0 10z" fill="#69788e"></path></marker></defs>
+          <g id="report-world" transform="translate(${world.x} ${world.y})
+            scale(${world.zoom})">${edgeMarkup}${nodeMarkup}</g>`;
+        svg.querySelectorAll(".report-node").forEach(node => {
+          const select = () => {
+            state.selected = node.dataset.nodeId;
+            render();
+          };
+          node.addEventListener("click", select);
+          node.addEventListener("keydown", event => {
+            if (!["Enter", " "].includes(event.key)) return;
+            event.preventDefault();
+            select();
+          });
+        });
+        document.querySelector("#graph-counter").textContent =
+          `Showing ${nodes.length} of ${entities.length} entities and ${
+            edges.length} of ${relationships.length} relationships`;
+        updateInspector();
+      };
+      document.querySelector("#graph-search").addEventListener("input", event => {
+        state.query = event.target.value;
+        render();
+      });
+      typeSelect.addEventListener("change", event => {
+        state.type = event.target.value;
+        render();
+      });
+      document.querySelector("#graph-direction").addEventListener(
+        "change", event => {
+          state.direction = event.target.value;
+          render();
+        });
+      document.querySelector("#graph-confidence").addEventListener(
+        "input", event => {
+          state.minimum = Number(event.target.value) / 100;
+          document.querySelector("#graph-confidence-value").textContent =
+            `${event.target.value}%`;
+          render();
+        });
+      document.querySelector("#graph-reset").addEventListener("click", () => {
+        state.query = "";
+        state.type = "all";
+        state.direction = "all";
+        state.minimum = 0;
+        state.viewport = {x: 0, y: 0, zoom: 1};
+        state.selected = payload.target_entity_id
+          ? String(payload.target_entity_id) : null;
+        document.querySelector("#graph-search").value = "";
+        typeSelect.value = "all";
+        document.querySelector("#graph-direction").value = "all";
+        document.querySelector("#graph-confidence").value = "0";
+        document.querySelector("#graph-confidence-value").textContent = "0%";
+        render();
+      });
+      svg.addEventListener("wheel", event => {
+        event.preventDefault();
+        state.viewport.zoom = Math.max(.35, Math.min(3,
+          state.viewport.zoom * (event.deltaY < 0 ? 1.12 : .89)));
+        render();
+      }, {passive: false});
+      let pan = null;
+      svg.addEventListener("pointerdown", event => {
+        if (event.target.closest(".report-node")) return;
+        pan = {x: event.clientX, y: event.clientY,
+          startX: state.viewport.x, startY: state.viewport.y};
+        svg.setPointerCapture(event.pointerId);
+      });
+      svg.addEventListener("pointermove", event => {
+        if (!pan) return;
+        state.viewport.x = pan.startX + event.clientX - pan.x;
+        state.viewport.y = pan.startY + event.clientY - pan.y;
+        const world = svg.querySelector("#report-world");
+        world?.setAttribute("transform", `translate(${state.viewport.x}
+          ${state.viewport.y}) scale(${state.viewport.zoom})`);
+      });
+      svg.addEventListener("pointerup", event => {
+        pan = null;
+        try { svg.releasePointerCapture(event.pointerId); } catch (_) {}
+      });
+      render();
+    })();
+    </script>
+    """
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DeepVault report — {safe(target_name)}</title>
-  <style>
-    body {{ font: 15px/1.55 Inter, system-ui, sans-serif; color: #18221d;
-      max-width: 900px; margin: 0 auto; padding: 48px; }}
-    header {{ border-bottom: 3px solid #1d7a4d; margin-bottom: 32px; }}
-    h1 {{ margin-bottom: 4px; }} h2 {{ margin-top: 32px; }}
-    .summary, .finding {{ background: #f3f7f4; border: 1px solid #d7e3da;
-      border-radius: 10px; padding: 18px; margin: 12px 0; }}
+  <title>{PRODUCT_FULL_NAME} report — {safe(target_name)}</title>
+	  <style>
+	    body {{ font: 15px/1.55 Inter, system-ui, sans-serif; color: #18221d;
+	      max-width: 1180px; margin: 0 auto; padding: 48px; }}
+	    header {{ border-bottom: 3px solid #1d7a4d; margin-bottom: 32px; }}
+	    h1 {{ margin-bottom: 4px; }} h2 {{ margin-top: 32px; }}
+      a {{ color: #1e5c98; }}
+      .report-nav {{ position: sticky; top: 0; z-index: 20; display: flex;
+        gap: 8px; flex-wrap: wrap; padding: 10px; margin: 0 0 18px;
+        border: 1px solid #ccd9e6; border-radius: 9px;
+        background: rgba(255,255,255,.96); }}
+      .report-nav a {{ padding: 5px 8px; border-radius: 6px;
+        text-decoration: none; font-size: 12px; font-weight: 700; }}
+      .report-nav a:hover, .report-nav a:focus {{ background: #e7f0f8; }}
+	    .plain-review {{ border: 2px solid #284e7a; border-radius: 14px;
+	      padding: 24px; margin: 22px 0 32px; background: #f4f8fc; }}
+	    .plain-review > h2:first-of-type {{ margin-top: 4px; font-size: 28px; }}
+	    .eyebrow {{ color: #284e7a; font-size: 12px; font-weight: 800;
+	      letter-spacing: .08em; }}
+	    .verdict-copy {{ font-size: 17px; }}
+	    .review-counts {{ display: grid; grid-template-columns: repeat(4, 1fr);
+	      gap: 8px; margin: 20px 0; }}
+	    .review-counts div {{ border: 1px solid #ccd9e6; border-radius: 8px;
+	      padding: 12px; background: white; }}
+	    .review-counts strong, .review-counts span {{ display: block; }}
+	    .review-counts strong {{ font-size: 24px; }}
+	    .review-counts span {{ color: #52635a; font-size: 11px;
+	      text-transform: uppercase; }}
+	    .how-to-read {{ border-left: 4px solid #d09a00; padding: 10px 14px;
+	      margin: 18px 0; background: #fff7db; }}
+	    .how-to-read p {{ margin: 4px 0 0; }}
+	    .review-lead {{ display: grid; grid-template-columns: 34px 1fr; gap: 12px;
+	      border: 1px solid #d7e3da; border-left: 4px solid #d09a00;
+	      border-radius: 9px; padding: 14px; margin: 9px 0; background: white; }}
+	    .review-lead h3, .plain-point h3 {{ margin: 0 0 5px; }}
+	    .rank {{ display: grid; place-items: center; width: 30px; height: 30px;
+	      border-radius: 50%; background: #284e7a; color: white; font-weight: 800; }}
+	    .review-badge {{ display: inline-block; border-radius: 999px;
+	      padding: 3px 8px; background: #fff0bb; color: #795900;
+	      font-size: 11px; font-weight: 800; text-transform: uppercase; }}
+	    .citations {{ display: block; color: #8a2631; font: 11px ui-monospace,
+	      SFMono-Regular, monospace; margin-top: 7px; overflow-wrap: anywhere; }}
+      .citations a {{ display: inline-block; padding: 2px 5px; margin: 2px;
+        border: 1px solid #dfb3ba; border-radius: 4px; color: #8a2631;
+        background: #fff; text-decoration: none; }}
+      .citations a:hover, .citations a:focus {{ color: white;
+        background: #8a2631; }}
+	    .review-link {{ display: inline-block; margin-top: 8px; color: #1e5c98; }}
+	    .plain-grid {{ display: grid; grid-template-columns: 1fr 1fr;
+	      gap: 18px; margin-top: 22px; }}
+	    .plain-point {{ border-top: 1px solid #d7e3da; padding: 12px 0; }}
+	    .cautions {{ padding-left: 20px; }}
+	    .cautions li {{ margin: 0 0 14px; }}
+	    .privacy-note {{ background: #fae9ec; border: 1px solid #dfb3ba;
+	      border-radius: 8px; padding: 12px; color: #742c37; }}
+	    .summary, .finding {{ background: #f3f7f4; border: 1px solid #d7e3da;
+	      border-radius: 10px; padding: 18px; margin: 12px 0; }}
     .notice {{ background: #fff7db; border: 1px solid #ead58a;
       border-radius: 10px; padding: 14px; margin: 12px 0; }}
     .meta {{ color: #52635a; font-size: 13px; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ border-bottom: 1px solid #d7e3da; padding: 10px; text-align: left; }}
-    pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #e8f0ea;
-      border-radius: 8px; padding: 12px; font-size: 12px; }}
-    @media print {{ body {{ padding: 0; }} }}
+      .interactive-graph-section {{ scroll-margin-top: 70px; }}
+      .graph-controls {{ display: grid;
+        grid-template-columns: minmax(180px, 1fr) 180px 220px minmax(180px, 1fr) auto;
+        gap: 10px; align-items: end; padding: 12px; border: 1px solid #cbd8e4;
+        border-radius: 10px 10px 0 0; background: #f4f8fc; }}
+      .graph-controls label {{ display: grid; gap: 5px; color: #52635a;
+        font-size: 11px; font-weight: 700; }}
+      .graph-controls input, .graph-controls select, .graph-controls button {{
+        box-sizing: border-box; width: 100%; min-height: 38px; padding: 8px;
+        border: 1px solid #9fb2c5; border-radius: 6px; background: white; }}
+      .graph-controls button {{ color: white; background: #284e7a;
+        cursor: pointer; font-weight: 800; }}
+      .graph-counter {{ margin: 0; padding: 8px 12px; color: #52635a;
+        border: 1px solid #cbd8e4; border-top: 0; font-size: 12px; }}
+      .interactive-graph-layout {{ display: grid;
+        grid-template-columns: minmax(0, 1fr) 300px; min-height: 620px;
+        border: 1px solid #cbd8e4; border-top: 0; border-radius: 0 0 10px 10px;
+        overflow: hidden; }}
+      .report-graph-stage {{ position: relative; min-width: 0;
+        background-color: #081525; background-image:
+          linear-gradient(rgba(100,124,151,.12) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(100,124,151,.12) 1px, transparent 1px);
+        background-size: 24px 24px; }}
+      #report-graph {{ display: block; width: 100%; height: 620px;
+        touch-action: none; }}
+      #report-graph line {{ stroke: #69788e; stroke-width: 1.5;
+        marker-end: url(#report-arrow); }}
+      #report-graph line.uncertain {{ stroke-dasharray: 6 5; opacity: .7; }}
+      .report-node {{ cursor: pointer; outline: none; }}
+      .report-node circle {{ stroke: rgba(255,255,255,.8); stroke-width: 2; }}
+      .report-node.selected circle, .report-node:focus-visible circle {{
+        stroke: #ffda66; stroke-width: 5; }}
+      .report-node text {{ fill: #091321; font-size: 17px; font-weight: 900;
+        text-anchor: middle; pointer-events: none; }}
+      .report-node .report-node-label {{ fill: #f4f8fc; font-size: 9px;
+        paint-order: stroke; stroke: #081525; stroke-width: 3px; }}
+      .graph-instructions {{ position: absolute; left: 12px; bottom: 10px;
+        max-width: calc(100% - 44px); margin: 0; padding: 7px 9px;
+        color: #c3d0de; border: 1px solid #40536b; border-radius: 6px;
+        background: rgba(8,21,37,.9); font-size: 10px; }}
+      #report-graph-inspector {{ padding: 18px; border-left: 1px solid #cbd8e4;
+        background: #f4f8fc; overflow: auto; }}
+      #report-graph-inspector h3 {{ margin-top: 0; overflow-wrap: anywhere; }}
+      #report-graph-inspector h4 {{ margin: 20px 0 7px; color: #52635a;
+        font-size: 11px; text-transform: uppercase; }}
+      .inspector-status {{ padding: 9px; border-left: 3px solid #d09a00;
+        background: #fff7db; }}
+      .inspector-evidence {{ display: flex; flex-wrap: wrap; gap: 5px; }}
+      .inspector-evidence a {{ padding: 3px 5px; border: 1px solid #dfb3ba;
+        border-radius: 4px; color: #8a2631; background: white;
+        font: 10px ui-monospace, monospace; text-decoration: none; }}
+      .inspector-peer {{ display: block; width: 100%; padding: 8px 0;
+        border: 0; border-top: 1px solid #ccd9e6; color: #1e5c98;
+        background: transparent; text-align: left; cursor: pointer; }}
+      .evidence-record {{ scroll-margin-top: 70px; }}
+	    pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #e8f0ea;
+	      border-radius: 8px; padding: 12px; font-size: 12px; }}
+	    details.technical {{ margin: 14px 0; }}
+	    details.technical summary {{ cursor: pointer; color: #284e7a;
+	      font-weight: 800; }}
+	    @media (max-width: 680px) {{
+	      body {{ padding: 22px; }}
+	      .review-counts, .plain-grid {{ grid-template-columns: 1fr 1fr; }}
+        .graph-controls {{ grid-template-columns: 1fr; }}
+        .interactive-graph-layout {{ grid-template-columns: 1fr; }}
+        #report-graph-inspector {{ border-left: 0; border-top: 1px solid #cbd8e4; }}
+	    }}
+	    @media print {{
+	      body {{ padding: 0; }}
+	      details.technical {{ display: block; }}
+	      details.technical > * {{ display: block; }}
+	    }}
   </style>
 </head>
-<body>
-  <header>
-    <p>DEEPVAULT · AUTHORIZED PERSON INTELLIGENCE</p>
+<body id="report-top">
+	  <header>
+    <p>{PRODUCT_VENDOR} · {PRODUCT_NAME.upper()} · PERSON INTELLIGENCE REPORT</p>
     <h1>{safe(target_name)}</h1>
+    <p class="meta">{PRODUCT_TAGLINE}</p>
     <p class="meta">Report {safe(report.get("report_id"))} ·
-      {safe(report.get("generated_at"))}</p>
+	      {safe(report.get("generated_at"))}</p>
   </header>
-  <section class="summary">
+  <nav class="report-nav" aria-label="Report sections">
+    <a href="#report-top">Summary</a>
+    <a href="#findings">Findings</a>
+    <a href="#interactive-graph">Interactive graph</a>
+    <a href="#source-coverage">Source coverage</a>
+    <a href="#evidence-appendix">Evidence appendix</a>
+    <a href="#analyst-decisions">Analyst decisions</a>
+  </nav>
+  <div class="notice"><strong>Responsible-use boundary:</strong> this report
+    presents cited public evidence for human review. It must not be used to infer
+    mental health, diagnose personality, infer protected traits, or make an
+    automated employment decision.</div>
+  {review_overview}
+	  <section class="summary">
     <h2>Executive summary</h2>
     <p>{safe(report.get("executive_summary"))}</p>
     <p><strong>Identity confidence:</strong>
-      {safe(report.get("identity_confidence"))} ·
-      <strong>Risk:</strong> {safe(report.get("overall_risk"))} ·
-      <strong>Coverage:</strong> {safe(report.get("coverage_assessment"))} ·
+      {safe(identity_label(report.get("identity_confidence")))} ·
+      <strong>Risk:</strong> {safe(risk_label(report.get("overall_risk")))} ·
+      <strong>Coverage:</strong>
+      {safe(coverage_label(report.get("coverage_assessment")))} ·
       <strong>Evidence:</strong> {safe(report.get("evidence_count"))}</p>
-    <p class="meta">Evidence citations:
-      {safe(", ".join(report.get("executive_summary_evidence_ids", [])))}</p>
+    <p class="meta">Evidence citations:</p>
+      {evidence_citations(report.get("executive_summary_evidence_ids"))}
   </section>
-  <h2>Findings</h2>
+  <h2 id="findings">Findings</h2>
   {findings or "<p>No evidence-backed findings were produced.</p>"}
   <h2>Evidence-first identity analysis</h2>
   <p><strong>Graph:</strong> {safe(len(graph_nodes))} nodes ·
     {safe(len(graph_edge_items))} relationships ·
     {safe(len(primary_graph_hypotheses))} reviewable hypotheses ·
     {safe(secondary_graph_hypothesis_count)} low-signal hypotheses retained in JSON</p>
-  {graph_hypotheses or "<p>No evidence-backed identity hypotheses were produced.</p>"}
-  <h3>Provenance relationships</h3>
-  <table><thead><tr><th>Relation</th><th>From</th><th>To</th>
-    <th>Confidence</th><th>Status</th><th>Evidence IDs</th></tr></thead>
-    <tbody>{graph_edges}</tbody></table>
+	  {graph_hypotheses or "<p>No evidence-backed identity hypotheses were produced.</p>"}
+    {interactive_graph}
+	  <details class="technical">
+	    <summary>Full technical provenance · {safe(len(graph_edge_items))} relationships</summary>
+	    <p class="meta">These rows document which tool published each observation.
+	      They are not additional identity matches.</p>
+	    <table><thead><tr><th>Relation</th><th>From</th><th>To</th>
+	      <th>Confidence</th><th>Status</th><th>Evidence IDs</th></tr></thead>
+	      <tbody>{graph_edges}</tbody></table>
+	  </details>
   <h3>Ranked analyst pivots</h3>
   {graph_pivots or "<p>No evidence-backed pivots were produced.</p>"}
   {temporal_section}
-  <h2>Source coverage</h2>
+  <h2 id="source-coverage">Source coverage</h2>
   <table><thead><tr><th>Source</th><th>Evidence</th><th>Status</th>
     <th>Coverage note</th><th>Evidence IDs</th></tr></thead>
     <tbody>{coverage}</tbody></table>
@@ -1668,8 +3939,11 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
   {timeline or "<p>No source-provided event dates were available. Collection timestamps are intentionally excluded because they are not person-history events.</p>"}
   <h2>Contradictions</h2>
   {contradictions or "<p>No contradiction entries were produced.</p>"}
-  <h2>Evidence appendix</h2>
+  <h2 id="evidence-appendix">Evidence appendix</h2>
   {evidence_ledger or "<p>No evidence records were produced.</p>"}
+  <h2 id="analyst-decisions">Analyst review decisions</h2>
+  <p>{safe(adjudication_summary.get("notice") or "No analyst exclusions were recorded.")}</p>
+  {adjudication_decisions or "<p>No analyst decisions were recorded.</p>"}
   <h2>Recommendations</h2>
   <ul>{recommendations}</ul>
   <h2>Limitations</h2>
@@ -1684,13 +3958,19 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
 async def download_html_report(investigation_id: UUID) -> Response:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
-        report = (investigation.case_metadata or {}).get("structured_report")
-        if not isinstance(report, dict):
+        report = _effective_report(investigation)
+        if report is None:
             raise HTTPException(status_code=409, detail="Report is not ready")
-        report = _redact_for_display(report)
-        filename = f"deepvault-{investigation_id}.html"
+        graph_document = _graph_document(investigation)
+        review_summary = graph_document.get("review_summary", {})
+        filename = f"{EXPORT_PREFIX}-{investigation_id}.html"
         return Response(
-            render_report_html(report, investigation.target_name),
+            render_report_html(
+                report,
+                investigation.target_name,
+                review_summary=review_summary,
+                graph_document=graph_document,
+            ),
             media_type="text/html",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )

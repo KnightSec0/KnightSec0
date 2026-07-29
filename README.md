@@ -1,11 +1,15 @@
-# 🕵️ DeepVault — The OSINT Investigation Framework
+# SIGMA WorldAtlas Intelligence
 
-**DeepVault** is a locally deployed, Docker-orchestrated open-source
+**SIGMA WorldAtlas Intelligence** (short name: **WorldAtlas**) is a locally
+deployed, Docker-orchestrated open-source
 intelligence (OSINT) platform for authorized investigations of individuals. It
 collects and correlates public-profile, person-search, breach-metadata, and
 authorized infrastructure evidence in a single auditable pipeline.
 
-> ⚠️ **This tool is for authorized security professionals conducting lawful investigations only.** Authorization is your responsibility. DeepVault provides the engine; you provide the legal mandate.
+> **From public evidence to defensible insight.** WorldAtlas is a SIGMA
+> Intelligence Platform.
+
+> ⚠️ **This tool is for authorized security professionals conducting lawful investigations only.** Authorization is your responsibility. WorldAtlas provides the engine; you provide the legal mandate.
 
 ---
 
@@ -50,7 +54,8 @@ credentials into the dashboard.
 | Data Breaches | Breach names, dates and exposed data classes (no credentials) | HIBP |
 | Passive scanning | Results from an authorized SpiderFoot server | SpiderFoot |
 | Analyst transforms | Bounded, authorization-gated pivots with shared evidence normalization | Blackbird, theHarvester, Subfinder, httpx, GHunt, ExifTool, Tesseract, Poppler |
-| Interactive mapping | Live graph/SSE APIs and evidence-preserving Mapping Tool schema v2 export | OSINT-Mapping-Tool |
+| Investigation workbench | Non-expert Overview, prioritized review queue, simplified/full Maltego-style graphs, node inspector, filters, clustering, comparison, saved layouts and evidence-safe exports | Native localhost dashboard |
+| Analyst adjudication | Accept, retain for review, or exclude false-positive evidence with reasons, reviewer notes, restoration, and append-only audit history | Native localhost dashboard |
 | Infrastructure | Explicitly authorized literal-IP enrichment | Shodan, Censys |
 | Result quality | Content-aware confidence gates, catalogue-family deduplication, sensitive-result quarantine and coverage-aware conclusions | Local quality engine |
 | Correlation | Provenance normalization, identity graph, hypotheses and contradiction detection | Local correlation engine |
@@ -62,7 +67,7 @@ credentials into the dashboard.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     DEEPVAULT ORCHESTRATOR (Celery + Python)         │
+│                    WORLDATLAS ORCHESTRATOR (Celery + Python)         │
 │  ┌────────────┐  ┌───────────┐  ┌──────────┐  ┌──────────────────┐ │
 │  │ Surface    │  │ Identity  │  │ Deep Web │  │ Dark Web / Tor   │ │
 │  │ Recon Layer│  │ Correlation│  │ Layer    │  │ Layer            │ │
@@ -138,7 +143,20 @@ See [Evidence-backed transforms and mapping](docs/TRANSFORMS.md) for the
 transform contract, SpiderFoot result ingestion, mapping APIs, and the macOS
 collector workflow.
 
-### 8. Structured Reporting Engine (orchestrator/reporting/person_report.py)
+### 8. Investigation workbench (dashboard)
+- Combines permitted connector results into one interactive person-identity graph
+- Opens with a plain-language Overview that distinguishes supported results,
+  review-first leads, unverified candidates, hidden noise, and source coverage
+- Provides simplified/full Graph, Evidence, Timeline, and Report views in a
+  dark-blue/red interface
+- Explains every node and relationship with evidence IDs, confidence, source
+  provenance, limitations, and manual review pivots
+- Exports WorldAtlas JSON, GraphML, GEXF, CSV, and Mapping Tool schema v2
+
+See [Investigation workbench](docs/INVESTIGATION_WORKBENCH.md) for graph
+controls, normalized API fields, export formats, and pivot safety.
+
+### 9. Structured Reporting Engine (orchestrator/reporting/person_report.py)
 - Produces evidence-linked findings with an executive summary and risk level
 - Includes identity hypotheses, provenance, temporal changes, timeline,
   contradictions, source coverage, limitations, and recommendations
@@ -184,10 +202,15 @@ persisted and included in reports.
 5. For a repeat scan, explicitly enable comparison and reuse the same unexpired
    authorization reference, purpose, and source scope.
 6. Start the case and keep the page open to see live progress updates.
-7. Review evidence citations, identity hypotheses, graph provenance, temporal
-   caveats, contradictions, timeline, and source coverage before accepting any
-   identity match.
-8. Download the completed report as JSON or HTML.
+7. Start with Overview: read the verdict, review-first queue, coverage gaps, and
+   evidence IDs. “Check first” is a manual-review priority, not a verified
+   identity.
+8. Use the simplified Graph to inspect the strongest leads. Switch to the full
+   technical graph only when publisher provenance or suppressed audit records
+   are needed.
+9. Review Evidence, Timeline, and Report tabs before accepting an identity match.
+9. Download the report or export the graph as JSON, GraphML, GEXF, CSV, or
+   Mapping Tool schema v2.
 
 The dashboard refreshes case state every few seconds; refreshing the browser
 does not stop the worker. A report is made available only after a structured
@@ -272,11 +295,18 @@ docker compose up -d --build
 
 ## 🔒 Legal & Ethical Use
 
-DeepVault is designed for authorized security assessments, background checks with consent, and lawful investigations only. By using this software you agree to:
+WorldAtlas is designed for authorized security assessments, background checks with consent, and lawful investigations only. By using this software you agree to:
 
 - Obtain explicit written authorization before investigating any target
 - Comply with all applicable laws (GDPR, CFAA, DPA, etc.)
 - Maintain chain of custody for all collected evidence
+
+WorldAtlas is an evidence-review system, not an automated employment-decision or
+psychological-profiling system. Do not use it to diagnose mental health, infer
+protected traits, derive personality or intimate preferences, or automatically
+rank, reject, or recommend a person for employment. Employment-related use must
+remain limited to relevant, consented, verifiable facts with documented human
+review and applicable legal safeguards.
 - Respect platform Terms of Service during data collection
 - Not use this tool for stalking, harassment, or any unlawful purpose
 

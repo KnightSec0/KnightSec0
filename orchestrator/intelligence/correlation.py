@@ -14,16 +14,18 @@ _RELIABILITY_BONUS = {
     SourceReliability.UNKNOWN: 0.0,
 }
 
+_PROFILE_TYPES = {
+    "github_profile",
+    "person_search_result",
+    "public_profile",
+    "social_profile",
+    "web_profile",
+}
+
 
 def _canonical_value(evidence_type: str, value: str) -> str:
     text = value.strip()
-    if evidence_type in {
-        "github_profile",
-        "public_profile",
-        "social_profile",
-        "web_profile",
-        "source_url",
-    }:
+    if evidence_type in _PROFILE_TYPES | {"source_url"}:
         canonical = canonical_profile_url(text)
         if canonical is not None:
             return canonical
@@ -32,7 +34,8 @@ def _canonical_value(evidence_type: str, value: str) -> str:
 
 def status_from_score(score: float) -> IdentityStatus:
     if score >= 0.92:
-        return IdentityStatus.CONFIRMED
+        # Confirmation is an analyst decision, never a score threshold.
+        return IdentityStatus.HIGHLY_PROBABLE
     if score >= 0.80:
         return IdentityStatus.HIGHLY_PROBABLE
     if score >= 0.65:
@@ -110,6 +113,40 @@ def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:
         )
         # Preserve the representative's normalized public fields for report
         # rendering while retaining the full observation ledger for provenance.
+        quality = representative.metadata.get("quality")
+        quality = dict(quality) if isinstance(quality, dict) else None
+        if (
+            representative.type.casefold() in _PROFILE_TYPES
+            and quality is not None
+            and quality.get("verification_status") not in {
+                "catalogue_only",
+                "inaccessible",
+                "insufficient_context",
+                "quarantined",
+                "rejected",
+            }
+        ):
+            if identity_status == IdentityStatus.UNRELATED:
+                quality["verification_status"] = "rejected"
+                quality["category"] = "rejected_observations"
+            elif identity_status in {
+                IdentityStatus.POSSIBLE,
+                IdentityStatus.PROBABLE,
+                IdentityStatus.HIGHLY_PROBABLE,
+            }:
+                quality["verification_status"] = identity_status.value
+                quality["category"] = (
+                    "probable_profiles"
+                    if identity_status in {
+                        IdentityStatus.PROBABLE,
+                        IdentityStatus.HIGHLY_PROBABLE,
+                    }
+                    else "possible_profiles"
+                )
+            else:
+                quality["verification_status"] = "unverified"
+                quality["category"] = "unverified_profiles"
+
         merged_metadata = {
             **representative.metadata,
             "observations": [item.safe_dump() for item in group],
@@ -117,6 +154,8 @@ def correlate_evidence(evidence_items: list[Evidence]) -> list[Evidence]:
             "collector_count": len(sources),
             "independence_groups": independence_groups,
         }
+        if quality is not None:
+            merged_metadata["quality"] = quality
 
         correlated.append(
             representative.model_copy(

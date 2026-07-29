@@ -1,8 +1,8 @@
 # Evidence-backed transforms and mapping
 
-DeepVault transforms are analyst-triggered, bounded collection jobs. They turn
+WorldAtlas transforms are analyst-triggered, bounded collection jobs. They turn
 one authorized entity into normalized evidence and then rebuild the case graph
-and report. A transform is not an automatic identity claim, and DeepVault never
+and report. A transform is not an automatic identity claim, and WorldAtlas never
 recursively executes a suggested pivot.
 
 ## What is implemented
@@ -106,6 +106,10 @@ The dashboard provides:
 | `GET` | `/api/investigations/{id}/graph` | Read the live evidence graph |
 | `GET` | `/api/investigations/{id}/events` | Stream case and transform changes over SSE |
 | `POST` | `/api/investigations/{id}/graph-layout` | Save reviewed node positions |
+| `GET` | `/api/investigations/{id}/graph.json` | Download the full normalized graph |
+| `GET` | `/api/investigations/{id}/graph.graphml` | Download evidence-linked GraphML |
+| `GET` | `/api/investigations/{id}/graph.gexf` | Download GEXF for graph tools |
+| `GET` | `/api/investigations/{id}/graph.csv` | Download flattened entities and relationships |
 | `GET` | `/api/investigations/{id}/mapping.osint.json` | Download Mapping Tool schema v2 |
 
 Example transform request:
@@ -120,10 +124,12 @@ Example transform request:
 }
 ```
 
-The mapping export retains confidence, identity status, evidence IDs, source
-names, independent-source count, observation dates, and the full provenance
-chain. File import is the compatibility path today. The graph and event APIs
-are the integration contract for a future embedded mapper.
+The embedded localhost workbench now consumes the graph contract directly.
+The normalized response includes entities, relationships, clusters, source/type
+statistics, evidence IDs, reasons, and provenance chains. The Mapping schema
+export retains confidence, identity status, evidence IDs, source names,
+independent-source count, observation dates, and the full provenance chain.
+GraphML and CSV retain relationship evidence IDs for external audit.
 
 Install the separate mapping UI on macOS:
 
@@ -137,7 +143,7 @@ npm install @dagrejs/dagre zod dompurify fuse.js
 npm run dev -- --host 127.0.0.1
 ```
 
-Keep it on `127.0.0.1`. Download `mapping.osint.json` from the DeepVault case
+Keep it on `127.0.0.1`. Download `mapping.osint.json` from the WorldAtlas case
 and import it into the mapping tool. Do not expose its development server or
 investigation files publicly.
 
@@ -179,7 +185,7 @@ pipx install ghunt
 ghunt login
 ```
 
-GHunt is opt-in. Manage its login outside DeepVault and never place Google
+GHunt is opt-in. Manage its login outside WorldAtlas and never place Google
 cookies or session material in case metadata, evidence, reports, or `.env`.
 
 Configure absolute executable locations in the shell that starts the worker:
@@ -249,7 +255,7 @@ sensitive result types.
 
 ## Licensing boundary
 
-DeepVault remains MIT-licensed. Third-party tools are invoked as separately
+WorldAtlas remains MIT-licensed. Third-party tools are invoked as separately
 installed programs and communicate through files, stdout, or HTTP; their source
 is not copied into this repository. Preserve each tool's license and notices.
 In particular, keep GPL/AGPL components such as the Mapping Tool and GHunt
