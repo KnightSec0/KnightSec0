@@ -368,19 +368,53 @@
     .graph-mode-banner span { color: var(--muted); font-size: 9px; }
     .graph-mode-banner + .graph-toolbar { border-radius: 0; }
     .graph-toolbar {
-      display: grid; grid-template-columns: minmax(140px, .8fr) minmax(140px, .8fr)
-        minmax(170px, 1fr) minmax(200px, 1fr) auto;
+      display: grid; grid-template-columns: minmax(210px, 1.25fr)
+        minmax(125px, .7fr) minmax(125px, .7fr) minmax(170px, .9fr)
+        minmax(180px, .9fr) auto;
       gap: 10px; align-items: end;
       padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px 10px 0 0;
       background: #0b1931;
     }
     .graph-toolbar label { margin: 0; }
-    .graph-toolbar select { padding: 8px 10px; margin-top: 5px; }
+    .graph-toolbar select, .graph-toolbar input {
+      padding: 8px 10px; margin-top: 5px;
+    }
     .confidence-filter { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; }
     .confidence-filter input { grid-column: 1 / -1; padding: 0; accent-color: var(--red); }
     .graph-buttons { display: flex; gap: 6px; flex-wrap: wrap; justify-content: end; }
     .graph-buttons .secondary { padding: 8px 10px; }
     .secondary.active { border-color: var(--red); color: #fff; background: #351528; }
+    .graph-entity-browser {
+      display: grid; gap: 8px; padding: 10px 12px;
+      border: 1px solid var(--line); border-top: 0; background: #09172e;
+    }
+    .graph-entity-browser > div:first-child {
+      display: flex; align-items: baseline; gap: 9px;
+    }
+    .graph-entity-browser > div:first-child strong { font-size: 10px; }
+    .graph-entity-browser > div:first-child span {
+      color: var(--muted); font-size: 9px;
+    }
+    .graph-entity-buttons {
+      display: flex; gap: 6px; padding-bottom: 3px; overflow-x: auto;
+    }
+    .graph-entity-buttons button {
+      display: grid; gap: 2px; flex: 0 0 auto; max-width: 260px;
+      padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px;
+      color: var(--ink); background: #0d1b34; text-align: left;
+    }
+    .graph-entity-buttons button:hover,
+    .graph-entity-buttons button:focus-visible,
+    .graph-entity-buttons button.active {
+      border-color: var(--red); background: #241525; outline: none;
+    }
+    .graph-entity-buttons button strong {
+      overflow: hidden; font-size: 9px; text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .graph-entity-buttons button span, .directory-more {
+      color: var(--muted); font-size: 8px; white-space: nowrap;
+    }
     .graph-shell {
       display: grid; grid-template-columns: minmax(0, 1fr) minmax(250px, 310px);
       min-height: 650px; border: 1px solid var(--line); border-top: 0;
@@ -469,6 +503,31 @@
     }
     .inspector-score strong { font-size: 21px; color: var(--green); }
     .inspector-score span { color: var(--muted); font-size: 10px; }
+    .inspector-facts {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+      margin-top: 8px;
+    }
+    .inspector-facts div {
+      min-width: 0; padding: 8px; border: 1px solid var(--line);
+      border-radius: 7px; background: #071326;
+    }
+    .inspector-facts strong, .inspector-facts span { display: block; }
+    .inspector-facts strong {
+      overflow: hidden; color: var(--ink); font-size: 12px;
+      text-overflow: ellipsis; white-space: nowrap;
+    }
+    .inspector-facts span {
+      margin-top: 3px; color: var(--muted); font-size: 7px;
+      text-transform: uppercase;
+    }
+    .inspector-conclusion {
+      display: grid; gap: 3px; margin-top: 8px; padding: 9px;
+      border-left: 3px solid var(--amber); background: #201c12;
+    }
+    .inspector-conclusion strong {
+      color: var(--muted); font-size: 8px; text-transform: uppercase;
+    }
+    .inspector-conclusion span { color: var(--ink); font-size: 11px; }
     .inspector-link { display: block; text-align: center; margin-top: 10px; }
     .inspector-warning {
       padding: 10px; border: 1px solid #62404b; border-radius: 8px;
@@ -494,6 +553,30 @@
       overflow-wrap: anywhere;
     }
     .pivot-card p { margin: 0; }
+    .inspector-evidence-card {
+      display: grid; gap: 7px; padding: 10px; margin: 7px 0;
+      border: 1px solid var(--line); border-radius: 8px; background: #071326;
+    }
+    .inspector-evidence-card > div {
+      display: flex; align-items: center; gap: 6px;
+    }
+    .inspector-evidence-card > div strong {
+      color: var(--muted); font-size: 9px;
+    }
+    .inspector-evidence-card p {
+      margin: 0; color: var(--ink); overflow-wrap: anywhere;
+    }
+    .inspector-evidence-card dl {
+      display: grid; grid-template-columns: 72px 1fr; gap: 4px 7px;
+      margin: 0;
+    }
+    .inspector-evidence-card dt {
+      color: var(--muted); font-size: 8px;
+    }
+    .inspector-evidence-card dd {
+      margin: 0; color: #c1cde1; font-size: 8px; overflow-wrap: anywhere;
+    }
+    .inspector-evidence-card > a { color: var(--blue); font-size: 9px; }
     .attribute-list { display: grid; grid-template-columns: minmax(70px, .7fr) 1fr; gap: 5px 8px; }
     .attribute-list dt { color: var(--muted); font-size: 9px; }
     .attribute-list dd { margin: 0; color: var(--ink); font-size: 9px; overflow-wrap: anywhere; }

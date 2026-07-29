@@ -140,6 +140,7 @@
         source: "all",
         type: "all",
         direction: "all",
+        graphQuery: "",
         minimumConfidence: 0,
         showLabels: false,
         collapsed: false,
@@ -316,10 +317,13 @@
           || String(left.label).localeCompare(String(right.label)))
         .slice(0, 12);
     const simpleIds = new Set(simpleCandidates.map(node => node.id));
+    const graphQuery = state.graphQuery.trim().toLocaleLowerCase();
     let records = data.records.filter(node => {
       const keepTarget = node.kind === "authorized_target";
+      const keepSelected = state.selectedIds.has(node.id);
       const simpleMatch = !state.simpleGraph
         || keepTarget
+        || keepSelected
         || simpleIds.has(node.id);
       const privacyMatch = state.showSuppressed
         || node.reviewPriority !== "suppressed"
@@ -333,7 +337,21 @@
       const confidenceMatch = node.confidence >= state.minimumConfidence
         || node.kind === "authorized_target"
         || node.kind === "public_source";
-      return simpleMatch && privacyMatch && sourceMatch && typeMatch && confidenceMatch;
+      const queryText = [
+        node.id,
+        node.label,
+        node.kind,
+        node.attributes?.url,
+        node.attributes?.email,
+        ...(node.sources || []),
+        ...(node.evidence_ids || []),
+      ].join(" ").toLocaleLowerCase();
+      const queryMatch = keepTarget
+        || keepSelected
+        || !graphQuery
+        || queryText.includes(graphQuery);
+      return simpleMatch && privacyMatch && sourceMatch && typeMatch
+        && confidenceMatch && queryMatch;
     });
     let allowed = new Set(records.map(node => node.id));
     if (state.focusNodeId) {
@@ -668,6 +686,11 @@
           ? "Show full technical graph" : "Return to simplified graph"}</button>
       </div>
       <section class="graph-toolbar">
+        <label>Find an entity
+          <input id="graph-entity-search" type="search"
+            value="${html(state.graphQuery)}"
+            placeholder="Name, URL, source or evidence ID">
+        </label>
         <label>Source
           <select id="graph-source-filter">
             <option value="all">All cited sources</option>
@@ -711,6 +734,22 @@
           <button class="secondary" id="graph-save" type="button">Save layout</button>
         </div>
       </section>
+      <section class="graph-entity-browser" aria-label="Visible entity directory">
+        <div><strong>Visible entity directory</strong>
+          <span>Choose an entity here or directly on the map.</span></div>
+        <div class="graph-entity-buttons">
+          ${visible.nodes.slice(0, 36).map(node => `
+            <button class="${state.selectedIds.has(node.id) ? "active" : ""}"
+              type="button" data-graph-entity-id="${html(node.id)}">
+              <strong>${html(node.label)}</strong>
+              <span>${html(titleCase(node.kind))} · ${html(confidenceLabel(node))}</span>
+            </button>`).join("")
+            || `<span class="sub">No entity matches the active filters.</span>`}
+          ${visible.nodes.length > 36
+            ? `<span class="directory-more">Refine the search to inspect the remaining
+              ${visible.nodes.length - 36} entities.</span>` : ""}
+        </div>
+      </section>
       <section class="graph-shell">
         <div class="graph-stage">
           <svg id="identity-map" viewBox="0 0 1000 650"
@@ -739,6 +778,40 @@
           `<button class="chip evidence-source-link" type="button"
             data-evidence-source="${html(source)}">${html(source)}</button>`).join("")}</div>`
       : `<p class="sub">No publisher metadata on this node.</p>`;
+  }
+
+  function inspectorEvidenceMarkup(node, data) {
+    const evidenceItems = (node.evidence_ids || [])
+      .map(evidenceId => data.evidenceById[evidenceId])
+      .filter(Boolean);
+    if (!evidenceItems.length) {
+      return `<p class="sub">No collected evidence record is attached to this
+        case-context entity.</p>`;
+    }
+    return evidenceItems.slice(0, 10).map(entry => {
+      const sourceUrl = safeUrl(entry.source_url);
+      const decision = data.adjudications?.[entry.id]?.status;
+      return `<article class="inspector-evidence-card">
+        <div><button class="evidence-link" type="button"
+          data-evidence-focus="${html(entry.id)}">${html(entry.id)}</button>
+          <strong>${html(entry.source || "unknown source")}</strong></div>
+        <p>${html(entry.value || "No display value")}</p>
+        <dl>
+          <dt>Type</dt><dd>${html(titleCase(entry.type))}</dd>
+          <dt>Confidence</dt><dd>${html(percent(entry.confidence))}</dd>
+          <dt>Identity</dt><dd>${html(identityLabel(
+            entry.identity_status || "insufficient_evidence",
+          ))}</dd>
+          <dt>Decision</dt><dd>${html(decisionLabel(decision))}</dd>
+          <dt>Observed</dt><dd>${entry.observed_at
+            ? html(new Date(entry.observed_at).toLocaleString()) : "Not supplied"}</dd>
+        </dl>
+        ${sourceUrl ? `<a href="${html(sourceUrl)}" target="_blank"
+          rel="noreferrer">Open the exact public source</a>` : ""}
+      </article>`;
+    }).join("") + (evidenceItems.length > 10
+      ? `<p class="sub">Showing 10 of ${evidenceItems.length} records. Open the
+        Evidence tab for the complete cited ledger.</p>` : "");
   }
 
   function inspectorMarkup(item, state, data) {
@@ -791,6 +864,11 @@
       ),
     );
     const profileUrl = safeUrl(node.attributes?.url || node.label);
+    const ownershipConclusion = ["probable", "highly_probable", "confirmed"].includes(
+      node.identityStatus,
+    )
+      ? identityLabel(node.identityStatus)
+      : "Ownership not verified";
     return `
       <p class="eyebrow">${html(titleCase(node.kind))}</p>
       <h3>${html(node.label)}</h3>
@@ -799,6 +877,16 @@
         <span>${html(percent(node.confidence))} technical confidence ·
           ${html(identityLabel(node.identityStatus))}</span>
       </div>
+      <div class="inspector-facts">
+        <div><strong>${html((node.evidence_ids || []).length)}</strong>
+          <span>Evidence records</span></div>
+        <div><strong>${html(node.publisherCount || 0)}</strong>
+          <span>Publishing tools</span></div>
+        <div><strong>${html(decisionLabel(node.adjudicationStatus))}</strong>
+          <span>Analyst decision</span></div>
+      </div>
+      <div class="inspector-conclusion"><strong>Ownership conclusion</strong>
+        <span>${html(ownershipConclusion)}</span></div>
       ${nodeSourcesMarkup(node)}
       ${profileUrl ? `<a class="secondary inspector-link" href="${html(profileUrl)}"
         target="_blank" rel="noreferrer">Open cited public page</a>` : ""}
@@ -812,6 +900,8 @@
       <p class="evidence">${(node.evidence_ids || []).length
         ? evidenceReferences(node.evidence_ids || [], 20)
         : "Target context supplied by the case analyst"}</p>
+      <h4>Cited evidence details</h4>
+      ${inspectorEvidenceMarkup(node, data)}
       ${(node.evidence_ids || []).length
         && !["authorized_target", "public_source"].includes(node.kind)
         ? `<div class="inspector-actions">
@@ -1186,6 +1276,27 @@
         label?.setAttribute("y", (source.y + target.y) / 2 - 6);
       });
     };
+    const finishPointer = (event, cancelled = false) => {
+      if (dragging) {
+        const completed = dragging;
+        dragging = null;
+        try {
+          completed.element.releasePointerCapture(event.pointerId);
+        } catch (_) {}
+        if (!cancelled && !completed.moved) {
+          selectGraphEntity(
+            item,
+            state,
+            data,
+            completed.id,
+            completed.additive,
+          );
+        }
+        return;
+      }
+      pan = null;
+      try { svg.releasePointerCapture(event.pointerId); } catch (_) {}
+    };
     svg.addEventListener("wheel", event => {
       event.preventDefault();
       const cursor = point(event);
@@ -1203,6 +1314,12 @@
     });
     svg.addEventListener("pointermove", event => {
       if (dragging) {
+        if (
+          Math.abs(event.clientX - dragging.startClientX) > 4
+          || Math.abs(event.clientY - dragging.startClientY) > 4
+        ) {
+          dragging.moved = true;
+        }
         const cursor = point(event);
         state.positions.set(dragging.id, {
           x: (cursor.x - state.viewport.x) / state.viewport.zoom - dragging.offset.x,
@@ -1217,54 +1334,36 @@
       state.viewport.y = pan.viewport.y + cursor.y - pan.pointer.y;
       updateViewport();
     });
-    svg.addEventListener("pointerup", event => {
-      pan = null;
-      dragging = null;
-      try { svg.releasePointerCapture(event.pointerId); } catch (_) {}
-    });
+    svg.addEventListener("pointerup", event => finishPointer(event));
+    svg.addEventListener(
+      "pointercancel",
+      event => finishPointer(event, true),
+    );
     svg.querySelectorAll(".graph-node").forEach(element => {
       const nodeId = element.dataset.nodeId;
-      const selectNode = additive => {
-        if (additive) {
-          if (state.selectedIds.has(nodeId)) state.selectedIds.delete(nodeId);
-          else state.selectedIds.add(nodeId);
-        } else {
-          state.selectedIds = new Set([nodeId]);
-        }
-        if (state.direction === "all") {
-          updateInspector(item, state, data);
-          renderGraphSvg(item, state, data);
-        } else {
-          drawActiveGraph(item, state, data);
-        }
-      };
       element.addEventListener("pointerdown", event => {
+        event.preventDefault();
         event.stopPropagation();
         const cursor = point(event);
         const position = state.positions.get(nodeId);
         dragging = {
           id: nodeId,
+          element,
+          moved: false,
+          additive: event.shiftKey,
+          startClientX: event.clientX,
+          startClientY: event.clientY,
           offset: {
             x: (cursor.x - state.viewport.x) / state.viewport.zoom - position.x,
             y: (cursor.y - state.viewport.y) / state.viewport.zoom - position.y,
           },
         };
-        svg.setPointerCapture(event.pointerId);
-      });
-      element.addEventListener("click", event => {
-        event.stopPropagation();
-        selectNode(event.shiftKey);
+        element.setPointerCapture(event.pointerId);
       });
       element.addEventListener("keydown", event => {
         if (!["Enter", " "].includes(event.key)) return;
         event.preventDefault();
-        selectNode(event.shiftKey);
-      });
-      element.addEventListener("dblclick", event => {
-        event.preventDefault();
-        state.focusNodeId = nodeId;
-        state.selectedIds = new Set([nodeId]);
-        drawActiveGraph(item, state, data);
+        selectGraphEntity(item, state, data, nodeId, event.shiftKey);
       });
     });
     if (!visible.nodes.length) {
@@ -1273,11 +1372,14 @@
     }
   }
 
-  function updateInspector(item, state, data) {
-    const inspector = document.querySelector("#node-inspector");
-    if (!inspector) return;
-    inspector.innerHTML = inspectorMarkup(item, state, data);
-    bindInspector(item, state, data);
+  function selectGraphEntity(item, state, data, nodeId, additive = false) {
+    if (additive) {
+      if (state.selectedIds.has(nodeId)) state.selectedIds.delete(nodeId);
+      else state.selectedIds.add(nodeId);
+    } else {
+      state.selectedIds = new Set([nodeId]);
+    }
+    drawActiveGraph(item, state, data);
   }
 
   function bindEvidenceDecisionButtons(item, state, root = document) {
@@ -1360,8 +1462,7 @@
     });
     document.querySelectorAll(".graph-select-peer").forEach(button =>
       button.addEventListener("click", () => {
-        state.selectedIds = new Set([button.dataset.nodeId]);
-        drawActiveGraph(item, state, data);
+        selectGraphEntity(item, state, data, button.dataset.nodeId);
       }));
     document.querySelectorAll(".graph-pivot").forEach(button =>
       button.addEventListener("click", async () => {
@@ -1409,11 +1510,32 @@
       state.source = "all";
       state.type = "all";
       state.direction = "all";
+      state.graphQuery = "";
       state.minimumConfidence = 0;
       state.focusNodeId = null;
       state.selectedIds = new Set();
       drawActiveGraph(item, state, data);
     });
+    document.querySelector("#graph-entity-search")?.addEventListener(
+      "input",
+      event => {
+        state.graphQuery = event.target.value;
+        drawActiveGraph(item, state, data);
+        const search = document.querySelector("#graph-entity-search");
+        search?.focus();
+        search?.setSelectionRange(search.value.length, search.value.length);
+      },
+    );
+    document.querySelectorAll("[data-graph-entity-id]").forEach(button =>
+      button.addEventListener("click", event => {
+        selectGraphEntity(
+          item,
+          state,
+          data,
+          button.dataset.graphEntityId,
+          event.shiftKey,
+        );
+      }));
     document.querySelector("#graph-source-filter")?.addEventListener("change", event => {
       state.source = event.target.value;
       drawActiveGraph(item, state, data);

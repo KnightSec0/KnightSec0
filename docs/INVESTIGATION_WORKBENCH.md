@@ -19,8 +19,12 @@ available:
   It opens in simplified mode with the target and the strongest review leads;
   the full technical provenance graph remains one click away.
   Click or press Enter on a node to open its inspector, drag nodes to arrange
-  them, drag the background to pan, use the wheel to zoom, double-click a node
-  to isolate its neighborhood, or Shift-click several nodes to compare them.
+  them, drag the background to pan, use the wheel to zoom, use **Show
+  neighborhood** in the inspector to isolate connections, or Shift-click
+  several nodes to compare them.
+  The visible-entity directory provides the same selection action independently
+  of the SVG target, and the entity search accepts labels, URLs, sources, types,
+  and evidence IDs.
 - **Evidence** shows the redacted evidence ledger, immutable evidence IDs,
   source, observation time, confidence, identity status, and safe public links.
   Search and filter it by source or analyst decision. Clicking an evidence ID
@@ -31,9 +35,13 @@ available:
   contradictions, source coverage, recommendations, and approved transforms.
 
 The node inspector explains why an entity exists, displays the evidence IDs
-behind it, lists adjacent relationships and their reasons, and shows
-evidence-backed manual review pivots. A relationship is a source observation or
-an explicitly uncertain hypothesis; it is not automatically an ownership,
+behind it, expands up to ten cited evidence records with their source, type,
+confidence, identity state, analyst decision, observation time, and exact public
+link, lists clickable adjacent relationships and their reasons, and shows
+evidence-backed manual review pivots. Its ownership conclusion remains explicit:
+a collected page is not verified ownership unless the cited identity analysis
+reaches the required status. A relationship is a source observation or an
+explicitly uncertain hypothesis; it is not automatically an ownership,
 employment, or identity claim.
 
 ## Graph controls
