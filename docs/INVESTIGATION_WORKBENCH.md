@@ -101,13 +101,21 @@ Each completed case supports:
 | JSON | `/api/investigations/{id}/graph.json` | Full DeepVault graph and provenance |
 | GraphML | `/api/investigations/{id}/graph.graphml` | Gephi and compatible graph tools |
 | GEXF | `/api/investigations/{id}/graph.gexf` | Graph analysis and visualization |
-| CSV | `/api/investigations/{id}/graph.csv` | Tabular entity/relationship review |
+| CSV | `/api/investigations/{id}/graph.csv` | Plain-language review fields plus technical entity/relationship audit |
 | Mapping schema v2 | `/api/investigations/{id}/mapping.osint.json` | OSINT Mapping Tool import |
 
-GraphML and CSV retain relationship evidence IDs and explanations. GEXF retains
-node labels, edge types, and confidence weights. The DeepVault JSON or GraphML
-export should remain the audit source when another visualization tool does not
-display every provenance field.
+CSV starts with the cited verdict and gives each entity a review priority,
+plain-language label, publisher list, hidden-by-default flag, and explanation.
+Spreadsheet formula-like values are escaped on export. GraphML and CSV retain
+relationship evidence IDs and explanations. GEXF retains node labels, edge
+types, and confidence weights. The DeepVault JSON or GraphML export should
+remain the audit source when another visualization tool does not display every
+provenance field.
+
+The downloadable HTML report now starts with the same plain-language assessment
+and review queue as the dashboard. Full publisher provenance remains available
+inside a collapsed technical section, and the evidence appendix remains
+complete for authorized audit and printing.
 
 ## Pivot safety
 

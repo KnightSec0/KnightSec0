@@ -1460,7 +1460,17 @@ def _gexf_document(investigation: Investigation) -> bytes:
 
 
 def _graph_csv_document(investigation: Investigation) -> str:
-    _, nodes, edges, _ = _graph_parts(investigation)
+    document = _graph_document(investigation)
+    entities = document.get("entities", [])
+    relationships = document.get("relationships", [])
+    review_summary = document.get("review_summary", {})
+
+    def csv_safe(value: Any) -> Any:
+        """Prevent spreadsheet formula execution without changing audit values."""
+        if not isinstance(value, str):
+            return value
+        return f"'{value}" if value.startswith(("=", "+", "-", "@")) else value
+
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(
@@ -1476,38 +1486,90 @@ def _graph_csv_document(investigation: Investigation) -> str:
             "identity_status",
             "evidence_ids",
             "reason",
+            "review_priority",
+            "review_label",
+            "source_tools",
+            "publisher_count",
+            "hidden_by_default",
+            "plain_language",
         )
     )
-    for node in nodes:
+    verdict = review_summary.get("verdict", {})
+    if isinstance(verdict, dict) and verdict:
+        writer.writerow(
+            (
+                "summary",
+                "verdict",
+                "",
+                csv_safe(verdict.get("title")),
+                "",
+                "",
+                "",
+                "",
+                verdict.get("status"),
+                "|".join(str(value) for value in verdict.get("evidence_ids", [])),
+                csv_safe(verdict.get("explanation")),
+                verdict.get("status"),
+                csv_safe(verdict.get("title")),
+                "",
+                "",
+                "false",
+                csv_safe(verdict.get("explanation")),
+            )
+        )
+    for entity in entities:
         writer.writerow(
             (
                 "entity",
-                node.get("id"),
-                node.get("kind"),
-                node.get("label"),
+                entity.get("entity_id"),
+                entity.get("entity_type"),
+                csv_safe(entity.get("label")),
                 "",
                 "",
                 "",
-                "",
-                "",
-                "|".join(str(value) for value in node.get("evidence_ids", [])),
-                "",
+                entity.get("confidence"),
+                entity.get("identity_status"),
+                "|".join(
+                    str(value) for value in entity.get("evidence_ids", [])
+                ),
+                csv_safe(entity.get("plain_language_explanation")),
+                entity.get("review_priority"),
+                csv_safe(entity.get("confidence_label")),
+                "|".join(
+                    csv_safe(str(value))
+                    for value in entity.get("source_tools", [])
+                ),
+                entity.get("publisher_count"),
+                str(entity.get("review_priority") == "suppressed").casefold(),
+                csv_safe(entity.get("plain_language_explanation")),
             )
         )
-    for edge in edges:
+    for relationship in relationships:
         writer.writerow(
             (
                 "relationship",
-                edge.get("id"),
+                relationship.get("edge_id"),
                 "",
                 "",
-                edge.get("source_node_id"),
-                edge.get("target_node_id"),
-                edge.get("relationship"),
-                edge.get("confidence"),
-                edge.get("identity_status"),
-                "|".join(str(value) for value in edge.get("evidence_ids", [])),
-                edge.get("explanation"),
+                relationship.get("from_entity_id"),
+                relationship.get("to_entity_id"),
+                relationship.get("relationship_type"),
+                relationship.get("confidence"),
+                relationship.get("identity_status"),
+                "|".join(
+                    str(value)
+                    for value in relationship.get("evidence_ids", [])
+                ),
+                csv_safe(relationship.get("reason")),
+                "",
+                csv_safe(relationship.get("plain_language_type")),
+                "|".join(
+                    csv_safe(str(value))
+                    for value in relationship.get("source_tools", [])
+                ),
+                "",
+                "false",
+                csv_safe(relationship.get("reason")),
             )
         )
     return output.getvalue()
@@ -2191,8 +2253,13 @@ async def download_json_report(investigation_id: UUID) -> Response:
         )
 
 
-def render_report_html(report: dict[str, Any], target_name: str) -> str:
+def render_report_html(
+    report: dict[str, Any],
+    target_name: str,
+    review_summary: dict[str, Any] | None = None,
+) -> str:
     report = _redact_for_display(report)
+    review_summary = _redact_for_display(review_summary or {})
 
     def safe(value: Any) -> str:
         return escape(str(value if value is not None else ""))
@@ -2205,6 +2272,133 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
         if 0.0 <= score <= 1.0:
             return f"{score * 100:.0f}%"
         return str(value)
+
+    def evidence_citations(values: Any, limit: int = 8) -> str:
+        evidence_ids = [
+            str(value)
+            for value in (values if isinstance(values, list) else [])
+            if value
+        ]
+        visible = evidence_ids[:limit]
+        remaining = len(evidence_ids) - len(visible)
+        citation_text = ", ".join(visible)
+        if remaining:
+            citation_text += f" · +{remaining} more in the evidence appendix"
+        return (
+            f"<span class='citations'>{safe(citation_text)}</span>"
+            if citation_text
+            else "<span class='citations'>No evidence ID</span>"
+        )
+
+    def public_link(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return ""
+        if parsed.scheme not in {"http", "https"}:
+            return ""
+        return (
+            f"<a class='review-link' href='{safe(value)}' "
+            "target='_blank' rel='noreferrer'>Open public page</a>"
+        )
+
+    verdict = review_summary.get("verdict", {})
+    verdict = verdict if isinstance(verdict, dict) else {}
+    review_counts = review_summary.get("counts", {})
+    review_counts = review_counts if isinstance(review_counts, dict) else {}
+    review_leads = review_summary.get("priority_leads", [])
+    review_leads = review_leads if isinstance(review_leads, list) else []
+    review_key_points = review_summary.get("key_points", [])
+    review_key_points = (
+        review_key_points if isinstance(review_key_points, list) else []
+    )
+    review_cautions = review_summary.get("cautions", [])
+    review_cautions = (
+        review_cautions if isinstance(review_cautions, list) else []
+    )
+
+    review_lead_cards = "".join(
+        (
+            "<article class='review-lead'>"
+            f"<div class='rank'>{safe(index)}</div>"
+            "<div>"
+            f"<h3>{safe(item.get('label') or item.get('entity_id'))}</h3>"
+            f"<span class='review-badge'>{safe(item.get('confidence_label'))}</span>"
+            f"<p>{safe(item.get('explanation'))}</p>"
+            f"<p class='meta'>Sources: "
+            f"{safe(' + '.join(item.get('source_tools', [])) or 'unknown')} · "
+            f"Technical confidence: "
+            f"{safe(confidence_label(item.get('technical_confidence')))}</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
+            f"{public_link(item.get('public_url'))}"
+            "</div>"
+            "</article>"
+        )
+        for index, item in enumerate(review_leads[:10], start=1)
+        if isinstance(item, dict)
+    )
+    review_points = "".join(
+        (
+            "<article class='plain-point'>"
+            f"<h3>{safe(item.get('title'))}</h3>"
+            f"<p>{safe(item.get('statement'))}</p>"
+            f"{evidence_citations(item.get('evidence_ids'))}"
+            "</article>"
+        )
+        for item in review_key_points
+        if isinstance(item, dict)
+    )
+    caution_items = "".join(
+        (
+            "<li>"
+            f"{safe(item.get('statement'))}"
+            f"{evidence_citations(item.get('evidence_ids'))}"
+            "</li>"
+        )
+        for item in review_cautions
+        if isinstance(item, dict) and item.get("evidence_ids")
+    )
+    review_overview = ""
+    if verdict:
+        review_overview = (
+            "<section class='plain-review'>"
+            "<p class='eyebrow'>PLAIN-LANGUAGE ASSESSMENT</p>"
+            f"<h2>{safe(verdict.get('title'))}</h2>"
+            f"<p class='verdict-copy'>{safe(verdict.get('explanation'))}</p>"
+            f"{evidence_citations(verdict.get('evidence_ids'))}"
+            "<div class='review-counts'>"
+            f"<div><strong>{safe(review_counts.get('supported', 0))}</strong>"
+            "<span>Supported</span></div>"
+            f"<div><strong>{safe(review_counts.get('review_first', 0))}</strong>"
+            "<span>Check first</span></div>"
+            f"<div><strong>{safe(review_counts.get('low_signal', 0))}</strong>"
+            "<span>Unverified</span></div>"
+            f"<div><strong>{safe(review_counts.get('suppressed', 0))}</strong>"
+            "<span>Hidden noise</span></div>"
+            "</div>"
+            "<div class='how-to-read'><strong>How to read this report</strong>"
+            "<p>A candidate means a public trace is worth checking. It does not "
+            "mean DeepVault verified that the person owns the account.</p></div>"
+            "<h2>What to check first</h2>"
+            f"{review_lead_cards or '<p>No prioritized review lead was produced.</p>'}"
+            "<div class='plain-grid'>"
+            f"<section><h2>What was actually found</h2>{review_points}</section>"
+            "<section><h2>What you must not conclude</h2>"
+            f"<ul class='cautions'>{caution_items}</ul>"
+            + (
+                "<div class='privacy-note'>"
+                f"{safe(review_counts.get('suppressed', 0))} misleading, generic, "
+                "rejected, or sensitive candidate(s) are hidden from this review "
+                "queue and retained only in the authorized evidence appendix."
+                "</div>"
+                if review_counts.get("suppressed")
+                else ""
+            )
+            + "</section></div>"
+            "</section>"
+        )
 
     finding_groups: dict[str, list[str]] = {}
     for item in report.get("findings", []):
@@ -2342,7 +2536,7 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
     graph_edges = "".join(
         (
             "<tr>"
-            f"<td>{safe(item.get('relationship'))}</td>"
+            f"<td>{safe(_PLAIN_RELATIONSHIP_LABELS.get(str(item.get('relationship')), str(item.get('relationship') or '').replace('_', ' ').capitalize()))}</td>"
             f"<td>{safe(node_labels.get(str(item.get('source_node_id')), item.get('source_node_id')))}</td>"
             f"<td>{safe(node_labels.get(str(item.get('target_node_id')), item.get('target_node_id')))}</td>"
             f"<td>{safe(confidence_label(item.get('confidence')))}</td>"
@@ -2462,31 +2656,79 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DeepVault report — {safe(target_name)}</title>
-  <style>
-    body {{ font: 15px/1.55 Inter, system-ui, sans-serif; color: #18221d;
-      max-width: 900px; margin: 0 auto; padding: 48px; }}
-    header {{ border-bottom: 3px solid #1d7a4d; margin-bottom: 32px; }}
-    h1 {{ margin-bottom: 4px; }} h2 {{ margin-top: 32px; }}
-    .summary, .finding {{ background: #f3f7f4; border: 1px solid #d7e3da;
-      border-radius: 10px; padding: 18px; margin: 12px 0; }}
+	  <style>
+	    body {{ font: 15px/1.55 Inter, system-ui, sans-serif; color: #18221d;
+	      max-width: 900px; margin: 0 auto; padding: 48px; }}
+	    header {{ border-bottom: 3px solid #1d7a4d; margin-bottom: 32px; }}
+	    h1 {{ margin-bottom: 4px; }} h2 {{ margin-top: 32px; }}
+	    .plain-review {{ border: 2px solid #284e7a; border-radius: 14px;
+	      padding: 24px; margin: 22px 0 32px; background: #f4f8fc; }}
+	    .plain-review > h2:first-of-type {{ margin-top: 4px; font-size: 28px; }}
+	    .eyebrow {{ color: #284e7a; font-size: 12px; font-weight: 800;
+	      letter-spacing: .08em; }}
+	    .verdict-copy {{ font-size: 17px; }}
+	    .review-counts {{ display: grid; grid-template-columns: repeat(4, 1fr);
+	      gap: 8px; margin: 20px 0; }}
+	    .review-counts div {{ border: 1px solid #ccd9e6; border-radius: 8px;
+	      padding: 12px; background: white; }}
+	    .review-counts strong, .review-counts span {{ display: block; }}
+	    .review-counts strong {{ font-size: 24px; }}
+	    .review-counts span {{ color: #52635a; font-size: 11px;
+	      text-transform: uppercase; }}
+	    .how-to-read {{ border-left: 4px solid #d09a00; padding: 10px 14px;
+	      margin: 18px 0; background: #fff7db; }}
+	    .how-to-read p {{ margin: 4px 0 0; }}
+	    .review-lead {{ display: grid; grid-template-columns: 34px 1fr; gap: 12px;
+	      border: 1px solid #d7e3da; border-left: 4px solid #d09a00;
+	      border-radius: 9px; padding: 14px; margin: 9px 0; background: white; }}
+	    .review-lead h3, .plain-point h3 {{ margin: 0 0 5px; }}
+	    .rank {{ display: grid; place-items: center; width: 30px; height: 30px;
+	      border-radius: 50%; background: #284e7a; color: white; font-weight: 800; }}
+	    .review-badge {{ display: inline-block; border-radius: 999px;
+	      padding: 3px 8px; background: #fff0bb; color: #795900;
+	      font-size: 11px; font-weight: 800; text-transform: uppercase; }}
+	    .citations {{ display: block; color: #8a2631; font: 11px ui-monospace,
+	      SFMono-Regular, monospace; margin-top: 7px; overflow-wrap: anywhere; }}
+	    .review-link {{ display: inline-block; margin-top: 8px; color: #1e5c98; }}
+	    .plain-grid {{ display: grid; grid-template-columns: 1fr 1fr;
+	      gap: 18px; margin-top: 22px; }}
+	    .plain-point {{ border-top: 1px solid #d7e3da; padding: 12px 0; }}
+	    .cautions {{ padding-left: 20px; }}
+	    .cautions li {{ margin: 0 0 14px; }}
+	    .privacy-note {{ background: #fae9ec; border: 1px solid #dfb3ba;
+	      border-radius: 8px; padding: 12px; color: #742c37; }}
+	    .summary, .finding {{ background: #f3f7f4; border: 1px solid #d7e3da;
+	      border-radius: 10px; padding: 18px; margin: 12px 0; }}
     .notice {{ background: #fff7db; border: 1px solid #ead58a;
       border-radius: 10px; padding: 14px; margin: 12px 0; }}
     .meta {{ color: #52635a; font-size: 13px; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ border-bottom: 1px solid #d7e3da; padding: 10px; text-align: left; }}
-    pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #e8f0ea;
-      border-radius: 8px; padding: 12px; font-size: 12px; }}
-    @media print {{ body {{ padding: 0; }} }}
+	    pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #e8f0ea;
+	      border-radius: 8px; padding: 12px; font-size: 12px; }}
+	    details.technical {{ margin: 14px 0; }}
+	    details.technical summary {{ cursor: pointer; color: #284e7a;
+	      font-weight: 800; }}
+	    @media (max-width: 680px) {{
+	      body {{ padding: 22px; }}
+	      .review-counts, .plain-grid {{ grid-template-columns: 1fr 1fr; }}
+	    }}
+	    @media print {{
+	      body {{ padding: 0; }}
+	      details.technical {{ display: block; }}
+	      details.technical > * {{ display: block; }}
+	    }}
   </style>
 </head>
 <body>
-  <header>
+	  <header>
     <p>DEEPVAULT · AUTHORIZED PERSON INTELLIGENCE</p>
     <h1>{safe(target_name)}</h1>
     <p class="meta">Report {safe(report.get("report_id"))} ·
-      {safe(report.get("generated_at"))}</p>
-  </header>
-  <section class="summary">
+	      {safe(report.get("generated_at"))}</p>
+	  </header>
+	  {review_overview}
+	  <section class="summary">
     <h2>Executive summary</h2>
     <p>{safe(report.get("executive_summary"))}</p>
     <p><strong>Identity confidence:</strong>
@@ -2504,11 +2746,15 @@ def render_report_html(report: dict[str, Any], target_name: str) -> str:
     {safe(len(graph_edge_items))} relationships ·
     {safe(len(primary_graph_hypotheses))} reviewable hypotheses ·
     {safe(secondary_graph_hypothesis_count)} low-signal hypotheses retained in JSON</p>
-  {graph_hypotheses or "<p>No evidence-backed identity hypotheses were produced.</p>"}
-  <h3>Provenance relationships</h3>
-  <table><thead><tr><th>Relation</th><th>From</th><th>To</th>
-    <th>Confidence</th><th>Status</th><th>Evidence IDs</th></tr></thead>
-    <tbody>{graph_edges}</tbody></table>
+	  {graph_hypotheses or "<p>No evidence-backed identity hypotheses were produced.</p>"}
+	  <details class="technical">
+	    <summary>Full technical provenance · {safe(len(graph_edge_items))} relationships</summary>
+	    <p class="meta">These rows document which tool published each observation.
+	      They are not additional identity matches.</p>
+	    <table><thead><tr><th>Relation</th><th>From</th><th>To</th>
+	      <th>Confidence</th><th>Status</th><th>Evidence IDs</th></tr></thead>
+	      <tbody>{graph_edges}</tbody></table>
+	  </details>
   <h3>Ranked analyst pivots</h3>
   {graph_pivots or "<p>No evidence-backed pivots were produced.</p>"}
   {temporal_section}
@@ -2540,9 +2786,14 @@ async def download_html_report(investigation_id: UUID) -> Response:
         if not isinstance(report, dict):
             raise HTTPException(status_code=409, detail="Report is not ready")
         report = _redact_for_display(report)
+        review_summary = _graph_document(investigation).get("review_summary", {})
         filename = f"deepvault-{investigation_id}.html"
         return Response(
-            render_report_html(report, investigation.target_name),
+            render_report_html(
+                report,
+                investigation.target_name,
+                review_summary=review_summary,
+            ),
             media_type="text/html",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )

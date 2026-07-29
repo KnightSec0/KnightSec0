@@ -341,6 +341,9 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertIn("candidate_profile", gexf.decode())
         self.assertIn("relationship,EDGE-1", csv_export)
         self.assertIn("EVID-1", csv_export)
+        self.assertIn("review_priority,review_label,source_tools", csv_export)
+        self.assertIn("summary,verdict", csv_export)
+        self.assertIn("Possible match", csv_export)
 
     def test_exports_escape_markup_and_reject_unknown_evidence(self):
         investigation = self.investigation()
@@ -349,6 +352,10 @@ class DashboardGraphExportTests(unittest.TestCase):
         graphml = _graphml_document(investigation).decode()
         self.assertNotIn("<script>", graphml)
         self.assertIn("&lt;script&gt;", graphml)
+
+        graph["nodes"][1]["label"] = "=2+2"
+        csv_export = _graph_csv_document(investigation)
+        self.assertIn("'=2+2", csv_export)
 
         graph["edges"][0]["evidence_ids"] = ["EVID-UNKNOWN"]
         with self.assertRaisesRegex(
@@ -495,7 +502,50 @@ class DashboardReportRenderingTests(unittest.TestCase):
             "recommendations": ["Review <b>manually</b>."],
         }
 
-        rendered = render_report_html(report, "Alice <script>alert('target')</script>")
+        review_summary = {
+            "verdict": {
+                "status": "manual_verification_required",
+                "title": "No verified identity match yet",
+                "explanation": "One candidate requires manual review.",
+                "evidence_ids": ["EVID-ABC123"],
+            },
+            "counts": {
+                "supported": 0,
+                "review_first": 1,
+                "low_signal": 0,
+                "suppressed": 0,
+            },
+            "priority_leads": [
+                {
+                    "entity_id": "NODE-PROFILE",
+                    "label": "<img src=x onerror=alert('lead')>",
+                    "public_url": "https://github.com/alice",
+                    "confidence_label": "Possible match",
+                    "technical_confidence": 0.62,
+                    "source_tools": ["github"],
+                    "explanation": "Compare public profile details.",
+                    "evidence_ids": ["EVID-ABC123"],
+                }
+            ],
+            "key_points": [
+                {
+                    "title": "Candidate observations",
+                    "statement": "One candidate was retained.",
+                    "evidence_ids": ["EVID-ABC123"],
+                }
+            ],
+            "cautions": [
+                {
+                    "statement": "A username match is not proof.",
+                    "evidence_ids": ["EVID-ABC123"],
+                }
+            ],
+        }
+        rendered = render_report_html(
+            report,
+            "Alice <script>alert('target')</script>",
+            review_summary=review_summary,
+        )
 
         self.assertNotIn("<script>", rendered)
         self.assertNotIn("<img src=x", rendered)
@@ -509,6 +559,11 @@ class DashboardReportRenderingTests(unittest.TestCase):
         self.assertNotIn("must-not-survive-either", rendered)
         self.assertIn("&lt;redacted&gt;", rendered)
         self.assertIn("Evidence appendix", rendered)
+        self.assertIn("PLAIN-LANGUAGE ASSESSMENT", rendered)
+        self.assertIn("No verified identity match yet", rendered)
+        self.assertIn("What to check first", rendered)
+        self.assertIn("What you must not conclude", rendered)
+        self.assertIn("Full technical provenance", rendered)
         self.assertIn("Evidence-first identity analysis", rendered)
         self.assertIn("Changes since the previous comparable case", rendered)
         self.assertIn("&lt;svg onload=alert(&#x27;graph&#x27;)&gt;", rendered)
