@@ -272,6 +272,13 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertEqual(graph["stats"]["entity_count"], 2)
         self.assertEqual(graph["stats"]["relationship_count"], 1)
         self.assertEqual(graph["stats"]["evidence_count"], 1)
+        target_entity = next(
+            item
+            for item in graph["entities"]
+            if item["entity_id"] == "NODE-TARGET"
+        )
+        self.assertEqual(target_entity["source_tools"], [])
+        self.assertEqual(target_entity["publisher_count"], 0)
         profile_entity = next(
             item
             for item in graph["entities"]

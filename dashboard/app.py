@@ -1185,6 +1185,8 @@ def _normalized_graph_view(
             },
             key=str.casefold,
         )
+        if node_id == graph.get("target_node_id") or kind == "authorized_target":
+            sources = []
         for source in sources:
             source_counts[source] = source_counts.get(source, 0) + 1
         observed = sorted(
