@@ -51,6 +51,7 @@ credentials into the dashboard.
 | Passive scanning | Results from an authorized SpiderFoot server | SpiderFoot |
 | Analyst transforms | Bounded, authorization-gated pivots with shared evidence normalization | Blackbird, theHarvester, Subfinder, httpx, GHunt, ExifTool, Tesseract, Poppler |
 | Investigation workbench | Non-expert Overview, prioritized review queue, simplified/full Maltego-style graphs, node inspector, filters, clustering, comparison, saved layouts and evidence-safe exports | Native localhost dashboard |
+| Analyst adjudication | Accept, retain for review, or exclude false-positive evidence with reasons, reviewer notes, restoration, and append-only audit history | Native localhost dashboard |
 | Infrastructure | Explicitly authorized literal-IP enrichment | Shodan, Censys |
 | Result quality | Content-aware confidence gates, catalogue-family deduplication, sensitive-result quarantine and coverage-aware conclusions | Local quality engine |
 | Correlation | Provenance normalization, identity graph, hypotheses and contradiction detection | Local correlation engine |
@@ -295,6 +296,13 @@ DeepVault is designed for authorized security assessments, background checks wit
 - Obtain explicit written authorization before investigating any target
 - Comply with all applicable laws (GDPR, CFAA, DPA, etc.)
 - Maintain chain of custody for all collected evidence
+
+DeepVault is an evidence-review system, not an automated employment-decision or
+psychological-profiling system. Do not use it to diagnose mental health, infer
+protected traits, derive personality or intimate preferences, or automatically
+rank, reject, or recommend a person for employment. Employment-related use must
+remain limited to relevant, consented, verifiable facts with documented human
+review and applicable legal safeguards.
 - Respect platform Terms of Service during data collection
 - Not use this tool for stalking, harassment, or any unlawful purpose
 

@@ -113,6 +113,9 @@
       color: var(--ink); background: var(--panel-2); border: 1px solid var(--line);
       padding: 9px 12px; border-radius: 8px; text-decoration: none; font-size: 12px;
     }
+    .secondary.danger {
+      color: #ffd5da; border-color: #8d2935; background: #2b1118;
+    }
     .secondary.disabled { opacity: .4; pointer-events: none; }
     .cards {
       display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr));
@@ -483,6 +486,8 @@
     .section-heading .sub { margin: 0; max-width: 480px; }
     .workbench-table-panel { padding: 0; }
     .workbench-table-panel .section-heading { padding: 20px 20px 0; }
+    .workbench-table-panel > .notice { margin: 0 20px 18px; }
+    .workbench-table-panel > .finding { margin: 0 20px 12px; }
     .table-wrap { overflow: auto; }
     .evidence-table { width: 100%; border-collapse: collapse; font-size: 10px; }
     .evidence-table th {
@@ -1067,6 +1072,7 @@
           api,
           badge,
           queueTransform,
+          reload: () => selectCase(id),
           renderFindingGroups,
           transformActions,
         });

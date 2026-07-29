@@ -95,6 +95,11 @@
       suppressed: "Hidden by default",
     }[node.reviewPriority])
     || titleCase(node.identityStatus || "insufficient_evidence");
+  const decisionLabel = value => ({
+    accepted: "Analyst accepted",
+    false_positive: "False positive",
+    needs_review: "Needs review",
+  }[value] || "Not reviewed");
   const isGenericEndpoint = value => {
     const url = safeUrl(value);
     if (!url) return false;
@@ -142,6 +147,8 @@
     const evidenceById = Object.fromEntries(
       evidence.filter(entry => entry?.id).map(entry => [entry.id, entry]),
     );
+    const adjudications = state.graphDocument?.adjudications
+      || item.evidence_adjudications || {};
     const hypothesisByNode = Object.fromEntries(
       hypotheses
         .filter(entry => entry?.object_node_id)
@@ -215,6 +222,8 @@
         genericEndpoint,
         hypothesis,
         cited,
+        adjudicationStatus: normalized.adjudication_status,
+        adjudicationNotes: normalized.adjudication_notes || [],
       };
     });
     return {
@@ -225,6 +234,7 @@
       pivots,
       evidence,
       evidenceById,
+      adjudications,
       nodeById,
       records,
       reviewSummary: state.graphDocument?.review_summary || null,
@@ -742,6 +752,17 @@
       <h4>Evidence IDs</h4>
       <p class="evidence">${(node.evidence_ids || []).map(html).join(" · ")
         || "Target context supplied by the case analyst"}</p>
+      ${(node.evidence_ids || []).length ? `<div class="inspector-actions">
+        <button class="secondary evidence-decision" type="button"
+          data-node-decision="accepted"
+          data-evidence-ids="${html((node.evidence_ids || []).join(","))}">Accept observation</button>
+        <button class="secondary evidence-decision" type="button"
+          data-node-decision="needs_review"
+          data-evidence-ids="${html((node.evidence_ids || []).join(","))}">Keep for review</button>
+        <button class="secondary evidence-decision danger" type="button"
+          data-node-decision="false_positive"
+          data-evidence-ids="${html((node.evidence_ids || []).join(","))}">Mark false positive</button>
+      </div>` : ""}
       ${attributes.length ? `<h4>Public attributes</h4>
         <dl class="attribute-list">${attributes.map(([key, value]) =>
           `<dt>${html(titleCase(key))}</dt><dd>${html(
@@ -805,24 +826,56 @@
           data-node-id="${html(node.id)}">Run ${html(transform)}</button>`).join("")}</div>`;
   }
 
-  function evidenceMarkup(data) {
+  function evidenceMarkup(item, data) {
+    const decisions = Object.entries(data.adjudications || {});
+    const excluded = decisions.filter(
+      ([, decision]) => decision?.status === "false_positive",
+    );
     return `<section class="panel workbench-table-panel">
       <div class="section-heading"><div><p class="eyebrow">Evidence ledger</p>
         <h3>${data.evidence.length} normalized observations</h3></div>
-        <p class="sub">Every row is redacted for display and retains its immutable evidence ID.</p></div>
+        <p class="sub">Review decisions change conclusions and exports, while the append-only audit history remains available.</p></div>
+      <div class="notice"><strong>Decision-support boundary:</strong> use cited public facts
+        and human review. Do not infer mental health, personality, protected traits, or
+        make an automated employment decision.</div>
       <div class="table-wrap"><table class="evidence-table">
         <thead><tr><th>Evidence</th><th>Type</th><th>Source</th><th>Confidence</th>
-          <th>Identity status</th><th>Observed</th><th>Public source</th></tr></thead>
+          <th>Identity status</th><th>Decision</th><th>Observed</th>
+          <th>Public source</th><th>Analyst actions</th></tr></thead>
         <tbody>${data.evidence.map(entry => {
           const url = safeUrl(entry.source_url);
+          const decision = data.adjudications?.[entry.id] || {};
           return `<tr><td><code>${html(entry.id)}</code><small>${html(entry.value)}</small></td>
             <td>${html(entry.type)}</td><td>${html(entry.source)}</td>
             <td>${html(percent(entry.confidence))}</td>
             <td>${html(titleCase(entry.identity_status || "insufficient_evidence"))}</td>
+            <td><strong>${html(decisionLabel(decision.status))}</strong>
+              ${decision.note ? `<small>${html(decision.note)}</small>` : ""}</td>
             <td>${entry.observed_at ? html(new Date(entry.observed_at).toLocaleString()) : "—"}</td>
-            <td>${url ? `<a href="${html(url)}" target="_blank" rel="noreferrer">Open</a>` : "—"}</td></tr>`;
-        }).join("") || `<tr><td colspan="7">No normalized evidence yet.</td></tr>`}</tbody>
-      </table></div></section>`;
+            <td>${url ? `<a href="${html(url)}" target="_blank" rel="noreferrer">Open</a>` : "—"}</td>
+            <td><div class="inspector-actions">
+              <button class="secondary evidence-decision" type="button"
+                data-evidence-id="${html(entry.id)}" data-evidence-status="accepted">Accept</button>
+              <button class="secondary evidence-decision" type="button"
+                data-evidence-id="${html(entry.id)}" data-evidence-status="needs_review">Review</button>
+              <button class="secondary evidence-decision danger" type="button"
+                data-evidence-id="${html(entry.id)}" data-evidence-status="false_positive">False positive</button>
+            </div></td></tr>`;
+        }).join("") || `<tr><td colspan="9">No active evidence remains.</td></tr>`}</tbody>
+      </table></div>
+      <div class="section-heading"><div><p class="eyebrow">Excluded observations</p>
+        <h3>${excluded.length} false positive${excluded.length === 1 ? "" : "s"}</h3></div>
+        <p class="sub">Excluded observations do not appear in conclusions or downloads. Restore them when a decision changes.</p></div>
+      ${excluded.map(([evidenceId, decision]) => `<article class="finding">
+        <h4>${html(evidenceId)} · False positive</h4>
+        <p>${html(decision.note || "No analyst note")}</p>
+        <p class="sub">${html(decision.reason_code || "analyst_review")} ·
+          ${html(decision.reviewer || "Local analyst")} · ${html(decision.updated_at || "")}</p>
+        <button class="secondary evidence-decision" type="button"
+          data-evidence-id="${html(evidenceId)}"
+          data-evidence-status="needs_review">Restore to review</button>
+      </article>`).join("") || `<p class="sub">No observations are excluded.</p>`}
+    </section>`;
   }
 
   function timelineMarkup(item) {
@@ -1066,6 +1119,70 @@
     bindInspector(item, state, data);
   }
 
+  function bindEvidenceDecisionButtons(item, state, root = document) {
+    root.querySelectorAll(".evidence-decision").forEach(button => {
+      if (button.dataset.decisionBound === "true") return;
+      button.dataset.decisionBound = "true";
+      button.addEventListener("click", async () => {
+        const status = button.dataset.evidenceStatus || button.dataset.nodeDecision;
+        const evidenceIds = button.dataset.evidenceId
+          ? [button.dataset.evidenceId]
+          : String(button.dataset.evidenceIds || "").split(",").filter(Boolean);
+        if (!status || !evidenceIds.length) return;
+
+        let note = "Queued for manual verification.";
+        let reasonCode = "analyst_review";
+        if (status === "false_positive") {
+          note = window.prompt(
+            "Why is this observation incorrect? Record the identity mismatch, stale page, generic result, source error, or other reason.",
+            "",
+          );
+          if (note === null) return;
+          note = note.trim();
+          if (!note) {
+            window.alert("A false-positive decision requires an analyst note.");
+            return;
+          }
+          reasonCode = "identity_or_source_mismatch";
+        } else if (status === "accepted") {
+          const response = window.prompt(
+            "Optional verification note for the audit history:",
+            "Public attributes manually checked against the case subject.",
+          );
+          if (response === null) return;
+          note = response.trim();
+          reasonCode = "manual_verification";
+        } else {
+          reasonCode = "requires_more_evidence";
+        }
+
+        const original = button.textContent;
+        button.disabled = true;
+        button.textContent = "Saving…";
+        try {
+          await state.helpers.api(
+            `/api/investigations/${item.id}/evidence-adjudications`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                evidence_ids: evidenceIds,
+                status,
+                reason_code: reasonCode,
+                note,
+                reviewer: "Local analyst",
+              }),
+            },
+          );
+          await state.helpers.reload();
+        } catch (error) {
+          window.alert(error.message);
+          button.disabled = false;
+          button.textContent = original;
+        }
+      });
+    });
+  }
+
   function bindInspector(item, state, data) {
     document.querySelector("#expand-selected-cluster")?.addEventListener("click", () => {
       state.collapsed = false;
@@ -1104,6 +1221,8 @@
           button.disabled = false;
         }
       }));
+    const inspector = document.querySelector("#node-inspector");
+    if (inspector) bindEvidenceDecisionButtons(item, state, inspector);
   }
 
   function drawActiveGraph(item, state, data) {
@@ -1247,6 +1366,7 @@
           item.report.evidence_count || 0,
           item.report.identity_graph?.nodes?.length || 0,
           item.report.identity_graph?.edges?.length || 0,
+          item.adjudication_audit?.length || 0,
         ].join(":")
       : "pending";
     if (state.graphVersion !== graphVersion) {
@@ -1292,10 +1412,14 @@
         <div><span>Relationships</span><strong>${html(stats.relationship_count)}</strong></div>
         <div><span>Evidence</span><strong>${html(stats.evidence_count)}</strong></div>
         <div><span>Sources</span><strong>${html(stats.source_count)}</strong></div>
+        <div><span>False positives</span><strong>${html(item.false_positive_count || 0)}</strong></div>
         <div><span>Identity</span><strong>${html(report?.identity_confidence || "—")}</strong></div>
         <div><span>Exposure</span><strong>${html(report?.overall_risk || item.risk_score || "—")}</strong></div>
       </div>
       ${item.error ? `<div class="notice">${html(item.error)}</div>` : ""}
+      <div class="notice"><strong>Human decision support:</strong> DeepVault presents
+        cited public evidence. It does not diagnose mental health, infer protected
+        traits, or make an automated hiring decision.</div>
       ${!report ? `<section class="panel live-progress"><div>
         <p class="eyebrow">Live progress · ${progressPercent}%</p>
         <h3>${html(progress.message || "Waiting for an available worker")}</h3>
@@ -1314,7 +1438,7 @@
       </nav>
       <div data-tab-panel="overview"></div>
       <div data-tab-panel="graph"></div>
-      <div data-tab-panel="evidence" hidden>${evidenceMarkup(data)}</div>
+      <div data-tab-panel="evidence" hidden>${evidenceMarkup(item, data)}</div>
       <div data-tab-panel="timeline" hidden>${timelineMarkup(item)}</div>
       <div data-tab-panel="report" hidden>${reportMarkup(item, helpers, data)}</div>`;
     document.querySelectorAll("[data-result-tab]").forEach(button =>
@@ -1324,6 +1448,7 @@
       }));
     document.querySelectorAll(".transform-action").forEach(button =>
       button.addEventListener("click", () => helpers.queueTransform(button)));
+    bindEvidenceDecisionButtons(item, state);
     showTab(item, state, data);
     hydrateGraphDocument(item, state);
   }

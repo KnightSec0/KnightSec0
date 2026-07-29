@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import csv
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -518,6 +519,41 @@ class GraphLayoutUpdate(BaseModel):
         return output
 
 
+class EvidenceDecisionStatus(str, Enum):
+    ACCEPTED = "accepted"
+    FALSE_POSITIVE = "false_positive"
+    NEEDS_REVIEW = "needs_review"
+
+
+class EvidenceAdjudicationRequest(BaseModel):
+    evidence_ids: list[str] = Field(min_length=1, max_length=100)
+    status: EvidenceDecisionStatus
+    reason_code: str = Field(default="analyst_review", min_length=2, max_length=80)
+    note: str = Field(default="", max_length=1000)
+    reviewer: str = Field(default="Local analyst", min_length=2, max_length=120)
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def validate_adjudication_ids(cls, values: list[str]) -> list[str]:
+        normalized = list(
+            dict.fromkeys(value.strip() for value in values if value.strip())
+        )
+        if not normalized:
+            raise ValueError("Select at least one evidence ID")
+        return normalized
+
+    @field_validator("reason_code", "note", "reviewer")
+    @classmethod
+    def clean_adjudication_text(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def validate_false_positive_reason(self) -> "EvidenceAdjudicationRequest":
+        if self.status == EvidenceDecisionStatus.FALSE_POSITIVE and not self.note:
+            raise ValueError("A false-positive decision requires an analyst note")
+        return self
+
+
 def _database_url() -> str:
     explicit = os.getenv("DB_URL")
     if explicit:
@@ -633,10 +669,8 @@ async def _serialize(
     include_report: bool = False,
 ) -> dict[str, Any]:
     metadata = investigation.case_metadata or {}
-    stored_report = metadata.get("structured_report")
-    report = (
-        _redact_for_display(stored_report) if isinstance(stored_report, dict) else None
-    )
+    report = _effective_report(investigation)
+    adjudications = _evidence_adjudications(investigation)
     output: dict[str, Any] = {
         "id": str(investigation.id),
         "target_name": investigation.target_name,
@@ -658,6 +692,16 @@ async def _serialize(
         "transform_runs": _redact_for_display(metadata.get("transform_runs", [])),
         "compare_previous_cases": bool(metadata.get("compare_previous_cases")),
         "source_status": metadata.get("source_status", []),
+        "evidence_adjudications": _redact_for_display(adjudications),
+        "adjudication_audit": _redact_for_display(
+            metadata.get("adjudication_audit", [])
+        ),
+        "false_positive_count": sum(
+            1
+            for decision in adjudications.values()
+            if decision.get("status")
+            == EvidenceDecisionStatus.FALSE_POSITIVE.value
+        ),
         "artifact_count": await _artifact_count(session, investigation.id),
         "has_report": report is not None,
         "progress": metadata.get("progress")
@@ -758,6 +802,262 @@ def _graph_parts(
     return graph, clean_nodes, clean_edges, evidence_index
 
 
+def _evidence_adjudications(
+    investigation: Investigation,
+) -> dict[str, dict[str, Any]]:
+    metadata = investigation.case_metadata or {}
+    decisions = metadata.get("evidence_adjudications", {})
+    if not isinstance(decisions, dict):
+        return {}
+    return {
+        str(evidence_id): item
+        for evidence_id, item in decisions.items()
+        if evidence_id and isinstance(item, dict)
+    }
+
+
+def _false_positive_evidence_ids(investigation: Investigation) -> set[str]:
+    return {
+        evidence_id
+        for evidence_id, decision in _evidence_adjudications(
+            investigation
+        ).items()
+        if decision.get("status") == EvidenceDecisionStatus.FALSE_POSITIVE.value
+    }
+
+
+def _adjudicated_graph_parts(
+    investigation: Investigation,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    """Remove analyst-rejected evidence from conclusions without deleting it."""
+    graph, nodes, edges, evidence_index = _graph_parts(investigation)
+    false_positive_ids = _false_positive_evidence_ids(investigation)
+    if not false_positive_ids:
+        return graph, nodes, edges, evidence_index
+
+    filtered_nodes: list[dict[str, Any]] = []
+    for item in nodes:
+        node = deepcopy(item)
+        original_ids = [str(value) for value in node.get("evidence_ids", [])]
+        surviving_ids = [
+            value for value in original_ids if value not in false_positive_ids
+        ]
+        if original_ids and not surviving_ids:
+            continue
+        node["evidence_ids"] = surviving_ids
+        filtered_nodes.append(node)
+    candidate_node_ids = {str(node["id"]) for node in filtered_nodes}
+
+    filtered_edges: list[dict[str, Any]] = []
+    for item in edges:
+        edge = deepcopy(item)
+        surviving_ids = [
+            str(value)
+            for value in edge.get("evidence_ids", [])
+            if str(value) not in false_positive_ids
+        ]
+        endpoints = {
+            str(edge.get("source_node_id")),
+            str(edge.get("target_node_id")),
+        }
+        if not surviving_ids or endpoints - candidate_node_ids:
+            continue
+        edge["evidence_ids"] = surviving_ids
+        edge["provenance_chain"] = [
+            step
+            for step in edge.get("provenance_chain", [])
+            if not isinstance(step, dict)
+            or str(step.get("evidence_id")) not in false_positive_ids
+        ]
+        filtered_edges.append(edge)
+
+    connected_node_ids = {
+        str(value)
+        for edge in filtered_edges
+        for value in (edge.get("source_node_id"), edge.get("target_node_id"))
+        if value
+    }
+    target_node_id = str(graph.get("target_node_id") or "")
+    filtered_nodes = [
+        node
+        for node in filtered_nodes
+        if str(node["id"]) == target_node_id
+        or node.get("kind") == "authorized_target"
+        or str(node["id"]) in connected_node_ids
+        or (
+            node.get("kind") != "public_source"
+            and bool(node.get("evidence_ids"))
+        )
+    ]
+    retained_node_ids = {str(node["id"]) for node in filtered_nodes}
+    filtered_edges = [
+        edge
+        for edge in filtered_edges
+        if {
+            str(edge.get("source_node_id")),
+            str(edge.get("target_node_id")),
+        }
+        <= retained_node_ids
+    ]
+
+    filtered_graph = deepcopy(graph)
+    filtered_graph["nodes"] = filtered_nodes
+    filtered_graph["edges"] = filtered_edges
+    filtered_graph["evidence_index"] = [
+        item
+        for evidence_id, item in evidence_index.items()
+        if evidence_id not in false_positive_ids
+    ]
+    for field, node_field in (
+        ("hypotheses", "object_node_id"),
+        ("pivots", "node_id"),
+    ):
+        values = graph.get(field, [])
+        filtered_graph[field] = [
+            deepcopy(item)
+            for item in values
+            if isinstance(item, dict)
+            and str(item.get(node_field)) in retained_node_ids
+            and not (
+                item.get("evidence_ids")
+                and not {
+                    str(value)
+                    for value in item.get("evidence_ids", [])
+                }
+                - false_positive_ids
+            )
+        ] if isinstance(values, list) else []
+
+    filtered_evidence = {
+        evidence_id: item
+        for evidence_id, item in evidence_index.items()
+        if evidence_id not in false_positive_ids
+    }
+    return filtered_graph, filtered_nodes, filtered_edges, filtered_evidence
+
+
+def _filter_report_items(
+    values: Any,
+    false_positive_ids: set[str],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for raw_item in values if isinstance(values, list) else []:
+        if not isinstance(raw_item, dict):
+            continue
+        item = deepcopy(raw_item)
+        original_ids = [
+            str(value) for value in item.get("evidence_ids", []) if value
+        ]
+        if original_ids:
+            if set(original_ids) & false_positive_ids:
+                continue
+        output.append(item)
+    return output
+
+
+def _effective_report(investigation: Investigation) -> dict[str, Any] | None:
+    """Build the report currently approved for analyst and customer use."""
+    metadata = investigation.case_metadata or {}
+    stored_report = metadata.get("structured_report")
+    if not isinstance(stored_report, dict):
+        return None
+    report = deepcopy(stored_report)
+    false_positive_ids = _false_positive_evidence_ids(investigation)
+    decisions = _evidence_adjudications(investigation)
+    if not false_positive_ids and not decisions:
+        return _redact_for_display(report)
+
+    ledger = report.get("evidence_ledger", [])
+    surviving_ledger = [
+        item
+        for item in ledger if isinstance(item, dict)
+        and str(item.get("id")) not in false_positive_ids
+    ] if isinstance(ledger, list) else []
+    report["evidence_ledger"] = surviving_ledger
+    report["evidence_count"] = len(surviving_ledger)
+    for field in ("findings", "timeline", "contradictions"):
+        report[field] = _filter_report_items(
+            report.get(field, []),
+            false_positive_ids,
+        )
+
+    graph, _, _, _ = _adjudicated_graph_parts(investigation)
+    report["identity_graph"] = graph
+    surviving_ids = sorted(
+        str(item.get("id"))
+        for item in surviving_ledger
+        if item.get("id")
+    )
+    if false_positive_ids:
+        report["executive_summary"] = (
+            f"After analyst review, {len(surviving_ledger)} active public "
+            f"evidence record(s) remain. {len(false_positive_ids)} observation(s) "
+            "were excluded as false positives and are not used in conclusions. "
+            "Review the remaining cited findings before making any decision."
+        )
+        report["executive_summary_evidence_ids"] = surviving_ids
+        report["overall_risk"] = "review_required"
+        limitations = report.get("limitations", [])
+        limitations = list(limitations) if isinstance(limitations, list) else []
+        limitations.append(
+            "Analyst false-positive decisions changed this report after "
+            "collection; excluded records remain available only in the audit history."
+        )
+        report["limitations"] = list(dict.fromkeys(limitations))
+        temporal = report.get("temporal_comparison")
+        if isinstance(temporal, dict):
+            for field in ("added", "changed", "persisting", "not_observed"):
+                items = temporal.get(field, [])
+                temporal[field] = [
+                    item
+                    for item in items
+                    if isinstance(item, dict)
+                    and not false_positive_ids
+                    & {
+                        str(value)
+                        for key, value in item.items()
+                        if key == "evidence_id"
+                        or key.endswith("_evidence_id")
+                    }
+                ] if isinstance(items, list) else []
+            temporal["counts"] = {
+                field: len(temporal.get(field, []))
+                for field in ("added", "changed", "persisting", "not_observed")
+            }
+    counts_by_source: dict[str, int] = {}
+    for item in surviving_ledger:
+        source = str(item.get("source") or "")
+        if source:
+            counts_by_source[source] = counts_by_source.get(source, 0) + 1
+    coverage = report.get("source_coverage", [])
+    if isinstance(coverage, list):
+        for item in coverage:
+            if isinstance(item, dict):
+                item["evidence_count"] = counts_by_source.get(
+                    str(item.get("source") or ""),
+                    0,
+                )
+
+    report["adjudication_summary"] = {
+        "false_positive_count": len(false_positive_ids),
+        "active_decision_count": len(decisions),
+        "notice": (
+            "Analyst-rejected observations are excluded from conclusions and "
+            "exports but retained in the append-only case audit history."
+        ),
+        "decisions": [
+            {"evidence_id": evidence_id, **deepcopy(decision)}
+            for evidence_id, decision in sorted(decisions.items())
+        ],
+    }
+    return _redact_for_display(report)
+
+
 _IDENTITY_STATUS_ORDER = {
     "unrelated": -1,
     "insufficient_evidence": 0,
@@ -812,6 +1112,7 @@ def _entity_review_details(
     )
     sensitive = bool(metadata.get("sensitive")) or quality_status == "quarantined"
     suppressed = quality_status in {"rejected", "quarantined"} or generic_endpoint
+    analyst_status = str(entity.get("adjudication_status") or "")
 
     if entity_type == "authorized_target":
         priority = "target"
@@ -826,6 +1127,20 @@ def _entity_review_details(
         explanation = (
             "This technical node records which discovery tool published cited "
             "observations."
+        )
+    elif analyst_status == EvidenceDecisionStatus.ACCEPTED.value:
+        priority = "supported"
+        confidence_label = "Analyst accepted"
+        explanation = (
+            "A case analyst accepted the cited observation after manual review. "
+            "The original technical confidence remains visible."
+        )
+    elif analyst_status == EvidenceDecisionStatus.NEEDS_REVIEW.value:
+        priority = "review_first"
+        confidence_label = "Analyst review required"
+        explanation = (
+            "A case analyst explicitly retained this observation for further "
+            "verification."
         )
     elif suppressed:
         priority = "suppressed"
@@ -1142,6 +1457,7 @@ def _normalized_graph_view(
     metadata = investigation.case_metadata or {}
     report = metadata.get("structured_report")
     report = report if isinstance(report, dict) else {}
+    adjudications = _evidence_adjudications(investigation)
     ledger = report.get("evidence_ledger", [])
     ledger_by_id = {
         str(item.get("id")): item
@@ -1244,6 +1560,29 @@ def _normalized_graph_view(
             "last_seen": observed[-1] if observed else None,
             "metadata": attributes,
             "evidence_ids": evidence_ids,
+            "adjudication_status": (
+                EvidenceDecisionStatus.ACCEPTED.value
+                if evidence_ids
+                and all(
+                    adjudications.get(evidence_id, {}).get("status")
+                    == EvidenceDecisionStatus.ACCEPTED.value
+                    for evidence_id in evidence_ids
+                )
+                else (
+                    EvidenceDecisionStatus.NEEDS_REVIEW.value
+                    if any(
+                        adjudications.get(evidence_id, {}).get("status")
+                        == EvidenceDecisionStatus.NEEDS_REVIEW.value
+                        for evidence_id in evidence_ids
+                    )
+                    else None
+                )
+            ),
+            "adjudication_notes": [
+                adjudications[evidence_id]
+                for evidence_id in evidence_ids
+                if evidence_id in adjudications
+            ],
         }
         entity.update(
             _entity_review_details(
@@ -1318,7 +1657,8 @@ def _normalized_graph_view(
 
 def _graph_document(investigation: Investigation) -> dict[str, Any]:
     metadata = investigation.case_metadata or {}
-    graph, nodes, edges, evidence_index = _graph_parts(investigation)
+    graph, nodes, edges, evidence_index = _adjudicated_graph_parts(investigation)
+    adjudications = _evidence_adjudications(investigation)
     permitted = {
         str(source).casefold()
         for source in metadata.get("permitted_sources", [])
@@ -1337,6 +1677,11 @@ def _graph_document(investigation: Investigation) -> dict[str, Any]:
         "layout": _redact_for_display(metadata.get("graph_layout", {})),
         "transforms": transforms,
         "transformRuns": _redact_for_display(metadata.get("transform_runs", [])),
+        "adjudications": _redact_for_display(adjudications),
+        "adjudicationAudit": _redact_for_display(
+            metadata.get("adjudication_audit", [])
+        ),
+        "falsePositiveCount": len(_false_positive_evidence_ids(investigation)),
         **_normalized_graph_view(
             investigation,
             graph,
@@ -1348,7 +1693,7 @@ def _graph_document(investigation: Investigation) -> dict[str, Any]:
 
 
 def _graphml_document(investigation: Investigation) -> bytes:
-    graph, nodes, edges, _ = _graph_parts(investigation)
+    graph, nodes, edges, _ = _adjudicated_graph_parts(investigation)
     namespace = "http://graphml.graphdrawing.org/xmlns"
     ET.register_namespace("", namespace)
     root = ET.Element(f"{{{namespace}}}graphml")
@@ -1423,7 +1768,7 @@ def _graphml_document(investigation: Investigation) -> bytes:
 
 
 def _gexf_document(investigation: Investigation) -> bytes:
-    _, nodes, edges, _ = _graph_parts(investigation)
+    _, nodes, edges, _ = _adjudicated_graph_parts(investigation)
     namespace = "http://www.gexf.net/1.3"
     ET.register_namespace("", namespace)
     root = ET.Element(
@@ -1494,6 +1839,8 @@ def _graph_csv_document(investigation: Investigation) -> str:
             "publisher_count",
             "hidden_by_default",
             "plain_language",
+            "adjudication_status",
+            "adjudication_notes",
         )
     )
     verdict = review_summary.get("verdict", {})
@@ -1517,6 +1864,8 @@ def _graph_csv_document(investigation: Investigation) -> str:
                 "",
                 "false",
                 csv_safe(verdict.get("explanation")),
+                "",
+                "",
             )
         )
     for entity in entities:
@@ -1544,6 +1893,14 @@ def _graph_csv_document(investigation: Investigation) -> str:
                 entity.get("publisher_count"),
                 str(entity.get("review_priority") == "suppressed").casefold(),
                 csv_safe(entity.get("plain_language_explanation")),
+                entity.get("adjudication_status"),
+                csv_safe(
+                    json.dumps(
+                        entity.get("adjudication_notes", []),
+                        sort_keys=True,
+                        default=str,
+                    )
+                ),
             )
         )
     for relationship in relationships:
@@ -1572,6 +1929,8 @@ def _graph_csv_document(investigation: Investigation) -> str:
                 "",
                 "false",
                 csv_safe(relationship.get("reason")),
+                "",
+                "",
             )
         )
     return output.getvalue()
@@ -1642,13 +2001,8 @@ def _node_mapping_type(node: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 
 def _mapping_document(investigation: Investigation) -> dict[str, Any]:
     metadata = investigation.case_metadata or {}
-    report = metadata.get("structured_report")
-    report = report if isinstance(report, dict) else {}
-    graph = _stored_graph(investigation)
-    nodes = graph.get("nodes", [])
-    nodes = nodes if isinstance(nodes, list) else []
-    edges = graph.get("edges", [])
-    edges = edges if isinstance(edges, list) else []
+    report = _effective_report(investigation) or {}
+    graph, nodes, edges, _ = _adjudicated_graph_parts(investigation)
     layout = metadata.get("graph_layout")
     layout = layout if isinstance(layout, dict) else {}
     layout_nodes = layout.get("nodes", [])
@@ -2107,6 +2461,82 @@ async def update_graph_layout(
         }
 
 
+@app.post("/api/investigations/{investigation_id}/evidence-adjudications")
+async def update_evidence_adjudications(
+    investigation_id: UUID,
+    payload: EvidenceAdjudicationRequest,
+) -> dict[str, Any]:
+    async with sessions() as session:
+        investigation = (
+            await session.execute(
+                select(Investigation)
+                .where(Investigation.id == investigation_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if investigation is None:
+            raise HTTPException(status_code=404, detail="Investigation not found")
+        metadata = investigation.case_metadata or {}
+        report = metadata.get("structured_report")
+        if not isinstance(report, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="Evidence can be reviewed after the report is ready",
+            )
+        ledger = report.get("evidence_ledger", [])
+        valid_ids = {
+            str(item.get("id"))
+            for item in ledger
+            if isinstance(item, dict) and item.get("id")
+        } if isinstance(ledger, list) else set()
+        unknown_ids = set(payload.evidence_ids) - valid_ids
+        if unknown_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown evidence IDs: {sorted(unknown_ids)}",
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        decisions = _evidence_adjudications(investigation)
+        audit = metadata.get("adjudication_audit", [])
+        audit = list(audit) if isinstance(audit, list) else []
+        for evidence_id in payload.evidence_ids:
+            previous = deepcopy(decisions.get(evidence_id))
+            decision = {
+                "status": payload.status.value,
+                "reason_code": payload.reason_code.casefold().replace(" ", "_"),
+                "note": payload.note,
+                "reviewer": payload.reviewer,
+                "updated_at": now,
+            }
+            decisions[evidence_id] = decision
+            audit.append(
+                {
+                    "id": f"ADJ-{uuid4().hex[:12].upper()}",
+                    "evidence_id": evidence_id,
+                    "previous": previous,
+                    "decision": deepcopy(decision),
+                    "recorded_at": now,
+                }
+            )
+        investigation.case_metadata = {
+            **metadata,
+            "evidence_adjudications": decisions,
+            "adjudication_audit": audit[-5000:],
+        }
+        investigation.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        await session.commit()
+        return {
+            "caseId": str(investigation.id),
+            "updatedEvidenceIds": payload.evidence_ids,
+            "status": payload.status.value,
+            "falsePositiveCount": len(
+                _false_positive_evidence_ids(investigation)
+            ),
+            "recordedAt": now,
+        }
+
+
 @app.post("/api/investigations/{investigation_id}/transforms", status_code=202)
 async def execute_transform(
     investigation_id: UUID,
@@ -2230,10 +2660,9 @@ async def stream_case_events(investigation_id: UUID) -> StreamingResponse:
 async def download_json_report(investigation_id: UUID) -> Response:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
-        report = (investigation.case_metadata or {}).get("structured_report")
-        if not isinstance(report, dict):
+        report = _effective_report(investigation)
+        if report is None:
             raise HTTPException(status_code=409, detail="Report is not ready")
-        report = _redact_for_display(report)
         metadata = investigation.case_metadata or {}
         document = {
             **report,
@@ -2643,6 +3072,24 @@ def render_report_html(
         )
         for item in report.get("evidence_ledger", [])
     )
+    adjudication_summary = report.get("adjudication_summary", {})
+    adjudication_summary = (
+        adjudication_summary if isinstance(adjudication_summary, dict) else {}
+    )
+    adjudication_decisions = "".join(
+        (
+            "<article class='finding'>"
+            f"<h3>{safe(item.get('evidence_id'))} · "
+            f"{safe(str(item.get('status') or '').replace('_', ' ').title())}</h3>"
+            f"<p><strong>Reason:</strong> {safe(item.get('reason_code'))}</p>"
+            f"<p>{safe(item.get('note'))}</p>"
+            f"<p class='meta'>Reviewed by {safe(item.get('reviewer'))} · "
+            f"{safe(item.get('updated_at'))}</p>"
+            "</article>"
+        )
+        for item in adjudication_summary.get("decisions", [])
+        if isinstance(item, dict)
+    )
     recommendations = "".join(
         f"<li>{safe(item)}</li>" for item in report.get("recommendations", [])
     )
@@ -2728,8 +3175,12 @@ def render_report_html(
     <h1>{safe(target_name)}</h1>
     <p class="meta">Report {safe(report.get("report_id"))} ·
 	      {safe(report.get("generated_at"))}</p>
-	  </header>
-	  {review_overview}
+  </header>
+  <div class="notice"><strong>Responsible-use boundary:</strong> this report
+    presents cited public evidence for human review. It must not be used to infer
+    mental health, diagnose personality, infer protected traits, or make an
+    automated employment decision.</div>
+  {review_overview}
 	  <section class="summary">
     <h2>Executive summary</h2>
     <p>{safe(report.get("executive_summary"))}</p>
@@ -2770,6 +3221,9 @@ def render_report_html(
   {contradictions or "<p>No contradiction entries were produced.</p>"}
   <h2>Evidence appendix</h2>
   {evidence_ledger or "<p>No evidence records were produced.</p>"}
+  <h2>Analyst review decisions</h2>
+  <p>{safe(adjudication_summary.get("notice") or "No analyst exclusions were recorded.")}</p>
+  {adjudication_decisions or "<p>No analyst decisions were recorded.</p>"}
   <h2>Recommendations</h2>
   <ul>{recommendations}</ul>
   <h2>Limitations</h2>
@@ -2784,10 +3238,9 @@ def render_report_html(
 async def download_html_report(investigation_id: UUID) -> Response:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
-        report = (investigation.case_metadata or {}).get("structured_report")
-        if not isinstance(report, dict):
+        report = _effective_report(investigation)
+        if report is None:
             raise HTTPException(status_code=409, detail="Report is not ready")
-        report = _redact_for_display(report)
         review_summary = _graph_document(investigation).get("review_summary", {})
         filename = f"deepvault-{investigation_id}.html"
         return Response(

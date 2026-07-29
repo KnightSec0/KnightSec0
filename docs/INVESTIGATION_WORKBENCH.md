@@ -117,6 +117,33 @@ and review queue as the dashboard. Full publisher provenance remains available
 inside a collapsed technical section, and the evidence appendix remains
 complete for authorized audit and printing.
 
+## Analyst adjudication and false positives
+
+The Evidence view lets an analyst mark one or more evidence records as:
+
+- **Analyst accepted** after checking the cited public attributes;
+- **Needs review** when more corroboration is required;
+- **False positive** when the observation belongs to another person, is stale,
+  generic, duplicated, or is a source error.
+
+A false-positive decision requires a written note. DeepVault immediately removes
+that evidence from the simplified and technical graphs, findings, timelines,
+contradictions, reports, and customer exports. It does not delete the collected
+record: the evidence ID, decision, reason, reviewer, prior decision, and timestamp
+remain in the case audit history. Selecting **Restore to review** makes the
+observation available again and appends another audit event.
+
+Analyst acceptance does not rewrite the source confidence. The interface shows
+the manual decision alongside the original technical score.
+
+## Responsible decision support
+
+DeepVault reports cited public evidence for qualified human review. It must not
+diagnose mental health, infer protected traits, derive intimate preferences or
+personality, or automatically rank, reject, or recommend a person for employment.
+Employment-related reviews should be limited to relevant, consented, verifiable
+facts and the legal safeguards applicable to the organization and jurisdiction.
+
 ## Pivot safety
 
 Analyst-triggered transforms appear only when:

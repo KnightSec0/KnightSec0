@@ -11,10 +11,13 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
 from dashboard.app import (  # noqa: E402
+    EvidenceAdjudicationRequest,
+    EvidenceDecisionStatus,
     Investigation,
     InvestigationCreate,
     TransformRequest,
     _active_transform_run_count,
+    _effective_report,
     _gexf_document,
     _graph_csv_document,
     _graph_document,
@@ -40,6 +43,25 @@ def valid_request(**overrides):
 
 
 class DashboardRequestValidationTests(unittest.TestCase):
+    def test_false_positive_decision_requires_an_analyst_note(self):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "requires an analyst note",
+        ):
+            EvidenceAdjudicationRequest(
+                evidence_ids=["EVID-1"],
+                status=EvidenceDecisionStatus.FALSE_POSITIVE,
+                reason_code="identity_mismatch",
+            )
+
+        decision = EvidenceAdjudicationRequest(
+            evidence_ids=["EVID-1", "EVID-1"],
+            status=EvidenceDecisionStatus.FALSE_POSITIVE,
+            reason_code="identity_mismatch",
+            note="The public profile belongs to a different person.",
+        )
+        self.assertEqual(decision.evidence_ids, ["EVID-1"])
+
     def test_temporal_comparison_is_explicit_opt_in(self):
         self.assertFalse(
             InvestigationCreate(**valid_request()).compare_previous_cases
@@ -332,6 +354,108 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertEqual(document["review_summary"]["counts"]["suppressed"], 1)
         self.assertEqual(document["review_summary"]["priority_leads"], [])
 
+    def test_false_positive_is_removed_from_views_exports_and_report(self):
+        investigation = self.investigation()
+        structured_report = investigation.case_metadata["structured_report"]
+        structured_report["findings"] = [
+            {
+                "title": "Candidate profile",
+                "statement": "The profile may belong to the person.",
+                "evidence_ids": ["EVID-1"],
+            }
+        ]
+        structured_report["timeline"] = [
+            {
+                "description": "Candidate profile event.",
+                "evidence_ids": ["EVID-1"],
+            }
+        ]
+        structured_report["contradictions"] = [
+            {
+                "description": "Candidate mismatch.",
+                "evidence_ids": ["EVID-1"],
+            }
+        ]
+        investigation.case_metadata["evidence_adjudications"] = {
+            "EVID-1": {
+                "status": "false_positive",
+                "reason_code": "identity_mismatch",
+                "note": "The profile belongs to another person.",
+                "reviewer": "Analyst A",
+                "updated_at": "2026-07-29T10:00:00Z",
+            }
+        }
+        investigation.case_metadata["adjudication_audit"] = [
+            {
+                "id": "ADJ-1",
+                "evidence_id": "EVID-1",
+                "decision": investigation.case_metadata[
+                    "evidence_adjudications"
+                ]["EVID-1"],
+                "recorded_at": "2026-07-29T10:00:00Z",
+            }
+        ]
+
+        document = _graph_document(investigation)
+        report = _effective_report(investigation)
+        mapping = _mapping_document(investigation)
+
+        self.assertEqual(document["falsePositiveCount"], 1)
+        self.assertEqual(document["stats"]["evidence_count"], 0)
+        self.assertEqual(document["stats"]["relationship_count"], 0)
+        self.assertEqual(
+            [item["entity_id"] for item in document["entities"]],
+            ["NODE-TARGET"],
+        )
+        self.assertEqual(
+            document["review_summary"]["counts"]["candidate_observations"],
+            0,
+        )
+        self.assertEqual(report["evidence_ledger"], [])
+        self.assertEqual(report["evidence_count"], 0)
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(report["timeline"], [])
+        self.assertEqual(report["contradictions"], [])
+        self.assertEqual(report["overall_risk"], "review_required")
+        self.assertIn("excluded as false positives", report["executive_summary"])
+        self.assertEqual(
+            [item["id"] for item in mapping["identifiers"]],
+            ["NODE-TARGET"],
+        )
+        self.assertNotIn("EVID-1", _graphml_document(investigation).decode())
+
+        rendered = render_report_html(
+            report,
+            investigation.target_name,
+            review_summary=document["review_summary"],
+        )
+        self.assertIn("Analyst review decisions", rendered)
+        self.assertIn("The profile belongs to another person.", rendered)
+        self.assertIn("must not be used to infer", rendered)
+
+    def test_restoring_evidence_to_review_makes_it_visible_again(self):
+        investigation = self.investigation()
+        investigation.case_metadata["evidence_adjudications"] = {
+            "EVID-1": {
+                "status": "needs_review",
+                "reason_code": "requires_more_evidence",
+                "note": "Restored for verification.",
+                "reviewer": "Analyst A",
+                "updated_at": "2026-07-29T10:00:00Z",
+            }
+        }
+
+        document = _graph_document(investigation)
+        profile = next(
+            item
+            for item in document["entities"]
+            if item["entity_id"] == "NODE-PROFILE"
+        )
+        self.assertEqual(document["stats"]["evidence_count"], 1)
+        self.assertEqual(profile["adjudication_status"], "needs_review")
+        self.assertEqual(profile["confidence_label"], "Analyst review required")
+        self.assertIn("needs_review", _graph_csv_document(investigation))
+
     def test_interoperable_exports_keep_relationship_evidence_ids(self):
         investigation = self.investigation()
 
@@ -349,6 +473,10 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertIn("relationship,EDGE-1", csv_export)
         self.assertIn("EVID-1", csv_export)
         self.assertIn("review_priority,review_label,source_tools", csv_export)
+        self.assertIn(
+            "adjudication_status,adjudication_notes",
+            csv_export,
+        )
         self.assertIn("summary,verdict", csv_export)
         self.assertIn("Possible match", csv_export)
 
@@ -400,6 +528,9 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertIn('authorized_target: "Case subject"', workbench)
         self.assertIn("Approved transforms", workbench)
         self.assertNotIn("Authorized transforms", workbench)
+        self.assertIn("Mark false positive", workbench)
+        self.assertIn("Restore to review", workbench)
+        self.assertIn("mental health", workbench)
         self.assertIn("Shift-click to compare", workbench)
         self.assertIn("graph.graphml", workbench)
         self.assertIn("graph.gexf", workbench)
