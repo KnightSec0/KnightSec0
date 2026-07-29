@@ -535,7 +535,10 @@ class DashboardGraphExportTests(unittest.TestCase):
 
         self.assertIn("--bg: #071326", index)
         self.assertIn("--accent: #c1121f", index)
-        self.assertIn('src="/static/workbench.js"', index)
+        self.assertIn(
+            'src="/static/workbench.js?v=entity-click-v2"',
+            index,
+        )
         self.assertIn("Case mandate reference", index)
         self.assertIn("Start investigation", index)
         self.assertNotIn("Start authorized investigation", index)
