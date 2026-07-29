@@ -7,9 +7,17 @@ account to the investigated person.
 
 ## Result views
 
-Open a completed case at `http://127.0.0.1:8080` and use the four result tabs:
+Open a completed case at `http://127.0.0.1:8080`. The default **Overview**
+answers what was found, how reliable it is, and what to review next without
+requiring graph-analysis or cybersecurity knowledge. Five result tabs remain
+available:
 
+- **Overview** gives a cited plain-language verdict, separates supported,
+  review-first, low-signal, and hidden-noise results, provides a ranked manual
+  review queue, explains coverage gaps, and states what must not be concluded.
 - **Graph** combines normalized observations from every permitted connector.
+  It opens in simplified mode with the target and the strongest review leads;
+  the full technical provenance graph remains one click away.
   Drag nodes to arrange them, drag the background to pan, use the wheel to zoom,
   double-click a node to isolate its neighborhood, or Shift-click several nodes
   to compare them.
@@ -28,10 +36,15 @@ employment, or identity claim.
 
 ## Graph controls
 
-The graph can be filtered by source, entity type, and minimum confidence. Entity
-clusters can be collapsed for large cases without changing the underlying
-evidence. Edge labels can be hidden, the viewport can be reset, and reviewed
-node positions can be saved to the case.
+The simplified graph hides publisher-only nodes, generic search/home endpoints,
+rejected endpoints, and quarantined sensitive username matches. This removes
+visual noise without deleting audit evidence. An analyst can switch to the full
+technical graph and can explicitly reveal suppressed results.
+
+Both graph modes can be filtered by source, entity type, and minimum confidence.
+Entity clusters can be collapsed for large cases without changing the
+underlying evidence. Edge labels can be hidden, the viewport can be reset, and
+reviewed node positions can be saved to the case.
 
 Confidence is a review aid:
 
@@ -40,6 +53,19 @@ Confidence is a review aid:
 - dashed edges remain possible or insufficiently supported;
 - confidence from multiple username enumeration tools is not treated as
   independent identity corroboration.
+
+The Overview replaces raw scores with four review labels:
+
+- **Supported** means the identity hypothesis reached probable or stronger;
+- **Check first** means a manual review is worthwhile, not that ownership is
+  verified;
+- **Unverified lead** means a single low-signal observation;
+- **Hidden by default** means a generic, rejected, or sensitive observation
+  retained only for authorized audit.
+
+Every Overview statement and review lead displays its evidence IDs. Operational
+coverage messages are labeled separately because tool availability is not a
+claim about the investigated person.
 
 The red and dark-blue palette uses red for selection, breach metadata, and
 important controls. It does not convert a low-confidence observation into a
@@ -56,6 +82,12 @@ and also returns a UI-friendly normalized model:
   tools, reason, provenance chain, and evidence IDs;
 - `clusters`: counts by entity type;
 - `stats`: entity, relationship, evidence, and source counts.
+- `review_summary`: a cited verdict, conservative counters, ranked review leads,
+  plain-language key points and cautions, and grouped source coverage;
+- review fields on every entity: `review_priority`, `confidence_label`,
+  `plain_language_explanation`, `quality_status`, `publisher_count`,
+  `sensitive`, and `generic_endpoint`;
+- `plain_language_type` on every normalized relationship.
 
 The API rejects malformed graph exports when a relationship has no evidence ID,
 cites unknown evidence, or references a node outside the case graph.

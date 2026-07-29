@@ -28,6 +28,13 @@
     public_observation: "O",
     cluster: "C",
   };
+  const plainRelationshipLabels = {
+    candidate_profile: "Possible public profile",
+    candidate_observation: "Possible public observation",
+    publishes_attribute: "Discovery tool returned this result",
+    breach_association: "Breach metadata reference",
+    service_registration: "Service registration signal",
+  };
 
   const html = (value = "") => String(value).replace(
     /[&<>"']/g,
@@ -61,16 +68,50 @@
     }
   };
   const unique = values => [...new Set(values.filter(Boolean))];
+  const relationshipLabel = value => plainRelationshipLabels[value]
+    || titleCase(value || "cited relationship");
+  const emailForDisplay = value => {
+    const [local, domain] = String(value || "").split("@");
+    if (!local || !domain) return value || "";
+    return `${local.slice(0, 2)}${"*".repeat(Math.min(5, Math.max(2, local.length - 2)))}@${domain}`;
+  };
+  const evidenceReferences = (values, limit = 3) => {
+    const cited = unique(values || []);
+    if (!cited.length) return `<span class="evidence-reference">No evidence ID</span>`;
+    const visible = cited.slice(0, limit).map(value => `<code>${html(value)}</code>`).join(" ");
+    return `<span class="evidence-reference">${visible}${cited.length > limit
+      ? ` <small>+${cited.length - limit} more</small>` : ""}</span>`;
+  };
+  const confidenceLabel = node => node.confidenceLabel
+    || ({
+      supported: "Supported",
+      review_first: "Check first",
+      low_signal: "Unverified lead",
+      suppressed: "Hidden by default",
+    }[node.reviewPriority])
+    || titleCase(node.identityStatus || "insufficient_evidence");
+  const isGenericEndpoint = value => {
+    const url = safeUrl(value);
+    if (!url) return false;
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLocaleLowerCase().replace(/^www\./, "");
+    const path = parsed.pathname.replace(/\/+$/, "") || "/";
+    return (host === "discord.com" && path === "/")
+      || (host === "scholar.google.com" && path.toLocaleLowerCase() === "/scholar")
+      || (host === "op.gg" && path.toLocaleLowerCase() === "/lol/summoners/search");
+  };
 
   function currentState(caseId) {
     if (!caseStates.has(caseId)) {
       caseStates.set(caseId, {
-        tab: "graph",
+        tab: "overview",
         source: "all",
         type: "all",
         minimumConfidence: 0,
-        showLabels: true,
+        showLabels: false,
         collapsed: false,
+        simpleGraph: true,
+        showSuppressed: false,
         focusNodeId: null,
         selectedIds: new Set(),
         positions: new Map(),
@@ -102,19 +143,71 @@
         .map(entry => [entry.object_node_id, entry]),
     );
     const nodeById = Object.fromEntries(nodes.map(node => [node.id, node]));
+    const normalizedByNode = Object.fromEntries(
+      (state.graphDocument?.entities || [])
+        .filter(entity => entity?.entity_id)
+        .map(entity => [entity.entity_id, entity]),
+    );
+    const relationshipSourcesByNode = {};
+    edges.forEach(edge => {
+      const sources = unique((edge.provenance_chain || [])
+        .map(step => step?.source));
+      [edge.source_node_id, edge.target_node_id].forEach(nodeId => {
+        if (!nodeId) return;
+        relationshipSourcesByNode[nodeId] = unique([
+          ...(relationshipSourcesByNode[nodeId] || []),
+          ...sources,
+        ]);
+      });
+    });
     const records = nodes.map(node => {
       const cited = (node.evidence_ids || []).map(id => evidenceById[id]).filter(Boolean);
       const hypothesis = hypothesisByNode[node.id] || {};
+      const normalized = normalizedByNode[node.id] || {};
       const isTarget = node.id === graph.target_node_id;
       const isSource = node.kind === "public_source";
+      const attributes = node.attributes || {};
+      const qualityStatus = normalized.quality_status
+        || attributes.verification_status
+        || "unverified";
+      const sources = unique([
+        ...cited.map(entry => entry.source),
+        ...(relationshipSourcesByNode[node.id] || []),
+      ]);
+      const genericEndpoint = normalized.generic_endpoint
+        ?? isGenericEndpoint(attributes.url || node.label);
+      const sensitive = normalized.sensitive
+        ?? Boolean(attributes.sensitive || qualityStatus === "quarantined");
+      const suppressed = qualityStatus === "rejected"
+        || qualityStatus === "quarantined"
+        || genericEndpoint;
+      let reviewPriority = normalized.review_priority;
+      if (!reviewPriority && !isTarget && !isSource) {
+        if (suppressed) reviewPriority = "suppressed";
+        else if (["confirmed", "highly_probable", "probable"].includes(
+          hypothesis.identity_status,
+        )) reviewPriority = "supported";
+        else if (hypothesis.identity_status === "possible"
+          || node.kind === "service"
+          || sources.length > 1) reviewPriority = "review_first";
+        else reviewPriority = "low_signal";
+      }
       return {
         ...node,
+        attributes,
         confidence: isTarget || isSource ? 1 : Number(hypothesis.confidence || 0),
         identityStatus: isTarget
           ? "authorized_target"
           : (hypothesis.identity_status || "insufficient_evidence"),
-        sources: unique(cited.map(entry => entry.source)),
+        sources,
         sourceUrls: unique(cited.map(entry => entry.source_url)),
+        publisherCount: normalized.publisher_count ?? sources.length,
+        qualityStatus,
+        reviewPriority,
+        confidenceLabel: normalized.confidence_label,
+        plainLanguageExplanation: normalized.plain_language_explanation,
+        sensitive,
+        genericEndpoint,
         hypothesis,
         cited,
       };
@@ -129,6 +222,7 @@
       evidenceById,
       nodeById,
       records,
+      reviewSummary: state.graphDocument?.review_summary || null,
     };
   }
 
@@ -168,8 +262,27 @@
   }
 
   function filteredGraph(data, state) {
+    const candidates = data.records.filter(node =>
+      !["authorized_target", "public_source"].includes(node.kind)
+      && node.reviewPriority !== "suppressed");
+    const prioritized = candidates.filter(node =>
+      ["supported", "review_first"].includes(node.reviewPriority));
+    const simpleCandidates = prioritized.length
+      ? prioritized
+      : [...candidates]
+        .sort((left, right) =>
+          Number(right.confidence || 0) - Number(left.confidence || 0)
+          || String(left.label).localeCompare(String(right.label)))
+        .slice(0, 12);
+    const simpleIds = new Set(simpleCandidates.map(node => node.id));
     let records = data.records.filter(node => {
       const keepTarget = node.kind === "authorized_target";
+      const simpleMatch = !state.simpleGraph
+        || keepTarget
+        || simpleIds.has(node.id);
+      const privacyMatch = state.showSuppressed
+        || node.reviewPriority !== "suppressed"
+        || keepTarget;
       const sourceMatch = keepTarget
         || state.source === "all"
         || node.sources.includes(state.source)
@@ -179,7 +292,7 @@
       const confidenceMatch = node.confidence >= state.minimumConfidence
         || node.kind === "authorized_target"
         || node.kind === "public_source";
-      return sourceMatch && typeMatch && confidenceMatch;
+      return simpleMatch && privacyMatch && sourceMatch && typeMatch && confidenceMatch;
     });
     let allowed = new Set(records.map(node => node.id));
     if (state.focusNodeId) {
@@ -260,9 +373,239 @@
     return {nodes: collapsedNodes, edges: [...aggregated.values()]};
   }
 
+  function fallbackReviewSummary(data, item) {
+    const candidates = data.records.filter(node =>
+      !["authorized_target", "public_source"].includes(node.kind));
+    const grouped = priority => candidates.filter(
+      node => node.reviewPriority === priority,
+    );
+    const supported = grouped("supported");
+    const reviewFirst = grouped("review_first");
+    const lowSignal = grouped("low_signal");
+    const suppressed = grouped("suppressed");
+    const allEvidence = unique(candidates.flatMap(node => node.evidence_ids || []));
+    const overlap = candidates.filter(node =>
+      node.publisherCount > 1 && node.reviewPriority !== "suppressed");
+    const serviceSignals = candidates.filter(node =>
+      node.kind === "service" && node.reviewPriority !== "suppressed");
+    const priorityRank = {supported: 0, review_first: 1, low_signal: 2};
+    const priorityLeads = candidates
+      .filter(node => node.reviewPriority !== "suppressed")
+      .sort((left, right) =>
+        (priorityRank[left.reviewPriority] ?? 9)
+          - (priorityRank[right.reviewPriority] ?? 9)
+        || right.publisherCount - left.publisherCount
+        || right.confidence - left.confidence
+        || String(left.label).localeCompare(String(right.label)))
+      .slice(0, 12)
+      .map(node => ({
+        entity_id: node.id,
+        entity_type: node.kind,
+        label: node.label,
+        public_url: safeUrl(node.attributes?.url || node.label),
+        review_priority: node.reviewPriority,
+        confidence_label: confidenceLabel(node),
+        technical_confidence: node.confidence,
+        source_tools: node.sources,
+        publisher_count: node.publisherCount,
+        explanation: node.plainLanguageExplanation
+          || (node.kind === "service"
+            ? "A public registration check returned a signal. It does not prove account access or current ownership."
+            : node.publisherCount > 1
+              ? "Multiple discovery tools returned this page, but shared catalogues can produce the same result."
+              : "A discovery tool returned a username match. Compare public profile details before attribution."),
+        evidence_ids: node.evidence_ids || [],
+      }));
+    const sourceCoverage = item.report?.source_coverage || [];
+    const coverage = {observed: [], no_results: [], unavailable: [], not_run: []};
+    sourceCoverage.forEach(entry => {
+      const status = String(entry.status || "not_run").toLocaleLowerCase();
+      let group = "not_run";
+      if (Number(entry.evidence_count || 0) > 0) group = "observed";
+      else if (["unavailable", "not_configured", "missing_configuration"].includes(status)) {
+        group = "unavailable";
+      } else if (["no_results", "no_result", "covered_no_results"].includes(status)) {
+        group = "no_results";
+      }
+      coverage[group].push(entry);
+    });
+    const hasSupported = supported.length > 0;
+    const hasReviewFirst = reviewFirst.length > 0;
+    return {
+      verdict: {
+        status: hasSupported
+          ? "supported_matches"
+          : (hasReviewFirst ? "manual_verification_required" : "no_verified_identity_match"),
+        title: hasSupported
+          ? "Supported identity matches require analyst review"
+          : (hasReviewFirst ? "No verified identity match yet" : "No verified identity match"),
+        explanation: hasSupported
+          ? `${supported.length} candidates reached probable or stronger support. Confirm every cited public record before use.`
+          : (hasReviewFirst
+            ? `${reviewFirst.length} candidates should be checked first, but none is safe to attribute automatically.`
+            : "The collected observations are low-signal leads. More independent public evidence is needed."),
+        evidence_ids: allEvidence,
+      },
+      counts: {
+        candidate_observations: candidates.length,
+        supported: supported.length,
+        review_first: reviewFirst.length,
+        low_signal: lowSignal.length,
+        suppressed: suppressed.length,
+        relationships: data.edges.length,
+      },
+      priority_leads: priorityLeads,
+      key_points: [
+        {
+          title: "Candidate observations",
+          statement: `${candidates.length} public observations were retained; ${supported.length} reached probable or stronger identity support.`,
+          evidence_ids: allEvidence,
+        },
+        ...(overlap.length ? [{
+          title: "Cross-tool overlap",
+          statement: `${overlap.length} public pages were returned by more than one discovery tool. Catalogue overlap prioritizes review; it does not verify identity.`,
+          evidence_ids: unique(overlap.flatMap(node => node.evidence_ids || [])),
+        }] : []),
+        ...(serviceSignals.length ? [{
+          title: "Service-registration signals",
+          statement: `${serviceSignals.length} public service signal was returned. It does not prove access or current ownership.`,
+          evidence_ids: unique(serviceSignals.flatMap(node => node.evidence_ids || [])),
+        }] : []),
+      ],
+      coverage,
+      cautions: [
+        {
+          statement: "A matching username or public page does not by itself prove that the investigated person owns the account.",
+          evidence_ids: allEvidence,
+        },
+        ...(overlap.length ? [{
+          statement: "Agreement between username discovery tools may come from shared site catalogues and is not independent identity proof.",
+          evidence_ids: unique(overlap.flatMap(node => node.evidence_ids || [])),
+        }] : []),
+      ],
+    };
+  }
+
+  function coverageMarkup(coverage) {
+    const definitions = [
+      ["observed", "Returned evidence", "The source ran and returned at least one observation."],
+      ["no_results", "Ran, no public result", "No result is not proof that an account does not exist."],
+      ["unavailable", "Unavailable", "Configuration or subscription was missing; this is a coverage gap."],
+      ["not_run", "Not run / not applicable", "These tools did not contribute evidence to this case."],
+    ];
+    return definitions.map(([key, title, description]) => {
+      const entries = coverage?.[key] || [];
+      if (!entries.length) return "";
+      return `<div class="coverage-group">
+        <strong>${html(title)}</strong>
+        <p>${html(description)}</p>
+        <div class="chip-row">${entries.map(entry =>
+          `<span class="chip">${html(entry.source || "unknown")}${entry.evidence_count
+            ? ` · ${html(entry.evidence_count)}` : ""}</span>`).join("")}</div>
+      </div>`;
+    }).join("") || `<p class="sub">No source-execution details were recorded.</p>`;
+  }
+
+  function overviewMarkup(item, data) {
+    if (!item.report) {
+      return `<div class="empty-tab">
+        The plain-language assessment will appear when evidence collection and normalization finish.
+      </div>`;
+    }
+    const summary = data.reviewSummary || fallbackReviewSummary(data, item);
+    const verdict = summary.verdict || {};
+    const counts = summary.counts || {};
+    const leads = summary.priority_leads || [];
+    const cautions = (summary.cautions || []).filter(
+      entry => (entry.evidence_ids || []).length,
+    );
+    return `<section class="plain-overview">
+      <article class="verdict-card verdict-${html(verdict.status || "unknown")}">
+        <div>
+          <p class="eyebrow">Plain-language assessment</p>
+          <h3>${html(verdict.title || "Assessment pending")}</h3>
+          <p>${html(verdict.explanation || "The evidence graph is still loading.")}</p>
+          ${evidenceReferences(verdict.evidence_ids || [])}
+        </div>
+        <div class="verdict-counts">
+          <div><strong>${html(counts.supported || 0)}</strong><span>Supported</span></div>
+          <div><strong>${html(counts.review_first || 0)}</strong><span>Check first</span></div>
+          <div><strong>${html(counts.low_signal || 0)}</strong><span>Unverified</span></div>
+          <div><strong>${html(counts.suppressed || 0)}</strong><span>Hidden noise</span></div>
+        </div>
+      </article>
+      <div class="overview-callout">
+        <strong>How to read this result</strong>
+        <p>A candidate means “a tool found a public trace worth checking.” It does not mean DeepVault verified that the person owns it.</p>
+      </div>
+      <section class="priority-section">
+        <div class="section-heading"><div><p class="eyebrow">Review queue</p>
+          <h3>What to check first</h3></div>
+          <p class="sub">Ordered by evidence quality and cross-tool overlap, never by how dramatic a site appears.</p></div>
+        <div class="lead-list">${leads.slice(0, 10).map((lead, index) => {
+          const url = safeUrl(lead.public_url || lead.label);
+          return `<article class="lead-card lead-${html(lead.review_priority)}">
+            <span class="lead-rank">${index + 1}</span>
+            <div class="lead-copy">
+              <div class="lead-heading"><strong>${html(lead.label || lead.entity_id)}</strong>
+                <span class="review-badge">${html(lead.confidence_label || "Unverified lead")}</span></div>
+              <p>${html(lead.explanation)}</p>
+              <div class="lead-meta"><span>${html((lead.source_tools || []).join(" + ") || "unknown source")}</span>
+                <span>${html(percent(lead.technical_confidence))} technical confidence</span></div>
+              ${evidenceReferences(lead.evidence_ids || [])}
+            </div>
+            <div class="lead-actions">
+              <button class="secondary overview-focus" type="button"
+                data-node-id="${html(lead.entity_id)}">View on graph</button>
+              ${url ? `<a class="secondary" href="${html(url)}" target="_blank"
+                rel="noreferrer">Open public page</a>` : ""}
+            </div>
+          </article>`;
+        }).join("") || `<div class="empty-tab compact-empty">No candidate is ready for prioritized review.</div>`}</div>
+      </section>
+      <section class="overview-grid">
+        <article class="panel"><p class="eyebrow">What was actually found</p>
+          ${(summary.key_points || []).map(point => `<div class="plain-finding">
+            <strong>${html(point.title)}</strong><p>${html(point.statement)}</p>
+            ${evidenceReferences(point.evidence_ids || [])}</div>`).join("")
+            || `<p class="sub">No cited observations are available.</p>`}</article>
+        <article class="panel"><p class="eyebrow">What you must not conclude</p>
+          ${cautions.map(caution => `<div class="plain-finding caution">
+            <p>${html(caution.statement)}</p>${evidenceReferences(caution.evidence_ids)}</div>`).join("")
+            || `<p class="sub">No evidence-backed cautions were generated.</p>`}
+          ${Number(counts.suppressed || 0) ? `<div class="privacy-note">
+            ${html(counts.suppressed)} misleading, generic, rejected, or sensitive candidate(s) are hidden by default.
+            They remain in the evidence ledger for authorized audit.</div>` : ""}
+        </article>
+        <article class="panel overview-wide"><p class="eyebrow">Tool coverage — not person facts</p>
+          <p class="sub">Unavailable and no-result sources reduce what DeepVault can conclude. They are not evidence about the person.</p>
+          <div class="coverage-groups">${coverageMarkup(summary.coverage)}</div>
+        </article>
+        <article class="panel overview-wide next-step-panel"><p class="eyebrow">Recommended manual check</p>
+          <ol>
+            <li>Open a prioritized public page.</li>
+            <li>Compare biography, location, employer, profile links, and stable public identifiers.</li>
+            <li>Record supporting or contradictory evidence before changing identity status.</li>
+            <li>Do not use account recovery, passwords, cookies, private messages, or leaked credentials.</li>
+          </ol>
+        </article>
+      </section>
+    </section>`;
+  }
+
   function graphMarkup(item, state, data) {
     const filters = availableFilters(data);
+    const visible = filteredGraph(data, state);
+    const suppressedCount = data.records.filter(
+      node => node.reviewPriority === "suppressed",
+    ).length;
     return `
+      <div class="graph-mode-banner">
+        <div><strong>${state.simpleGraph ? "Simplified evidence map" : "Full technical graph"}</strong>
+          <span>Showing ${visible.nodes.length} of ${data.records.length} entities</span></div>
+        <button class="secondary" id="graph-mode" type="button">${state.simpleGraph
+          ? "Show full technical graph" : "Return to simplified graph"}</button>
+      </div>
       <section class="graph-toolbar">
         <label>Source
           <select id="graph-source-filter">
@@ -289,6 +632,9 @@
             id="graph-collapse" type="button">${state.collapsed ? "Expand clusters" : "Collapse clusters"}</button>
           <button class="secondary ${state.showLabels ? "active" : ""}"
             id="graph-labels" type="button">Edge labels</button>
+          ${!state.simpleGraph && suppressedCount ? `<button class="secondary ${state.showSuppressed ? "active" : ""}"
+            id="graph-suppressed" type="button">${state.showSuppressed
+              ? "Hide suppressed results" : `Show ${suppressedCount} suppressed`}</button>` : ""}
           <button class="secondary" id="graph-save" type="button">Save layout</button>
         </div>
       </section>
@@ -301,11 +647,11 @@
             double-click for neighborhood · Shift-click to compare
           </div>
           <div class="graph-legend">
-            <span><i class="solid"></i> cited relationship</span>
-            <span><i class="dashed"></i> possible or insufficient</span>
+            <span><i class="solid"></i> evidence-supported relationship</span>
+            <span><i class="dashed"></i> unverified candidate</span>
             <span><b class="legend-target">P</b> authorized target</span>
             <span><b class="legend-breach">!</b> breach metadata</span>
-            <span>Ring: green ≥90 · yellow ≥70 · orange ≥40 · red &lt;40</span>
+            <span>Confidence helps order review; it does not prove ownership</span>
           </div>
         </div>
         <aside class="node-inspector" id="node-inspector">
@@ -336,7 +682,7 @@
         <h3>${selected.length} selected nodes</h3>
         ${selected.map(node => `<article class="inspector-entity">
           <strong>${html(node.label)}</strong>
-          <span>${html(titleCase(node.kind))} · ${html(percent(node.confidence))}</span>
+          <span>${html(titleCase(node.kind))} · ${html(confidenceLabel(node))}</span>
         </article>`).join("")}
         <h4>Shared evidence</h4>
         <p class="evidence">${[...commonEvidence].map(html).join(" · ") || "No shared evidence IDs"}</p>
@@ -375,14 +721,16 @@
       <p class="eyebrow">${html(titleCase(node.kind))}</p>
       <h3>${html(node.label)}</h3>
       <div class="inspector-score">
-        <strong>${html(percent(node.confidence))}</strong>
-        <span>${html(titleCase(node.identityStatus))}</span>
+        <strong>${html(confidenceLabel(node))}</strong>
+        <span>${html(percent(node.confidence))} technical confidence ·
+          ${html(titleCase(node.identityStatus))}</span>
       </div>
       ${nodeSourcesMarkup(node)}
       ${profileUrl ? `<a class="secondary inspector-link" href="${html(profileUrl)}"
         target="_blank" rel="noreferrer">Open cited public page</a>` : ""}
       <h4>Why this match?</h4>
-      <p>${html(node.hypothesis?.claim || "This entity is retained because cited source evidence produced the observation. No identity attribution is implied.")}</p>
+      <p>${html(node.plainLanguageExplanation || node.hypothesis?.claim
+        || "A cited source produced this observation. It is not an automatic identity or ownership claim.")}</p>
       ${(node.hypothesis?.limitations || []).length
         ? `<ul class="compact-list">${node.hypothesis.limitations.map(value =>
             `<li>${html(value)}</li>`).join("")}</ul>` : ""}
@@ -400,7 +748,7 @@
           ? edge.target_node_id : edge.source_node_id;
         const peer = data.nodeById[peerId];
         return `<article class="relationship-card">
-          <strong>${html(edge.relationship)}</strong>
+          <strong>${html(relationshipLabel(edge.relationship))}</strong>
           <span>${html(peer?.label || peerId)} · ${html(percent(edge.confidence))}</span>
           <small>${html(edge.explanation || "")}</small>
           <em>${(edge.evidence_ids || []).map(html).join(" · ")}</em>
@@ -554,7 +902,9 @@
           marker-end="url(#arrow)"><title>${html(edge.explanation || edge.relationship)} ·
           Evidence ${(edge.evidence_ids || []).map(html).join(", ")}</title></line>
         ${state.showLabels ? `<text x="${middleX}" y="${middleY - 6}">${html(
-          edge.count > 1 ? `${edge.relationship} ×${edge.count}` : edge.relationship,
+          edge.count > 1
+            ? `${relationshipLabel(edge.relationship)} ×${edge.count}`
+            : relationshipLabel(edge.relationship),
         )}</text>` : ""}
       </g>`;
     }).join("");
@@ -576,8 +926,7 @@
           transform="rotate(-90)"></circle>
         <text class="node-icon" y="6">${html(entityIcons[node.kind] || "O")}</text>
         <text class="node-label" y="52">${html(String(node.label).slice(0, 34))}</text>
-        <text class="node-score" y="67">${html(percent(node.confidence))} ·
-          ${html(titleCase(node.identityStatus))}</text>
+        <text class="node-score" y="67">${html(confidenceLabel(node))}</text>
         <title>${html(node.label)} · Evidence ${(node.evidence_ids || []).map(html).join(", ")}</title>
       </g>`;
     }).join("");
@@ -761,6 +1110,16 @@
   }
 
   function bindGraphControls(item, state, data) {
+    document.querySelector("#graph-mode")?.addEventListener("click", () => {
+      state.simpleGraph = !state.simpleGraph;
+      if (state.simpleGraph) state.showSuppressed = false;
+      state.source = "all";
+      state.type = "all";
+      state.minimumConfidence = 0;
+      state.focusNodeId = null;
+      state.selectedIds = new Set();
+      drawActiveGraph(item, state, data);
+    });
     document.querySelector("#graph-source-filter")?.addEventListener("change", event => {
       state.source = event.target.value;
       drawActiveGraph(item, state, data);
@@ -785,6 +1144,12 @@
     });
     document.querySelector("#graph-labels")?.addEventListener("click", () => {
       state.showLabels = !state.showLabels;
+      drawActiveGraph(item, state, data);
+    });
+    document.querySelector("#graph-suppressed")?.addEventListener("click", () => {
+      state.showSuppressed = !state.showSuppressed;
+      state.focusNodeId = null;
+      state.selectedIds = new Set();
       drawActiveGraph(item, state, data);
     });
     document.querySelector("#graph-save")?.addEventListener("click", async event => {
@@ -812,15 +1177,28 @@
     bindInspector(item, state, data);
   }
 
+  function drawActiveOverview(item, state, data) {
+    const panel = document.querySelector("[data-tab-panel='overview']");
+    if (!panel) return;
+    panel.innerHTML = overviewMarkup(item, data);
+    panel.querySelectorAll(".overview-focus").forEach(button =>
+      button.addEventListener("click", () => {
+        state.tab = "graph";
+        state.simpleGraph = true;
+        state.focusNodeId = button.dataset.nodeId;
+        state.selectedIds = new Set([button.dataset.nodeId]);
+        showTab(item, state, data);
+      }));
+  }
+
   function showTab(item, state, data) {
     document.querySelectorAll("[data-result-tab]").forEach(button =>
       button.classList.toggle("active", button.dataset.resultTab === state.tab));
     document.querySelectorAll("[data-tab-panel]").forEach(panel => {
       panel.hidden = panel.dataset.tabPanel !== state.tab;
     });
-    if (state.tab === "graph") {
-      drawActiveGraph(item, state, data);
-    }
+    if (state.tab === "overview") drawActiveOverview(item, state, data);
+    if (state.tab === "graph") drawActiveGraph(item, state, data);
   }
 
   function hydrateGraphDocument(item, state) {
@@ -847,6 +1225,7 @@
           };
         }
         const freshData = graphData(item, state);
+        if (state.tab === "overview") drawActiveOverview(item, state, freshData);
         if (state.tab === "graph") drawActiveGraph(item, state, freshData);
       })
       .catch(() => {})
@@ -874,6 +1253,7 @@
     state.helpers = helpers;
     const data = graphData(item, state);
     const report = item.report;
+    const reviewSummary = data.reviewSummary || fallbackReviewSummary(data, item);
     const progress = item.progress || {};
     const progressPercent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
     const stats = state.graphDocument?.stats || {
@@ -888,7 +1268,7 @@
         <div><p class="eyebrow">CASE ${html(item.authorization_reference || "—")}</p>
           <h2>${html(item.target_name)}</h2>
           <p class="sub">${html(item.target_username || "")}${item.target_email
-            ? ` · ${html(item.target_email)}` : ""}</p></div>
+            ? ` · ${html(emailForDisplay(item.target_email))}` : ""}</p></div>
         <div class="actions export-actions">
           <a class="secondary ${item.has_report ? "" : "disabled"}"
             href="/api/investigations/${item.id}/report.html">Download report</a>
@@ -919,6 +1299,7 @@
       </section>` : ""}
       <nav class="result-tabs" aria-label="Investigation result views">
         ${[
+          ["overview", "Overview", reviewSummary.counts?.review_first || 0],
           ["graph", "Graph", data.nodes.length],
           ["evidence", "Evidence", data.evidence.length],
           ["timeline", "Timeline", report?.timeline?.length || 0],
@@ -926,6 +1307,7 @@
         ].map(([name, label, count]) => `<button type="button" data-result-tab="${name}"
           class="${state.tab === name ? "active" : ""}">${label}<span>${count}</span></button>`).join("")}
       </nav>
+      <div data-tab-panel="overview"></div>
       <div data-tab-panel="graph"></div>
       <div data-tab-panel="evidence" hidden>${evidenceMarkup(data)}</div>
       <div data-tab-panel="timeline" hidden>${timelineMarkup(item)}</div>

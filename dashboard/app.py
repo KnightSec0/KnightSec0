@@ -758,6 +758,379 @@ def _graph_parts(
     return graph, clean_nodes, clean_edges, evidence_index
 
 
+_IDENTITY_STATUS_ORDER = {
+    "unrelated": -1,
+    "insufficient_evidence": 0,
+    "possible": 1,
+    "probable": 2,
+    "highly_probable": 3,
+    "confirmed": 4,
+}
+
+_PLAIN_RELATIONSHIP_LABELS = {
+    "candidate_profile": "Possible public profile",
+    "candidate_observation": "Possible public observation",
+    "publishes_attribute": "Discovery tool returned this result",
+    "breach_association": "Breach metadata references this identifier",
+    "service_registration": "Service registration signal",
+}
+
+
+def _is_generic_profile_endpoint(value: Any) -> bool:
+    """Identify search/home endpoints that cannot represent a person profile."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").casefold().removeprefix("www.")
+    path = (parsed.path or "/").rstrip("/") or "/"
+    return (
+        (host == "discord.com" and path == "/")
+        or (host == "scholar.google.com" and path.casefold() == "/scholar")
+        or (host == "op.gg" and path.casefold() == "/lol/summoners/search")
+    )
+
+
+def _entity_review_details(
+    *,
+    entity: dict[str, Any],
+    publisher_count: int,
+) -> dict[str, Any]:
+    """Translate technical confidence into a conservative review instruction."""
+    metadata = entity.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    quality_status = str(metadata.get("verification_status") or "unverified")
+    identity_status = str(
+        entity.get("identity_status") or "insufficient_evidence"
+    )
+    entity_type = str(entity.get("entity_type") or "public_observation")
+    confidence = float(entity.get("confidence") or 0)
+    generic_endpoint = _is_generic_profile_endpoint(
+        entity.get("canonical_value") or entity.get("label")
+    )
+    sensitive = bool(metadata.get("sensitive")) or quality_status == "quarantined"
+    suppressed = quality_status in {"rejected", "quarantined"} or generic_endpoint
+
+    if entity_type == "authorized_target":
+        priority = "target"
+        confidence_label = "Authorized target"
+        explanation = (
+            "This node contains the identifiers supplied in the authorized case "
+            "scope; it is not a collected identity claim."
+        )
+    elif entity_type == "public_source":
+        priority = "publisher"
+        confidence_label = "Evidence publisher"
+        explanation = (
+            "This technical node records which discovery tool published cited "
+            "observations."
+        )
+    elif suppressed:
+        priority = "suppressed"
+        confidence_label = "Hidden by default"
+        if sensitive:
+            explanation = (
+                "Sensitive-site username similarity is quarantined. It must not "
+                "be attributed to the person without separate, strong evidence."
+            )
+        elif generic_endpoint:
+            explanation = (
+                "This is a generic home or search page, not a person-specific "
+                "profile, so it is hidden from the simplified graph."
+            )
+        else:
+            explanation = (
+                "The quality gate identified a non-profile endpoint, so this "
+                "observation is hidden from the simplified graph."
+            )
+    elif identity_status in {"confirmed", "highly_probable", "probable"}:
+        priority = "supported"
+        confidence_label = {
+            "confirmed": "Confirmed",
+            "highly_probable": "Strongly supported",
+            "probable": "Probable",
+        }[identity_status]
+        explanation = (
+            "The cited evidence supports this identity association. Review the "
+            "evidence IDs before relying on it."
+        )
+    elif identity_status == "possible":
+        priority = "review_first"
+        confidence_label = "Possible match"
+        explanation = (
+            "This candidate has some identity support but still needs manual "
+            "verification against public profile details."
+        )
+    elif entity_type == "service":
+        priority = "review_first"
+        confidence_label = "Service signal"
+        explanation = (
+            "A public service-registration check returned a signal. It does not "
+            "prove account access, current ownership, or activity."
+        )
+    elif publisher_count > 1:
+        priority = "review_first"
+        confidence_label = "Check first"
+        explanation = (
+            "More than one discovery tool returned this public page. Those tools "
+            "may share username catalogues, so the overlap prioritizes review but "
+            "does not independently prove ownership."
+        )
+    else:
+        priority = "low_signal"
+        confidence_label = "Unverified lead"
+        explanation = (
+            "One discovery tool returned a page matching the supplied username. "
+            "Compare public profile details before attributing it to the person."
+        )
+    return {
+        "review_priority": priority,
+        "confidence_label": confidence_label,
+        "plain_language_explanation": explanation,
+        "quality_status": quality_status,
+        "publisher_count": publisher_count,
+        "sensitive": sensitive,
+        "generic_endpoint": generic_endpoint,
+        "technical_confidence": confidence,
+    }
+
+
+def _review_summary(
+    *,
+    entities: list[dict[str, Any]],
+    relationships: list[dict[str, Any]],
+    target_entity_id: Any,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a cited, non-technical assessment over the normalized graph."""
+    candidates = [
+        entity
+        for entity in entities
+        if entity.get("entity_id") != target_entity_id
+        and entity.get("entity_type")
+        not in {"authorized_target", "public_source"}
+    ]
+    supported = [
+        entity
+        for entity in candidates
+        if entity.get("review_priority") == "supported"
+    ]
+    review_first = [
+        entity
+        for entity in candidates
+        if entity.get("review_priority") == "review_first"
+    ]
+    low_signal = [
+        entity
+        for entity in candidates
+        if entity.get("review_priority") == "low_signal"
+    ]
+    suppressed = [
+        entity
+        for entity in candidates
+        if entity.get("review_priority") == "suppressed"
+    ]
+    cited_ids = sorted(
+        {
+            evidence_id
+            for entity in candidates
+            for evidence_id in entity.get("evidence_ids", [])
+        }
+    )
+
+    if supported:
+        verdict_status = "supported_matches"
+        verdict_title = "Supported identity matches require analyst review"
+        verdict_explanation = (
+            f"{len(supported)} candidate"
+            f"{'s' if len(supported) != 1 else ''} reached probable or stronger "
+            "identity support. Confirm the cited public evidence before use."
+        )
+    elif review_first:
+        verdict_status = "manual_verification_required"
+        verdict_title = "No verified identity match yet"
+        verdict_explanation = (
+            f"{len(review_first)} candidate"
+            f"{'s' if len(review_first) != 1 else ''} should be checked first, "
+            "but none is safe to attribute to the person automatically."
+        )
+    else:
+        verdict_status = "no_verified_identity_match"
+        verdict_title = "No verified identity match"
+        verdict_explanation = (
+            "The collected observations are low-signal leads. More public "
+            "identity attributes or independent sources are needed."
+        )
+
+    priority_rank = {"supported": 0, "review_first": 1, "low_signal": 2}
+    priority_leads = sorted(
+        [entity for entity in candidates if entity not in suppressed],
+        key=lambda entity: (
+            priority_rank.get(str(entity.get("review_priority")), 9),
+            -int(entity.get("publisher_count") or 0),
+            -float(entity.get("confidence") or 0),
+            str(entity.get("label") or "").casefold(),
+        ),
+    )[:12]
+    priority_leads = [
+        {
+            "entity_id": entity.get("entity_id"),
+            "entity_type": entity.get("entity_type"),
+            "label": entity.get("label"),
+            "public_url": (
+                entity.get("canonical_value")
+                if isinstance(entity.get("canonical_value"), str)
+                and str(entity.get("canonical_value")).startswith(
+                    ("http://", "https://")
+                )
+                else None
+            ),
+            "review_priority": entity.get("review_priority"),
+            "confidence_label": entity.get("confidence_label"),
+            "technical_confidence": entity.get("confidence"),
+            "source_tools": entity.get("source_tools", []),
+            "publisher_count": entity.get("publisher_count", 0),
+            "explanation": entity.get("plain_language_explanation"),
+            "evidence_ids": entity.get("evidence_ids", []),
+        }
+        for entity in priority_leads
+    ]
+
+    overlap = [
+        entity
+        for entity in candidates
+        if int(entity.get("publisher_count") or 0) > 1
+        and entity.get("review_priority") != "suppressed"
+    ]
+    service_signals = [
+        entity
+        for entity in candidates
+        if entity.get("entity_type") == "service"
+        and entity.get("review_priority") != "suppressed"
+    ]
+    key_points = [
+        {
+            "title": "Candidate observations",
+            "statement": (
+                f"{len(candidates)} public observations were retained; "
+                f"{len(supported)} reached probable or stronger identity support."
+            ),
+            "evidence_ids": cited_ids,
+        }
+    ]
+    if overlap:
+        key_points.append(
+            {
+                "title": "Cross-tool overlap",
+                "statement": (
+                    f"{len(overlap)} public page"
+                    f"{'s were' if len(overlap) != 1 else ' was'} returned by "
+                    "more than one discovery tool. Catalogue overlap makes these "
+                    "review priorities, not verified identities."
+                ),
+                "evidence_ids": sorted(
+                    {
+                        evidence_id
+                        for entity in overlap
+                        for evidence_id in entity.get("evidence_ids", [])
+                    }
+                ),
+            }
+        )
+    if service_signals:
+        key_points.append(
+            {
+                "title": "Service-registration signals",
+                "statement": (
+                    f"{len(service_signals)} public service signal"
+                    f"{'s were' if len(service_signals) != 1 else ' was'} "
+                    "returned. A signal does not prove access or current ownership."
+                ),
+                "evidence_ids": sorted(
+                    {
+                        evidence_id
+                        for entity in service_signals
+                        for evidence_id in entity.get("evidence_ids", [])
+                    }
+                ),
+            }
+        )
+
+    coverage = report.get("source_coverage", [])
+    coverage = coverage if isinstance(coverage, list) else []
+    coverage_groups: dict[str, list[dict[str, Any]]] = {
+        "observed": [],
+        "no_results": [],
+        "unavailable": [],
+        "not_run": [],
+    }
+    for item in coverage:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "not_run").casefold()
+        evidence_count = int(item.get("evidence_count") or 0)
+        if evidence_count:
+            group = "observed"
+        elif status in {"unavailable", "not_configured", "missing_configuration"}:
+            group = "unavailable"
+        elif status in {"no_results", "no_result", "covered_no_results"}:
+            group = "no_results"
+        else:
+            group = "not_run"
+        coverage_groups[group].append(
+            {
+                "source": item.get("source"),
+                "status": item.get("status"),
+                "evidence_count": evidence_count,
+                "reason": item.get("reason"),
+            }
+        )
+
+    return {
+        "verdict": {
+            "status": verdict_status,
+            "title": verdict_title,
+            "explanation": verdict_explanation,
+            "evidence_ids": cited_ids,
+        },
+        "counts": {
+            "candidate_observations": len(candidates),
+            "supported": len(supported),
+            "review_first": len(review_first),
+            "low_signal": len(low_signal),
+            "suppressed": len(suppressed),
+            "relationships": len(relationships),
+        },
+        "priority_leads": priority_leads,
+        "key_points": key_points,
+        "coverage": coverage_groups,
+        "cautions": [
+            {
+                "statement": (
+                    "A matching username or public page does not by itself prove "
+                    "that the investigated person owns the account."
+                ),
+                "evidence_ids": cited_ids,
+            },
+            {
+                "statement": (
+                    "Agreement between username discovery tools may come from "
+                    "shared site catalogues and is not independent identity proof."
+                ),
+                "evidence_ids": sorted(
+                    {
+                        evidence_id
+                        for entity in overlap
+                        for evidence_id in entity.get("evidence_ids", [])
+                    }
+                ),
+            },
+        ],
+    }
+
+
 def _normalized_graph_view(
     investigation: Investigation,
     graph: dict[str, Any],
@@ -803,6 +1176,12 @@ def _normalized_graph_view(
                 str(item.get("source"))
                 for item in evidence_items
                 if item.get("source")
+            }
+            | {
+                str(step.get("source"))
+                for edge in edges_by_node.get(node_id, [])
+                for step in edge.get("provenance_chain", [])
+                if isinstance(step, dict) and step.get("source")
             },
             key=str.casefold,
         )
@@ -829,14 +1208,7 @@ def _normalized_graph_view(
                     str(edge.get("identity_status") or "insufficient_evidence")
                     for edge in related_edges
                 ),
-                key=lambda status: {
-                    "unrelated": -1,
-                    "insufficient_evidence": 0,
-                    "possible": 1,
-                    "probable": 2,
-                    "highly_probable": 3,
-                    "confirmed": 4,
-                }.get(status, 0),
+                key=lambda status: _IDENTITY_STATUS_ORDER.get(status, 0),
             )
         if (
             node_id == graph.get("target_node_id")
@@ -845,34 +1217,39 @@ def _normalized_graph_view(
             confidence = 1.0
             identity_status = "authorized_target"
         cluster_counts[kind] = cluster_counts.get(kind, 0) + 1
-        entities.append(
-            {
-                "entity_id": node_id,
-                "entity_type": kind,
-                "label": node.get("label") or node_id,
-                "canonical_value": (
-                    attributes.get("url")
-                    or attributes.get("email")
-                    or attributes.get("address")
-                    or node.get("label")
-                ),
-                "aliases": attributes.get("aliases", []),
-                "source_tools": sources,
-                "source_urls": sorted(
-                    {
-                        str(item.get("source_url"))
-                        for item in evidence_items
-                        if item.get("source_url")
-                    }
-                ),
-                "confidence": confidence,
-                "identity_status": identity_status or "insufficient_evidence",
-                "first_seen": observed[0] if observed else None,
-                "last_seen": observed[-1] if observed else None,
-                "metadata": attributes,
-                "evidence_ids": evidence_ids,
-            }
+        entity = {
+            "entity_id": node_id,
+            "entity_type": kind,
+            "label": node.get("label") or node_id,
+            "canonical_value": (
+                attributes.get("url")
+                or attributes.get("email")
+                or attributes.get("address")
+                or node.get("label")
+            ),
+            "aliases": attributes.get("aliases", []),
+            "source_tools": sources,
+            "source_urls": sorted(
+                {
+                    str(item.get("source_url"))
+                    for item in evidence_items
+                    if item.get("source_url")
+                }
+            ),
+            "confidence": confidence,
+            "identity_status": identity_status or "insufficient_evidence",
+            "first_seen": observed[0] if observed else None,
+            "last_seen": observed[-1] if observed else None,
+            "metadata": attributes,
+            "evidence_ids": evidence_ids,
+        }
+        entity.update(
+            _entity_review_details(
+                entity=entity,
+                publisher_count=len(sources),
+            )
         )
+        entities.append(entity)
 
     relationships = [
         {
@@ -880,6 +1257,12 @@ def _normalized_graph_view(
             "from_entity_id": edge.get("source_node_id"),
             "to_entity_id": edge.get("target_node_id"),
             "relationship_type": edge.get("relationship"),
+            "plain_language_type": _PLAIN_RELATIONSHIP_LABELS.get(
+                str(edge.get("relationship")),
+                str(edge.get("relationship") or "Cited relationship").replace(
+                    "_", " "
+                ).capitalize(),
+            ),
             "confidence": edge.get("confidence"),
             "identity_status": edge.get("identity_status"),
             "source_tools": sorted(
@@ -905,7 +1288,7 @@ def _normalized_graph_view(
         }
         for edge in edges
     ]
-    return {
+    normalized = {
         "target_entity_id": graph.get("target_node_id"),
         "entities": entities,
         "relationships": relationships,
@@ -922,6 +1305,13 @@ def _normalized_graph_view(
             "entities_by_source": dict(sorted(source_counts.items())),
         },
     }
+    normalized["review_summary"] = _review_summary(
+        entities=entities,
+        relationships=relationships,
+        target_entity_id=graph.get("target_node_id"),
+        report=report,
+    )
+    return normalized
 
 
 def _graph_document(investigation: Investigation) -> dict[str, Any]:

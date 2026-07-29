@@ -280,10 +280,50 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertEqual(profile_entity["source_tools"], ["github"])
         self.assertEqual(profile_entity["confidence"], 0.62)
         self.assertEqual(profile_entity["evidence_ids"], ["EVID-1"])
+        self.assertEqual(profile_entity["review_priority"], "review_first")
+        self.assertEqual(profile_entity["confidence_label"], "Possible match")
         self.assertEqual(
             graph["relationships"][0]["reason"],
             "Public observation.",
         )
+        self.assertEqual(
+            graph["relationships"][0]["plain_language_type"],
+            "Possible public profile",
+        )
+        self.assertEqual(
+            graph["review_summary"]["verdict"]["title"],
+            "No verified identity match yet",
+        )
+        self.assertEqual(
+            graph["review_summary"]["verdict"]["evidence_ids"],
+            ["EVID-1"],
+        )
+        self.assertEqual(graph["review_summary"]["counts"]["review_first"], 1)
+        self.assertEqual(
+            graph["review_summary"]["priority_leads"][0]["entity_id"],
+            "NODE-PROFILE",
+        )
+
+    def test_simplified_review_hides_generic_profile_endpoints(self):
+        investigation = self.investigation()
+        graph = investigation.case_metadata["structured_report"]["identity_graph"]
+        graph["nodes"][1]["label"] = "https://discord.com/"
+        graph["nodes"][1]["attributes"] = {
+            "url": "https://discord.com/",
+            "verification_status": "unverified",
+        }
+
+        document = _graph_document(investigation)
+        profile = next(
+            item
+            for item in document["entities"]
+            if item["entity_id"] == "NODE-PROFILE"
+        )
+
+        self.assertTrue(profile["generic_endpoint"])
+        self.assertEqual(profile["review_priority"], "suppressed")
+        self.assertEqual(document["review_summary"]["counts"]["suppressed"], 1)
+        self.assertEqual(document["review_summary"]["priority_leads"], [])
 
     def test_interoperable_exports_keep_relationship_evidence_ids(self):
         investigation = self.investigation()
@@ -332,8 +372,13 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertIn("--bg: #071326", index)
         self.assertIn("--accent: #c1121f", index)
         self.assertIn('src="/static/workbench.js"', index)
-        for result_view in ("graph", "evidence", "timeline", "report"):
+        for result_view in ("overview", "graph", "evidence", "timeline", "report"):
             self.assertIn(f'["{result_view}"', workbench)
+        self.assertIn("Plain-language assessment", workbench)
+        self.assertIn("What to check first", workbench)
+        self.assertIn("What you must not conclude", workbench)
+        self.assertIn("Show full technical graph", workbench)
+        self.assertIn("Hidden noise", workbench)
         self.assertIn("Why this match?", workbench)
         self.assertIn("Shift-click to compare", workbench)
         self.assertIn("graph.graphml", workbench)
