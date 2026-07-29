@@ -1,5 +1,5 @@
 """
-DeepVault configuration — loaded from environment variables.
+WorldAtlas configuration — loaded from environment variables.
 """
 
 import os

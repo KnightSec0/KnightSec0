@@ -1,5 +1,5 @@
 """
-Neo4j graph database client for DeepVault.
+Neo4j graph database client for WorldAtlas.
 """
 import logging
 from typing import Optional, Any

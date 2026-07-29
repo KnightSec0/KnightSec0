@@ -1,5 +1,5 @@
 """
-DeepVault Orchestrator — Celery entrypoint and task definitions.
+WorldAtlas Orchestrator — Celery entrypoint and task definitions.
 """
 
 import asyncio
@@ -1330,9 +1330,9 @@ def periodic_healthcheck():
 @worker_ready.connect
 def on_worker_ready(**kwargs):
     asyncio.run(create_tables())
-    logger.info("DeepVault orchestrator ready.")
+    logger.info("WorldAtlas orchestrator ready.")
 
 
 @worker_shutdown.connect
 def on_worker_shutdown(**kwargs):
-    logger.info("DeepVault orchestrator shutting down.")
+    logger.info("WorldAtlas orchestrator shutting down.")

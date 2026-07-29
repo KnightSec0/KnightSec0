@@ -1,6 +1,6 @@
 # Evidence-first identity analysis
 
-DeepVault incorporates the defensible parts of the supplied Chimera/NEXUS
+WorldAtlas incorporates the defensible parts of the supplied Chimera/NEXUS
 prototype as a local analysis layer over evidence that its authorized
 connectors have already collected. It does not run a second, hidden collection
 pipeline.
@@ -8,7 +8,7 @@ pipeline.
 ## What is integrated
 
 - A deterministic identity graph whose nodes, edges and provenance steps
-  reference DeepVault evidence IDs.
+  reference WorldAtlas evidence IDs.
 - Conservative identity hypotheses that distinguish an observed public account
   from attribution of that account to the investigated person.
 - Cross-source links for the same normalized public observation. A single
@@ -39,7 +39,7 @@ public attributes corroborate them.
 ## Temporal semantics
 
 Temporal comparison is off by default and requires explicit case-level opt-in.
-DeepVault then selects the latest completed case having the same normalized
+WorldAtlas then selects the latest completed case having the same normalized
 name, matching operator-supplied email, the same unexpired authorization
 reference, lawful purpose and source scope. If no email was supplied, it can
 fall back to the username and adds an explicit ambiguity warning. Volatile
@@ -49,13 +49,13 @@ wrappers do not create a change.
 A not-observed item means only that the observation was not present in the
 latest successfully covered source. It may reflect changed page behavior or
 connector coverage. It is never evidence that an account or person no longer
-exists. DeepVault suppresses not-observed entries for unavailable, timed-out,
+exists. WorldAtlas suppresses not-observed entries for unavailable, timed-out,
 rate-limited or unqueried sources.
 
 ## Deliberately excluded
 
-The supplied prototype also contained techniques that do not meet DeepVault's
-authorization, privacy or evidentiary requirements. DeepVault does not:
+The supplied prototype also contained techniques that do not meet WorldAtlas's
+authorization, privacy or evidentiary requirements. WorldAtlas does not:
 
 - invent email addresses, phone numbers or usernames and present them as facts;
 - collect passwords, password hashes, session cookies, tokens, private messages

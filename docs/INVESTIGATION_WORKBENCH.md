@@ -1,6 +1,6 @@
 # Investigation workbench
 
-DeepVault's localhost dashboard provides a Maltego-style visual workbench over
+WorldAtlas's localhost dashboard provides a Maltego-style visual workbench over
 the deterministic, evidence-first identity graph. It is a review surface for
 already-collected public evidence, not a license to attribute every returned
 account to the investigated person.
@@ -112,7 +112,7 @@ Each completed case supports:
 
 | Format | Endpoint | Intended use |
 |---|---|---|
-| JSON | `/api/investigations/{id}/graph.json` | Full DeepVault graph and provenance |
+| JSON | `/api/investigations/{id}/graph.json` | Full WorldAtlas graph and provenance |
 | GraphML | `/api/investigations/{id}/graph.graphml` | Gephi and compatible graph tools |
 | GEXF | `/api/investigations/{id}/graph.gexf` | Graph analysis and visualization |
 | CSV | `/api/investigations/{id}/graph.csv` | Plain-language review fields plus technical entity/relationship audit |
@@ -122,7 +122,7 @@ CSV starts with the cited verdict and gives each entity a review priority,
 plain-language label, publisher list, hidden-by-default flag, and explanation.
 Spreadsheet formula-like values are escaped on export. GraphML and CSV retain
 relationship evidence IDs and explanations. GEXF retains node labels, edge
-types, and confidence weights. The DeepVault JSON or GraphML export should
+types, and confidence weights. The WorldAtlas JSON or GraphML export should
 remain the audit source when another visualization tool does not display every
 provenance field.
 
@@ -144,7 +144,7 @@ The Evidence view lets an analyst mark one or more evidence records as:
 - **False positive** when the observation belongs to another person, is stale,
   generic, duplicated, or is a source error.
 
-A false-positive decision requires a written note. DeepVault immediately removes
+A false-positive decision requires a written note. WorldAtlas immediately removes
 that evidence from the simplified and technical graphs, findings, timelines,
 contradictions, reports, and customer exports. It does not delete the collected
 record: the evidence ID, decision, reason, reviewer, prior decision, and timestamp
@@ -156,7 +156,7 @@ the manual decision alongside the original technical score.
 
 ## Responsible decision support
 
-DeepVault reports cited public evidence for qualified human review. It must not
+WorldAtlas reports cited public evidence for qualified human review. It must not
 diagnose mental health, infer protected traits, derive intimate preferences or
 personality, or automatically rank, reject, or recommend a person for employment.
 Employment-related reviews should be limited to relevant, consented, verifiable
@@ -172,5 +172,5 @@ Analyst-triggered transforms appear only when:
 4. the selected node has a supported entity type and cited evidence;
 5. configured result, time, concurrency, and pivot-depth budgets allow it.
 
-DeepVault never accepts passwords, session cookies, leaked credentials, private
+WorldAtlas never accepts passwords, session cookies, leaked credentials, private
 communications, or account-recovery actions as pivots.

@@ -615,7 +615,7 @@
       </article>
       <div class="overview-callout">
         <strong>How to read this result</strong>
-        <p>A candidate means “a tool found a public trace worth checking.” It does not mean DeepVault verified that the person owns it.</p>
+        <p>A candidate means “a tool found a public trace worth checking.” It does not mean WorldAtlas verified that the person owns it.</p>
       </div>
       <section class="priority-section">
         <div class="section-heading"><div><p class="eyebrow">Review queue</p>
@@ -657,7 +657,7 @@
             They remain in the evidence ledger for controlled case audit.</div>` : ""}
         </article>
         <article class="panel overview-wide"><p class="eyebrow">Tool coverage — not person facts</p>
-          <p class="sub">Unavailable and no-result sources reduce what DeepVault can conclude. They are not evidence about the person.</p>
+          <p class="sub">Unavailable and no-result sources reduce what WorldAtlas can conclude. They are not evidence about the person.</p>
           <div class="coverage-groups">${coverageMarkup(summary.coverage)}</div>
         </article>
         <article class="panel overview-wide next-step-panel"><p class="eyebrow">Recommended manual check</p>
@@ -1793,7 +1793,7 @@
         )}</strong></div>
       </div>
       ${item.error ? `<div class="notice">${html(item.error)}</div>` : ""}
-      <div class="notice"><strong>Human decision support:</strong> DeepVault presents
+      <div class="notice"><strong>Human decision support:</strong> WorldAtlas presents
         cited public evidence. It does not diagnose mental health, infer protected
         traits, or make an automated hiring decision.</div>
       ${!report ? `<section class="panel live-progress"><div>

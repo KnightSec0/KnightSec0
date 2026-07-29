@@ -1,1 +1,1 @@
-"""DeepVault localhost dashboard."""
+"""WorldAtlas localhost dashboard."""

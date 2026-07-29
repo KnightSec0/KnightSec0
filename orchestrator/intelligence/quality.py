@@ -342,7 +342,8 @@ def refine_evidence_quality(
             "unverified",
         }:
             notes.append(
-                "Result prominence was reduced by the DeepVault evidence-quality gate."
+                "Result prominence was reduced by the WorldAtlas "
+                "evidence-quality gate."
             )
         canonical_url = quality.get("canonical_url")
         update: dict[str, Any] = {

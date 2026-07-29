@@ -1,11 +1,15 @@
-# 🕵️ DeepVault — The OSINT Investigation Framework
+# SIGMA WorldAtlas Intelligence
 
-**DeepVault** is a locally deployed, Docker-orchestrated open-source
+**SIGMA WorldAtlas Intelligence** (short name: **WorldAtlas**) is a locally
+deployed, Docker-orchestrated open-source
 intelligence (OSINT) platform for authorized investigations of individuals. It
 collects and correlates public-profile, person-search, breach-metadata, and
 authorized infrastructure evidence in a single auditable pipeline.
 
-> ⚠️ **This tool is for authorized security professionals conducting lawful investigations only.** Authorization is your responsibility. DeepVault provides the engine; you provide the legal mandate.
+> **From public evidence to defensible insight.** WorldAtlas is a SIGMA
+> Intelligence Platform.
+
+> ⚠️ **This tool is for authorized security professionals conducting lawful investigations only.** Authorization is your responsibility. WorldAtlas provides the engine; you provide the legal mandate.
 
 ---
 
@@ -63,7 +67,7 @@ credentials into the dashboard.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     DEEPVAULT ORCHESTRATOR (Celery + Python)         │
+│                    WORLDATLAS ORCHESTRATOR (Celery + Python)         │
 │  ┌────────────┐  ┌───────────┐  ┌──────────┐  ┌──────────────────┐ │
 │  │ Surface    │  │ Identity  │  │ Deep Web │  │ Dark Web / Tor   │ │
 │  │ Recon Layer│  │ Correlation│  │ Layer    │  │ Layer            │ │
@@ -147,7 +151,7 @@ collector workflow.
   dark-blue/red interface
 - Explains every node and relationship with evidence IDs, confidence, source
   provenance, limitations, and manual review pivots
-- Exports DeepVault JSON, GraphML, GEXF, CSV, and Mapping Tool schema v2
+- Exports WorldAtlas JSON, GraphML, GEXF, CSV, and Mapping Tool schema v2
 
 See [Investigation workbench](docs/INVESTIGATION_WORKBENCH.md) for graph
 controls, normalized API fields, export formats, and pivot safety.
@@ -291,13 +295,13 @@ docker compose up -d --build
 
 ## 🔒 Legal & Ethical Use
 
-DeepVault is designed for authorized security assessments, background checks with consent, and lawful investigations only. By using this software you agree to:
+WorldAtlas is designed for authorized security assessments, background checks with consent, and lawful investigations only. By using this software you agree to:
 
 - Obtain explicit written authorization before investigating any target
 - Comply with all applicable laws (GDPR, CFAA, DPA, etc.)
 - Maintain chain of custody for all collected evidence
 
-DeepVault is an evidence-review system, not an automated employment-decision or
+WorldAtlas is an evidence-review system, not an automated employment-decision or
 psychological-profiling system. Do not use it to diagnose mental health, infer
 protected traits, derive personality or intimate preferences, or automatically
 rank, reject, or recommend a person for employment. Employment-related use must

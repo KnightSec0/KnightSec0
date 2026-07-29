@@ -11,6 +11,11 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
 from dashboard.app import (  # noqa: E402
+    EXPORT_PREFIX,
+    PRODUCT_FULL_NAME,
+    PRODUCT_NAME,
+    PRODUCT_TAGLINE,
+    PRODUCT_VENDOR,
     EvidenceAdjudicationRequest,
     EvidenceDecisionStatus,
     Investigation,
@@ -273,10 +278,25 @@ class DashboardGraphExportTests(unittest.TestCase):
 
         self.assertEqual(graph["schemaVersion"], 2)
         self.assertEqual(
+            graph["product"],
+            {
+                "name": PRODUCT_FULL_NAME,
+                "shortName": PRODUCT_NAME,
+                "vendor": PRODUCT_VENDOR,
+                "tagline": PRODUCT_TAGLINE,
+            },
+        )
+        self.assertEqual(
             [item["name"] for item in graph["transforms"]],
             ["blackbird"],
         )
         self.assertEqual(mapping["schemaVersion"], 2)
+        self.assertEqual(
+            mapping["name"],
+            "SIGMA WorldAtlas Intelligence — Alice Example",
+        )
+        self.assertIn("WorldAtlas", mapping["target"]["notes"])
+        self.assertNotIn("DeepVault", str(mapping))
         profile = next(
             item
             for item in mapping["identifiers"]
@@ -535,6 +555,10 @@ class DashboardGraphExportTests(unittest.TestCase):
 
         self.assertIn("--bg: #071326", index)
         self.assertIn("--accent: #c1121f", index)
+        self.assertIn("SIGMA WorldAtlas Intelligence", index)
+        self.assertIn("A SIGMA Intelligence Platform", index)
+        self.assertIn('aria-label="WorldAtlas">WA', index)
+        self.assertNotIn("<h1>DeepVault</h1>", index)
         self.assertIn(
             'src="/static/workbench.js?v=entity-click-v2"',
             index,
@@ -576,6 +600,33 @@ class DashboardGraphExportTests(unittest.TestCase):
 
 
 class DashboardReportRenderingTests(unittest.TestCase):
+    def test_product_branding_is_consistent_across_reports_and_exports(self):
+        self.assertEqual(PRODUCT_NAME, "WorldAtlas")
+        self.assertEqual(PRODUCT_FULL_NAME, "SIGMA WorldAtlas Intelligence")
+        self.assertEqual(PRODUCT_VENDOR, "SIGMA")
+        self.assertEqual(
+            PRODUCT_TAGLINE,
+            "From public evidence to defensible insight",
+        )
+        self.assertEqual(EXPORT_PREFIX, "sigma-worldatlas")
+
+        rendered = render_report_html(
+            {
+                "report_id": "REPORT-BRAND",
+                "generated_at": "2026-07-29T12:00:00Z",
+                "executive_summary": "No cited conclusion was produced.",
+                "identity_confidence": "insufficient_evidence",
+                "overall_risk": "not_assessed",
+                "evidence_count": 0,
+                "executive_summary_evidence_ids": [],
+            },
+            "Alice Example",
+        )
+        self.assertIn(PRODUCT_FULL_NAME, rendered)
+        self.assertIn("SIGMA · WORLDATLAS", rendered)
+        self.assertIn(PRODUCT_TAGLINE, rendered)
+        self.assertNotIn("DEEPVAULT · PERSON", rendered)
+
     def test_html_escapes_untrusted_values_and_keeps_evidence_citations(self):
         report = {
             "report_id": "REPORT-1",

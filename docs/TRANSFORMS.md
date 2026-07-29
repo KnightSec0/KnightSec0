@@ -1,8 +1,8 @@
 # Evidence-backed transforms and mapping
 
-DeepVault transforms are analyst-triggered, bounded collection jobs. They turn
+WorldAtlas transforms are analyst-triggered, bounded collection jobs. They turn
 one authorized entity into normalized evidence and then rebuild the case graph
-and report. A transform is not an automatic identity claim, and DeepVault never
+and report. A transform is not an automatic identity claim, and WorldAtlas never
 recursively executes a suggested pivot.
 
 ## What is implemented
@@ -143,7 +143,7 @@ npm install @dagrejs/dagre zod dompurify fuse.js
 npm run dev -- --host 127.0.0.1
 ```
 
-Keep it on `127.0.0.1`. Download `mapping.osint.json` from the DeepVault case
+Keep it on `127.0.0.1`. Download `mapping.osint.json` from the WorldAtlas case
 and import it into the mapping tool. Do not expose its development server or
 investigation files publicly.
 
@@ -185,7 +185,7 @@ pipx install ghunt
 ghunt login
 ```
 
-GHunt is opt-in. Manage its login outside DeepVault and never place Google
+GHunt is opt-in. Manage its login outside WorldAtlas and never place Google
 cookies or session material in case metadata, evidence, reports, or `.env`.
 
 Configure absolute executable locations in the shell that starts the worker:
@@ -255,7 +255,7 @@ sensitive result types.
 
 ## Licensing boundary
 
-DeepVault remains MIT-licensed. Third-party tools are invoked as separately
+WorldAtlas remains MIT-licensed. Third-party tools are invoked as separately
 installed programs and communicate through files, stdout, or HTTP; their source
 is not copied into this repository. Preserve each tool's license and notices.
 In particular, keep GPL/AGPL components such as the Mapping Tool and GHunt

@@ -632,7 +632,7 @@ def _baseline_report(
     )
 
     summary_parts = [
-        f"DeepVault normalized {len(evidence)} source observation(s)."
+        f"WorldAtlas normalized {len(evidence)} source observation(s)."
     ]
     actionable_count = (
         result_quality["confirmed"]
@@ -811,7 +811,7 @@ def _baseline_report(
     if counts["breach"]:
         recommendations.append(
             "Prioritize remediation for verified breach exposure and rotate affected "
-            "credentials outside DeepVault."
+            "credentials outside WorldAtlas."
         )
     if unavailable_count:
         recommendations.append(
@@ -1050,7 +1050,7 @@ def _gate_not_observed_by_coverage(
         update={"not_observed": len(kept)}
     )
     note = (
-        f"{comparison.scope_note} DeepVault omitted {suppressed} possible "
+        f"{comparison.scope_note} WorldAtlas omitted {suppressed} possible "
         "not-observed difference(s) because the current run lacked successful "
         "coverage for the relevant source."
     )

@@ -1,6 +1,6 @@
 # Result quality and identity attribution
 
-DeepVault treats collector output as observations, not automatically as facts
+WorldAtlas treats collector output as observations, not automatically as facts
 about a person. The evidence-quality gate runs after connector normalization and
 before correlation, graph construction, and report generation.
 
@@ -45,7 +45,7 @@ The original observations remain inside the correlated provenance metadata.
 
 ## Coverage-aware conclusions
 
-If selected sources are unavailable, failed, or not queried, DeepVault reports
+If selected sources are unavailable, failed, or not queried, WorldAtlas reports
 coverage as `partial` or `insufficient`. In the absence of concrete exposure
 evidence, incomplete coverage produces an `unknown` exposure assessment rather
 than `low`.

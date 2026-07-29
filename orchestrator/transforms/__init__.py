@@ -1,4 +1,4 @@
-"""Policy-gated graph transforms for normalized DeepVault evidence."""
+"""Policy-gated graph transforms for normalized WorldAtlas evidence."""
 
 from .base import (
     TransformAdapter,

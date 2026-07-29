@@ -1,4 +1,4 @@
-"""Evidence normalization, redaction, and entity correlation for DeepVault."""
+"""Evidence normalization, redaction, and entity correlation for WorldAtlas."""
 
 from .models import (
     ConnectorResult,

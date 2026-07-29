@@ -49,7 +49,10 @@ class BreachInvestigator:
 
     async def _check_hibp(self, emails: list[str]) -> list[dict]:
         """Check Have I Been Pwned API."""
-        headers = {"User-Agent": "DeepVault/1.0", "hibp-api-key": settings.hibp_api_key}
+        headers = {
+            "User-Agent": "SIGMA-WorldAtlas/1.0",
+            "hibp-api-key": settings.hibp_api_key,
+        }
         results = []
         async with aiohttp.ClientSession(headers=headers) as session:
             for email in emails:

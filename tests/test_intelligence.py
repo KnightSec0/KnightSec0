@@ -163,6 +163,8 @@ class IntelligenceTests(unittest.TestCase):
         self.assertTrue(report.findings[0].evidence_ids)
         serialized = report.model_dump_json()
         self.assertNotIn("must-not-survive", serialized)
+        self.assertNotIn("DeepVault", serialized)
+        self.assertIn("WorldAtlas normalized", serialized)
         self.assertEqual(len(report.evidence_ledger), 1)
         self.assertIsNotNone(report.identity_graph)
         self.assertTrue(report.identity_graph.edges)

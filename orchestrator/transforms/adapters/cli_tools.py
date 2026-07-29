@@ -1,6 +1,6 @@
 """Safe adapters for separately installed CLI tools.
 
-Third-party code is never imported into DeepVault.  Each adapter executes a
+Third-party code is never imported into WorldAtlas.  Each adapter executes a
 fixed argv list, parses a bounded machine-readable result, and emits minimized
 evidence.  Missing tools are reported as source-coverage gaps.
 """
@@ -587,7 +587,7 @@ class GHuntTransform(TransformAdapter):
         independence_group="google",
         description=(
             "Requires explicit consent and a separately managed GHunt session. "
-            "Cookies are never accepted or persisted by DeepVault."
+            "Cookies are never accepted or persisted by WorldAtlas."
         ),
     )
 

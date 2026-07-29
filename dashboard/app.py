@@ -1,4 +1,4 @@
-"""Local FastAPI dashboard for governed DeepVault investigations."""
+"""Local FastAPI dashboard for governed SIGMA WorldAtlas investigations."""
 
 from __future__ import annotations
 
@@ -30,6 +30,13 @@ from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+PRODUCT_NAME = "WorldAtlas"
+PRODUCT_FULL_NAME = "SIGMA WorldAtlas Intelligence"
+PRODUCT_VENDOR = "SIGMA"
+PRODUCT_TAGLINE = "From public evidence to defensible insight"
+EXPORT_PREFIX = "sigma-worldatlas"
 
 
 class Base(DeclarativeBase):
@@ -580,8 +587,11 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="DeepVault",
-    description="Local governed person-intelligence dashboard",
+    title=PRODUCT_FULL_NAME,
+    description=(
+        "Local governed person-intelligence dashboard by "
+        f"{PRODUCT_VENDOR}"
+    ),
     version="0.2.0",
     lifespan=lifespan,
 )
@@ -1708,6 +1718,12 @@ def _graph_document(investigation: Investigation) -> dict[str, Any]:
     ]
     return {
         "schemaVersion": 2,
+        "product": {
+            "name": PRODUCT_FULL_NAME,
+            "shortName": PRODUCT_NAME,
+            "vendor": PRODUCT_VENDOR,
+            "tagline": PRODUCT_TAGLINE,
+        },
         "caseId": str(investigation.id),
         "authorizationReference": metadata.get("authorization_reference"),
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -2122,7 +2138,7 @@ def _mapping_document(investigation: Investigation) -> dict[str, Any]:
                     for key, value in fields.items()
                     if value is not None
                 },
-                "notes": "Evidence-backed DeepVault graph node.",
+                "notes": f"Evidence-backed {PRODUCT_NAME} graph node.",
                 "position": positions.get(
                     node_id,
                     {
@@ -2198,7 +2214,7 @@ def _mapping_document(investigation: Investigation) -> dict[str, Any]:
     return {
         "schemaVersion": 2,
         "id": str(investigation.id),
-        "name": f"DeepVault — {investigation.target_name}",
+        "name": f"{PRODUCT_FULL_NAME} — {investigation.target_name}",
         "createdAt": (
             investigation.created_at.isoformat()
             if investigation.created_at
@@ -2208,7 +2224,7 @@ def _mapping_document(investigation: Investigation) -> dict[str, Any]:
         "target": {
             "name": investigation.target_name,
             "notes": (
-                "Imported from a governed DeepVault case. Every derived "
+                f"Imported from a governed {PRODUCT_NAME} case. Every derived "
                 "relationship retains its evidence IDs."
             ),
         },
@@ -2406,7 +2422,7 @@ async def download_graph_json(investigation_id: UUID) -> Response:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
         document = _redact_for_display(_graph_document(investigation))
-        filename = f"deepvault-{investigation_id}-graph.json"
+        filename = f"{EXPORT_PREFIX}-{investigation_id}-graph.json"
         return Response(
             json.dumps(document, indent=2, default=str),
             media_type="application/json",
@@ -2418,7 +2434,7 @@ async def download_graph_json(investigation_id: UUID) -> Response:
 async def download_graphml(investigation_id: UUID) -> Response:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
-        filename = f"deepvault-{investigation_id}.graphml"
+        filename = f"{EXPORT_PREFIX}-{investigation_id}.graphml"
         return Response(
             _graphml_document(investigation),
             media_type="application/graphml+xml",
@@ -2430,7 +2446,7 @@ async def download_graphml(investigation_id: UUID) -> Response:
 async def download_gexf(investigation_id: UUID) -> Response:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
-        filename = f"deepvault-{investigation_id}.gexf"
+        filename = f"{EXPORT_PREFIX}-{investigation_id}.gexf"
         return Response(
             _gexf_document(investigation),
             media_type="application/gexf+xml",
@@ -2442,7 +2458,7 @@ async def download_gexf(investigation_id: UUID) -> Response:
 async def download_graph_csv(investigation_id: UUID) -> Response:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
-        filename = f"deepvault-{investigation_id}-graph.csv"
+        filename = f"{EXPORT_PREFIX}-{investigation_id}-graph.csv"
         return Response(
             _graph_csv_document(investigation),
             media_type="text/csv; charset=utf-8",
@@ -2455,7 +2471,7 @@ async def download_mapping_project(investigation_id: UUID) -> Response:
     async with sessions() as session:
         investigation = await _get_investigation(session, investigation_id)
         document = _redact_for_display(_mapping_document(investigation))
-        filename = f"deepvault-{investigation_id}.osint.json"
+        filename = f"{EXPORT_PREFIX}-{investigation_id}.osint.json"
         return Response(
             json.dumps(document, indent=2, default=str),
             media_type="application/json",
@@ -2704,6 +2720,12 @@ async def download_json_report(investigation_id: UUID) -> Response:
         metadata = investigation.case_metadata or {}
         document = {
             **report,
+            "product": {
+                "name": PRODUCT_FULL_NAME,
+                "short_name": PRODUCT_NAME,
+                "vendor": PRODUCT_VENDOR,
+                "tagline": PRODUCT_TAGLINE,
+            },
             "case_context": {
                 "case_id": str(investigation.id),
                 "target_name": investigation.target_name,
@@ -2714,7 +2736,7 @@ async def download_json_report(investigation_id: UUID) -> Response:
                 "permitted_sources": metadata.get("permitted_sources", []),
             },
         }
-        filename = f"deepvault-{investigation_id}.json"
+        filename = f"{EXPORT_PREFIX}-{investigation_id}.json"
         return Response(
             json.dumps(document, indent=2, default=str),
             media_type="application/json",
@@ -2893,7 +2915,8 @@ def render_report_html(
             "</div>"
             "<div class='how-to-read'><strong>How to read this report</strong>"
             "<p>A candidate means a public trace is worth checking. It does not "
-            "mean DeepVault verified that the person owns the account.</p></div>"
+            f"mean {PRODUCT_NAME} verified that the person owns the "
+            "account.</p></div>"
             "<h2>What to check first</h2>"
             f"{review_lead_cards or '<p>No prioritized review lead was produced.</p>'}"
             "<div class='plain-grid'>"
@@ -3611,7 +3634,7 @@ def render_report_html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DeepVault report — {safe(target_name)}</title>
+  <title>{PRODUCT_FULL_NAME} report — {safe(target_name)}</title>
 	  <style>
 	    body {{ font: 15px/1.55 Inter, system-ui, sans-serif; color: #18221d;
 	      max-width: 1180px; margin: 0 auto; padding: 48px; }}
@@ -3749,8 +3772,9 @@ def render_report_html(
 </head>
 <body id="report-top">
 	  <header>
-    <p>DEEPVAULT · PERSON INTELLIGENCE REPORT</p>
+    <p>{PRODUCT_VENDOR} · {PRODUCT_NAME.upper()} · PERSON INTELLIGENCE REPORT</p>
     <h1>{safe(target_name)}</h1>
+    <p class="meta">{PRODUCT_TAGLINE}</p>
     <p class="meta">Report {safe(report.get("report_id"))} ·
 	      {safe(report.get("generated_at"))}</p>
   </header>
@@ -3831,7 +3855,7 @@ async def download_html_report(investigation_id: UUID) -> Response:
             raise HTTPException(status_code=409, detail="Report is not ready")
         graph_document = _graph_document(investigation)
         review_summary = graph_document.get("review_summary", {})
-        filename = f"deepvault-{investigation_id}.html"
+        filename = f"{EXPORT_PREFIX}-{investigation_id}.html"
         return Response(
             render_report_html(
                 report,

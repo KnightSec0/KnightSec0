@@ -107,7 +107,7 @@ class HIBPConnector(HTTPConnector):
             f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(identifier, safe='')}",
             headers={
                 "hibp-api-key": settings.hibp_api_key,
-                "user-agent": "DeepVault/2.0",
+                "user-agent": "SIGMA-WorldAtlas/2.0",
             },
             params={"truncateResponse": "false"},
         )
@@ -377,7 +377,10 @@ class SpiderFootConnector(HTTPConnector):
                 f"{settings.spiderfoot_url.rstrip('/')}/startscan",
                 headers={"Accept": "application/json"},
                 data={
-                    "scanname": f"DeepVault passive {datetime.now(timezone.utc).isoformat()}",
+                    "scanname": (
+                        "SIGMA WorldAtlas Intelligence passive "
+                        f"{datetime.now(timezone.utc).isoformat()}"
+                    ),
                     "scantarget": identifier,
                     "modulelist": "",
                     "typelist": "",
