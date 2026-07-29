@@ -92,7 +92,7 @@
     evidence_collected: "Public observations collected",
     no_results: "Checked — no public result",
     unavailable: "Unavailable — provider or configuration missing",
-    not_queried: "Not selected for this case",
+    not_queried: "Not run in this collection",
     insufficient: "Insufficient source coverage",
   }[value] || titleCase(value || "not assessed"));
   const emailForDisplay = value => {

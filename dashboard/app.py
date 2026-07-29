@@ -2773,7 +2773,7 @@ def render_report_html(
             "evidence_collected": "Public observations collected",
             "no_results": "Checked — no public result",
             "unavailable": "Unavailable — provider or configuration missing",
-            "not_queried": "Not selected for this case",
+            "not_queried": "Not run in this collection",
             "insufficient": "Insufficient source coverage",
         }
         return labels.get(str(value), str(value or "Not assessed").replace("_", " "))
