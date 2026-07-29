@@ -557,14 +557,14 @@
   <header>
     <div class="brand">
       <div class="mark">DV</div>
-      <div><h1>DeepVault</h1><p>Authorized person intelligence</p></div>
+      <div><h1>DeepVault</h1><p>Person intelligence platform</p></div>
     </div>
     <div class="live"><span class="dot"></span><span id="connection">Local service</span></div>
   </header>
   <main>
     <aside>
       <h2>New investigation</h2>
-      <p class="sub">Collect public evidence for a person who has explicitly authorized the assessment.</p>
+      <p class="sub">Collect public evidence within a documented and approved case scope.</p>
       <div class="notice">Never enter API keys, passwords, leaked credentials, or private communications here.</div>
       <form id="case-form">
         <label for="name">Full name</label>
@@ -575,21 +575,21 @@
         </div>
         <label for="additional-usernames">Additional known usernames</label>
         <input id="additional-usernames" placeholder="KnightSec0, another-handle" autocomplete="off">
-        <p class="sub">Comma-separated handles already known to belong to the authorized subject. They are searched independently and are not treated as corroboration.</p>
+        <p class="sub">Comma-separated handles already known to belong to the case subject. They are searched independently and are not treated as corroboration.</p>
         <div class="grid-2">
           <div><label for="employer">Employer context</label><input id="employer" maxlength="255"></div>
           <div><label for="location">Location context</label><input id="location" maxlength="255"></div>
         </div>
         <div class="grid-2">
-          <div><label for="domains">Authorized domains</label><input id="domains" placeholder="your-owned-domain.com" autocomplete="off"></div>
-          <div><label for="ips">Authorized public IPs</label><input id="ips" placeholder="Public Internet IP only" autocomplete="off"></div>
+          <div><label for="domains">In-scope domains</label><input id="domains" placeholder="your-owned-domain.com" autocomplete="off"></div>
+          <div><label for="ips">In-scope public IPs</label><input id="ips" placeholder="Public Internet IP only" autocomplete="off"></div>
         </div>
-        <p class="sub">Leave these fields empty unless the subject owns or is explicitly authorized to assess the assets. Reserved example domains and private IPs are rejected.</p>
+        <p class="sub">Leave these fields empty unless the assets are covered by the documented case scope. Reserved example domains and private IPs are rejected.</p>
         <label for="purpose">Lawful purpose</label>
         <textarea id="purpose" required>Consent-based self-assessment of public OSINT exposure</textarea>
         <div class="grid-2">
-          <div><label for="reference">Authorization reference</label><input id="reference" value="SELF-TEST-001" required></div>
-          <div><label for="expiry">Authorization expires</label><input id="expiry" type="datetime-local" required></div>
+          <div><label for="reference">Case mandate reference</label><input id="reference" value="SELF-TEST-001" required></div>
+          <div><label for="expiry">Case mandate expires</label><input id="expiry" type="datetime-local" required></div>
         </div>
         <fieldset>
           <legend>Sources</legend>
@@ -616,18 +616,18 @@
           </div>
         </fieldset>
         <label class="consent"><input id="infra-consent" type="checkbox">
-          <span>Permit active infrastructure enrichment: Shodan/Censys only for the literal IPs above and httpx only for the authorized domains above. This also requires <code>ALLOW_INFRASTRUCTURE_ENRICHMENT=true</code> in <code>.env</code>.</span>
+          <span>Permit active infrastructure enrichment: Shodan/Censys only for the literal IPs above and httpx only for the in-scope domains above. This also requires <code>ALLOW_INFRASTRUCTURE_ENRICHMENT=true</code> in <code>.env</code>.</span>
         </label>
         <label class="consent"><input id="authenticated-consent" type="checkbox">
           <span>Permit separately configured authenticated transforms such as GHunt. DeepVault never accepts or stores session cookies. This also requires <code>ALLOW_AUTHENTICATED_TRANSFORMS=true</code>.</span>
         </label>
         <label class="consent"><input id="compare-history" type="checkbox">
-          <span>Compare this run with the latest compatible case under the same unexpired authorization, purpose, and source scope.</span>
+          <span>Compare this run with the latest compatible case under the same active mandate, purpose, and source scope.</span>
         </label>
         <label class="consent"><input id="consent" type="checkbox" required>
-          <span>I confirm that I have explicit written authorization and that the selected sources are within scope.</span>
+          <span>I confirm this case has documented approval and that the selected sources are within scope.</span>
         </label>
-        <button class="primary" id="submit" type="submit">Start authorized investigation</button>
+        <button class="primary" id="submit" type="submit">Start investigation</button>
         <div class="error" id="form-error"></div>
       </form>
       <div class="investigations" id="case-list"></div>
@@ -967,7 +967,7 @@
             <p>${escapeHtml(pivot.rationale)}</p>
             <p>${escapeHtml(pivot.action)}</p>
             <p class="sub">${escapeHtml(pivot.priority)} priority · Manual review only ·
-              New authorization required</p>
+              New case approval required</p>
             <span class="evidence">${(pivot.evidence_ids || []).map(escapeHtml).join(" · ")}</span>
           </article>`).join("") || `<p class="sub">No high-value evidence-backed pivots are available.</p>`}
           ${secondaryGraphPivots.length ? `<details class="evidence-item">
@@ -1010,7 +1010,7 @@
           ).join("") || `<span class="sub">Coverage appears when evidence is normalized.</span>`}</div>
         </section>
         <section class="panel"><h3>Analyst-triggered transforms</h3>
-          <p class="sub">Transforms run only after an explicit click and remain constrained by this case’s source scope, authorization expiry, evidence citations, and pivot budgets.</p>
+          <p class="sub">Transforms run only after an explicit click and remain constrained by this case’s source scope, mandate expiry, evidence citations, and pivot budgets.</p>
           <div class="actions">${transformActions(item).join("") ||
             `<span class="sub">No applicable target transforms were approved for this case.</span>`}</div>
           ${(item.transform_runs || []).slice().reverse().slice(0, 20).map(run =>
@@ -1096,7 +1096,7 @@
         .map(input => input.value);
       const expiryLocal = new Date($("#expiry").value);
       if (Number.isNaN(expiryLocal.getTime())) {
-        errorBox.textContent = "Enter a valid authorization expiry.";
+        errorBox.textContent = "Enter a valid case mandate expiry.";
         button.disabled = false;
         return;
       }

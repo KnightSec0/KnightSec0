@@ -1,4 +1,4 @@
-"""Local FastAPI dashboard for authorized DeepVault investigations."""
+"""Local FastAPI dashboard for governed DeepVault investigations."""
 
 from __future__ import annotations
 
@@ -374,7 +374,7 @@ class InvestigationCreate(BaseModel):
                     for label in domain.split(".")
                 )
             ):
-                raise ValueError(f"Invalid authorized domain: {value}")
+                raise ValueError(f"Invalid in-scope domain: {value}")
             if (
                 domain in _RESERVED_OSINT_DOMAINS
                 or any(domain.endswith(suffix) for suffix in _RESERVED_OSINT_SUFFIXES)
@@ -393,7 +393,7 @@ class InvestigationCreate(BaseModel):
             try:
                 normalized.append(str(ipaddress.ip_address(value.strip())))
             except ValueError as exc:
-                raise ValueError(f"Invalid authorized IP address: {value}") from exc
+                raise ValueError(f"Invalid in-scope IP address: {value}") from exc
         return list(dict.fromkeys(normalized))
 
     @field_validator("depth")
@@ -406,13 +406,13 @@ class InvestigationCreate(BaseModel):
     @model_validator(mode="after")
     def validate_authorization(self) -> "InvestigationCreate":
         if not self.authorization_confirmed:
-            raise ValueError("Written authorization must be confirmed")
+            raise ValueError("Documented case approval must be confirmed")
         expiry = self.authorization_expires_at
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=timezone.utc)
             self.authorization_expires_at = expiry
         if expiry <= datetime.now(timezone.utc):
-            raise ValueError("Authorization expiry must be in the future")
+            raise ValueError("Case mandate expiry must be in the future")
         if (
             not self.target_username
             and not self.additional_usernames
@@ -430,7 +430,7 @@ class InvestigationCreate(BaseModel):
             not self.allow_infrastructure_enrichment or not self.authorized_ips
         ):
             raise ValueError(
-                "Shodan and Censys require infrastructure consent and an authorized IP"
+                "Shodan and Censys require infrastructure consent and an in-scope IP"
             )
         if infrastructure_sources:
             non_public_ips = [
@@ -448,7 +448,7 @@ class InvestigationCreate(BaseModel):
             or not self.allow_infrastructure_enrichment
         ):
             raise ValueError(
-                "httpx requires infrastructure consent and an authorized domain"
+                "httpx requires infrastructure consent and an in-scope domain"
             )
         if (
             "ghunt" in self.permitted_sources
@@ -545,7 +545,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DeepVault",
-    description="Local authorized person-OSINT dashboard",
+    description="Local governed person-intelligence dashboard",
     version="0.2.0",
     lifespan=lifespan,
 )
@@ -815,9 +815,9 @@ def _entity_review_details(
 
     if entity_type == "authorized_target":
         priority = "target"
-        confidence_label = "Authorized target"
+        confidence_label = "Case subject"
         explanation = (
-            "This node contains the identifiers supplied in the authorized case "
+            "This node contains the identifiers supplied in the approved case "
             "scope; it is not a collected identity claim."
         )
     elif entity_type == "public_source":
@@ -1816,7 +1816,7 @@ def _mapping_document(investigation: Investigation) -> dict[str, Any]:
         "target": {
             "name": investigation.target_name,
             "notes": (
-                "Imported from an authorized DeepVault case. Every derived "
+                "Imported from a governed DeepVault case. Every derived "
                 "relationship retains its evidence IDs."
             ),
         },
@@ -1846,7 +1846,7 @@ def _require_transform_authorization(
         )
     metadata = investigation.case_metadata or {}
     if not metadata.get("authorization_confirmed"):
-        raise HTTPException(status_code=403, detail="Authorization is not confirmed")
+        raise HTTPException(status_code=403, detail="Case approval is not confirmed")
     if payload.transform not in {
         str(source).casefold()
         for source in metadata.get("permitted_sources", [])
@@ -1862,12 +1862,12 @@ def _require_transform_authorization(
     except (TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=403,
-            detail="Authorization expiry is invalid",
+            detail="Case mandate expiry is invalid",
         ) from exc
     if expiry.tzinfo is None:
         expiry = expiry.replace(tzinfo=timezone.utc)
     if expiry <= datetime.now(timezone.utc):
-        raise HTTPException(status_code=403, detail="Authorization has expired")
+        raise HTTPException(status_code=403, detail="Case mandate has expired")
     max_depth = max(0, int(os.getenv("MAX_PIVOT_DEPTH", "2")))
     if payload.pivot_depth > max_depth:
         raise HTTPException(status_code=400, detail="Pivot depth limit exceeded")
@@ -2393,7 +2393,7 @@ def render_report_html(
                 "<div class='privacy-note'>"
                 f"{safe(review_counts.get('suppressed', 0))} misleading, generic, "
                 "rejected, or sensitive candidate(s) are hidden from this review "
-                "queue and retained only in the authorized evidence appendix."
+                "queue and retained only in the controlled evidence appendix."
                 "</div>"
                 if review_counts.get("suppressed")
                 else ""
@@ -2560,7 +2560,7 @@ def render_report_html(
             f"<h3>#{safe(item.get('rank'))} · {safe(item.get('title'))}</h3>"
             f"<p>{safe(item.get('rationale'))}</p>"
             f"<p>{safe(item.get('action'))}</p>"
-            "<p class='meta'>Manual review only · new authorization required · "
+            "<p class='meta'>Manual review only · new case approval required · "
             f"{safe(item.get('priority'))} priority</p>"
             f"<p class='meta'>Evidence "
             f"{safe(', '.join(item.get('evidence_ids', [])))}</p>"
@@ -2724,7 +2724,7 @@ def render_report_html(
 </head>
 <body>
 	  <header>
-    <p>DEEPVAULT · AUTHORIZED PERSON INTELLIGENCE</p>
+    <p>DEEPVAULT · PERSON INTELLIGENCE REPORT</p>
     <h1>{safe(target_name)}</h1>
     <p class="meta">Report {safe(report.get("report_id"))} ·
 	      {safe(report.get("generated_at"))}</p>

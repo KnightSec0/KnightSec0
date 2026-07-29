@@ -52,13 +52,13 @@ class DashboardRequestValidationTests(unittest.TestCase):
 
     def test_rejects_unconfirmed_authorization(self):
         with self.assertRaisesRegex(
-            ValidationError, "Written authorization must be confirmed"
+            ValidationError, "Documented case approval must be confirmed"
         ):
             InvestigationCreate(**valid_request(authorization_confirmed=False))
 
     def test_rejects_expired_authorization(self):
         with self.assertRaisesRegex(
-            ValidationError, "Authorization expiry must be in the future"
+            ValidationError, "Case mandate expiry must be in the future"
         ):
             InvestigationCreate(
                 **valid_request(
@@ -108,7 +108,7 @@ class DashboardRequestValidationTests(unittest.TestCase):
             )
 
     def test_active_and_authenticated_transforms_require_separate_scope(self):
-        with self.assertRaisesRegex(ValidationError, "authorized domain"):
+        with self.assertRaisesRegex(ValidationError, "in-scope domain"):
             InvestigationCreate(
                 **valid_request(permitted_sources=["github", "httpx"])
             )
@@ -386,6 +386,9 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertIn("--bg: #071326", index)
         self.assertIn("--accent: #c1121f", index)
         self.assertIn('src="/static/workbench.js"', index)
+        self.assertIn("Case mandate reference", index)
+        self.assertIn("Start investigation", index)
+        self.assertNotIn("Start authorized investigation", index)
         for result_view in ("overview", "graph", "evidence", "timeline", "report"):
             self.assertIn(f'["{result_view}"', workbench)
         self.assertIn("Plain-language assessment", workbench)
@@ -394,6 +397,9 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertIn("Show full technical graph", workbench)
         self.assertIn("Hidden noise", workbench)
         self.assertIn("Why this match?", workbench)
+        self.assertIn('authorized_target: "Case subject"', workbench)
+        self.assertIn("Approved transforms", workbench)
+        self.assertNotIn("Authorized transforms", workbench)
         self.assertIn("Shift-click to compare", workbench)
         self.assertIn("graph.graphml", workbench)
         self.assertIn("graph.gexf", workbench)

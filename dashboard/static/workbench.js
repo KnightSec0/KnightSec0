@@ -46,9 +46,14 @@
       "'": "&#039;",
     }[character]),
   );
-  const titleCase = value => String(value || "observation")
-    .replaceAll("_", " ")
-    .replace(/\b\w/g, character => character.toUpperCase());
+  const titleCase = value => {
+    const customerLabels = {
+      authorized_target: "Case subject",
+    };
+    return customerLabels[value] || String(value || "observation")
+      .replaceAll("_", " ")
+      .replace(/\b\w/g, character => character.toUpperCase());
+  };
   const percent = value => Number.isFinite(Number(value))
     ? `${Math.round(Number(value) * 100)}%`
     : "not scored";
@@ -575,7 +580,7 @@
             || `<p class="sub">No evidence-backed cautions were generated.</p>`}
           ${Number(counts.suppressed || 0) ? `<div class="privacy-note">
             ${html(counts.suppressed)} misleading, generic, rejected, or sensitive candidate(s) are hidden by default.
-            They remain in the evidence ledger for authorized audit.</div>` : ""}
+            They remain in the evidence ledger for controlled case audit.</div>` : ""}
         </article>
         <article class="panel overview-wide"><p class="eyebrow">Tool coverage — not person facts</p>
           <p class="sub">Unavailable and no-result sources reduce what DeepVault can conclude. They are not evidence about the person.</p>
@@ -649,7 +654,7 @@
           <div class="graph-legend">
             <span><i class="solid"></i> evidence-supported relationship</span>
             <span><i class="dashed"></i> unverified candidate</span>
-            <span><b class="legend-target">P</b> authorized target</span>
+            <span><b class="legend-target">P</b> case subject</span>
             <span><b class="legend-breach">!</b> breach metadata</span>
             <span>Confidence helps order review; it does not prove ownership</span>
           </div>
@@ -695,7 +700,7 @@
       return `
         <p class="eyebrow">Node inspector</p>
         <h3>Select an entity</h3>
-        <p class="sub">Click a node to inspect its confidence, cited evidence, provenance, attributes, and authorized pivot options.</p>
+        <p class="sub">Click a node to inspect its confidence, cited evidence, provenance, attributes, and approved pivot options.</p>
         <div class="inspector-warning">Every visible relationship is a source observation or an explicitly uncertain hypothesis. It is never an automatic ownership claim.</div>`;
     }
     if (node.kind === "cluster") {
@@ -736,7 +741,7 @@
             `<li>${html(value)}</li>`).join("")}</ul>` : ""}
       <h4>Evidence IDs</h4>
       <p class="evidence">${(node.evidence_ids || []).map(html).join(" · ")
-        || "Target context supplied by the authorized analyst"}</p>
+        || "Target context supplied by the case analyst"}</p>
       ${attributes.length ? `<h4>Public attributes</h4>
         <dl class="attribute-list">${attributes.map(([key, value]) =>
           `<dt>${html(titleCase(key))}</dt><dd>${html(
@@ -790,7 +795,7 @@
     if (!definition?.value) return "";
     const transforms = definition.transforms.filter(name => allowed.has(name));
     if (!transforms.length) return "";
-    return `<h4>Authorized transforms</h4>
+    return `<h4>Approved transforms</h4>
       <p class="sub">Each run stays inside this case scope and cites this node’s evidence.</p>
       <div class="inspector-actions">${transforms.map(transform =>
         `<button class="secondary graph-pivot" type="button"
@@ -865,7 +870,7 @@
           <ol class="compact-list">${recommendations.map(entry =>
             `<li>${html(entry)}</li>`).join("")}</ol></article>
         <article class="panel report-wide"><p class="eyebrow">Analyst-triggered transforms</p>
-          <p class="sub">Transforms execute only after an explicit click and remain authorization-gated.</p>
+          <p class="sub">Transforms execute only after an explicit click and remain governed by the case mandate.</p>
           <div class="actions">${helpers.transformActions(item).join("")
             || `<span class="sub">No applicable target transforms are approved.</span>`}</div>
           <p class="sub">${data.pivots.length} evidence-backed manual review pivots are available in the graph inspector.</p>
