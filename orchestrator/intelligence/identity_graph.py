@@ -60,6 +60,7 @@ _SECRET_QUERY_KEYS = {
 }
 _PROFILE_TYPES = {
     "github_profile",
+    "person_search_result",
     "public_profile",
     "social_profile",
     "web_profile",
@@ -612,6 +613,10 @@ def _entity_for_evidence(
             else "public_resource"
         )
         attributes["url"] = entity_url
+        if source_url is not None:
+            # Keep the exact redacted collector URL for navigation.  ``url``
+            # is the canonical entity key and may intentionally differ.
+            attributes["open_url"] = source_url
         return f"url:{entity_url}", kind, entity_url, attributes, True
     return (
         f"observation:{item.id}",

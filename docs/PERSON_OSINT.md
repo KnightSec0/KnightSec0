@@ -7,7 +7,7 @@ as proof that a person controls an account.
 ## Sources
 
 - Sherlock: public username presence
-- Maigret: independent username corroboration
+- Maigret: public username-catalogue discovery
 - Holehe: public service-registration signals
 - GitHub: public profile metadata only
 - HIBP: breach metadata and data classes only
@@ -23,10 +23,12 @@ identity status, notes and minimized metadata.
 
 ## Confidence rules
 
-A single username match begins as **possible**. Confidence rises only when
-independent sources return the same canonical profile URL. Analysts must still
-compare public profile attributes such as display name, employer, location and
-cross-linked accounts.
+A username-catalogue match is an **unattributed discovery lead** and is hidden
+from primary person results until public content supplies matching identity
+context or an analyst explicitly accepts it. Catalogue overlap is never
+independent corroboration. Person-search results require at least two matching
+supplied attributes, such as full name plus employer or location. Analysts must
+still inspect cited public content before attribution.
 
 ## Structured reports
 

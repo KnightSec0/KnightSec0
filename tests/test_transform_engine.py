@@ -182,7 +182,11 @@ class TransformEngineTests(unittest.TestCase):
             output = tool_root / "results" / "alice" / "alice.json"
             output.parent.mkdir(parents=True)
             output.write_text(
-                '[{"name":"Example","url":"https://example.test/alice"}]',
+                '[{"name":"Example","url":"https://example.test/alice"},'
+                '{"name":"Missing","url":"https://missing.test/alice",'
+                '"exists":false},'
+                '{"name":"Partial","url":"https://example.test/malice",'
+                '"status":"found"}]',
                 encoding="utf-8",
             )
             return CLIResult(

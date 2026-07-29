@@ -47,9 +47,12 @@ employment, or identity claim.
 ## Graph controls
 
 The simplified graph hides publisher-only nodes, generic search/home endpoints,
-rejected endpoints, and quarantined sensitive username matches. This removes
-visual noise without deleting audit evidence. An analyst can switch to the full
-technical graph and can explicitly reveal suppressed results.
+missing or inaccessible pages, catalogue-only username URLs, person-search
+results without enough identity context, rejected endpoints, and quarantined
+sensitive username matches. These observations remain in the audit ledger with
+their evidence IDs, but broken and unvalidated links are clearly labelled and
+disabled. An analyst can switch to the full technical graph and explicitly
+reveal suppressed results.
 
 Both graph modes can be filtered by source, entity type, and minimum confidence.
 After selecting a node, **Connection view** can show all neighbors, only

@@ -72,6 +72,44 @@
       return null;
     }
   };
+  const catalogueSources = new Set([
+    "blackbird",
+    "maigret",
+    "sherlock",
+    "whatsmyname",
+  ]);
+  const validationFlags = new Set([
+    "canonical_profile_match",
+    "content_validated",
+    "profile_content_validated",
+    "username_in_page",
+  ]);
+  const unavailableFlags = new Set([
+    "inaccessible_profile",
+    "not_found",
+    "profile_missing",
+    "soft_404",
+  ]);
+  const evidenceLink = entry => {
+    const quality = entry?.metadata?.quality || {};
+    const flags = new Set(quality.flags || []);
+    const status = String(quality.verification_status || "").toLocaleLowerCase();
+    if (["inaccessible", "rejected"].includes(status)
+      || [...flags].some(flag => unavailableFlags.has(flag))) {
+      return {url: null, label: "Unavailable page"};
+    }
+    const matched = Array.isArray(quality.matched_attributes)
+      ? quality.matched_attributes : [];
+    const source = String(entry?.source || "").toLocaleLowerCase();
+    const catalogueOnly = catalogueSources.has(source)
+      && !matched.length
+      && ![...flags].some(flag => validationFlags.has(flag));
+    if (["catalogue_only", "insufficient_context", "quarantined"].includes(status)
+      || catalogueOnly) {
+      return {url: null, label: "Unvalidated discovery link"};
+    }
+    return {url: safeUrl(entry?.source_url), label: "Open"};
+  };
   const unique = values => [...new Set(values.filter(Boolean))];
   const relationshipLabel = value => plainRelationshipLabels[value]
     || titleCase(value || "cited relationship");
@@ -217,18 +255,32 @@
         ?? isGenericEndpoint(attributes.url || node.label);
       const sensitive = normalized.sensitive
         ?? Boolean(attributes.sensitive || qualityStatus === "quarantined");
-      const suppressed = qualityStatus === "rejected"
-        || qualityStatus === "quarantined"
-        || genericEndpoint;
+      const flags = new Set(attributes.flags || []);
+      const matchedAttributes = Array.isArray(attributes.matched_attributes)
+        ? attributes.matched_attributes : [];
+      const catalogueOnly = node.kind === "public_profile"
+        && sources.length > 0
+        && sources.every(source => catalogueSources.has(source.toLocaleLowerCase()))
+        && !matchedAttributes.length
+        && ![...flags].some(flag => validationFlags.has(flag));
+      const suppressed = [
+        "catalogue_only",
+        "inaccessible",
+        "insufficient_context",
+        "quarantined",
+        "rejected",
+      ].includes(qualityStatus)
+        || genericEndpoint
+        || catalogueOnly;
       let reviewPriority = normalized.review_priority;
       if (!reviewPriority && !isTarget && !isSource) {
         if (suppressed) reviewPriority = "suppressed";
         else if (["confirmed", "highly_probable", "probable"].includes(
           hypothesis.identity_status,
         )) reviewPriority = "supported";
+        else if (catalogueOnly) reviewPriority = "suppressed";
         else if (hypothesis.identity_status === "possible"
-          || node.kind === "service"
-          || sources.length > 1) reviewPriority = "review_first";
+          || node.kind === "service") reviewPriority = "review_first";
         else reviewPriority = "low_signal";
       }
       return {
@@ -309,13 +361,7 @@
       && node.reviewPriority !== "suppressed");
     const prioritized = candidates.filter(node =>
       ["supported", "review_first"].includes(node.reviewPriority));
-    const simpleCandidates = prioritized.length
-      ? prioritized
-      : [...candidates]
-        .sort((left, right) =>
-          Number(right.confidence || 0) - Number(left.confidence || 0)
-          || String(left.label).localeCompare(String(right.label)))
-        .slice(0, 12);
+    const simpleCandidates = prioritized;
     const simpleIds = new Set(simpleCandidates.map(node => node.id));
     const graphQuery = state.graphQuery.trim().toLocaleLowerCase();
     let records = data.records.filter(node => {
@@ -467,9 +513,11 @@
       node.publisherCount > 1 && node.reviewPriority !== "suppressed");
     const serviceSignals = candidates.filter(node =>
       node.kind === "service" && node.reviewPriority !== "suppressed");
-    const priorityRank = {supported: 0, review_first: 1, low_signal: 2};
+    const priorityRank = {supported: 0, review_first: 1};
     const priorityLeads = candidates
-      .filter(node => node.reviewPriority !== "suppressed")
+      .filter(node => ["supported", "review_first"].includes(
+        node.reviewPriority,
+      ))
       .sort((left, right) =>
         (priorityRank[left.reviewPriority] ?? 9)
           - (priorityRank[right.reviewPriority] ?? 9)
@@ -481,7 +529,9 @@
         entity_id: node.id,
         entity_type: node.kind,
         label: node.label,
-        public_url: safeUrl(node.attributes?.url || node.label),
+        public_url: safeUrl(
+          node.attributes?.open_url || node.attributes?.url || node.label,
+        ),
         review_priority: node.reviewPriority,
         confidence_label: confidenceLabel(node),
         technical_confidence: node.confidence,
@@ -789,7 +839,7 @@
         case-context entity.</p>`;
     }
     return evidenceItems.slice(0, 10).map(entry => {
-      const sourceUrl = safeUrl(entry.source_url);
+      const link = evidenceLink(entry);
       const decision = data.adjudications?.[entry.id]?.status;
       return `<article class="inspector-evidence-card">
         <div><button class="evidence-link" type="button"
@@ -806,8 +856,9 @@
           <dt>Observed</dt><dd>${entry.observed_at
             ? html(new Date(entry.observed_at).toLocaleString()) : "Not supplied"}</dd>
         </dl>
-        ${sourceUrl ? `<a href="${html(sourceUrl)}" target="_blank"
-          rel="noreferrer">Open the exact public source</a>` : ""}
+        ${link.url ? `<a href="${html(link.url)}" target="_blank"
+          rel="noreferrer">Open the exact public source</a>`
+          : `<span class="sub">${html(link.label)}</span>`}
       </article>`;
     }).join("") + (evidenceItems.length > 10
       ? `<p class="sub">Showing 10 of ${evidenceItems.length} records. Open the
@@ -863,7 +914,11 @@
         blocked => key.toLocaleLowerCase().includes(blocked),
       ),
     );
-    const profileUrl = safeUrl(node.attributes?.url || node.label);
+    const profileUrl = node.reviewPriority === "suppressed"
+      ? null
+      : safeUrl(
+        node.attributes?.open_url || node.attributes?.url || node.label,
+      );
     const ownershipConclusion = ["probable", "highly_probable", "confirmed"].includes(
       node.identityStatus,
     )
@@ -1040,7 +1095,7 @@
           <th>Identity status</th><th>Decision</th><th>Observed</th>
           <th>Public source</th><th>Analyst actions</th></tr></thead>
         <tbody>${visibleEvidence.map(entry => {
-          const url = safeUrl(entry.source_url);
+          const link = evidenceLink(entry);
           const decision = data.adjudications?.[entry.id] || {};
           return `<tr id="evidence-row-${html(entry.id)}"><td>
             <code>${html(entry.id)}</code><small>${html(entry.value)}</small></td>
@@ -1050,7 +1105,9 @@
             <td><strong>${html(decisionLabel(decision.status))}</strong>
               ${decision.note ? `<small>${html(decision.note)}</small>` : ""}</td>
             <td>${entry.observed_at ? html(new Date(entry.observed_at).toLocaleString()) : "—"}</td>
-            <td>${url ? `<a href="${html(url)}" target="_blank" rel="noreferrer">Open</a>` : "—"}</td>
+            <td>${link.url
+              ? `<a href="${html(link.url)}" target="_blank" rel="noreferrer">Open</a>`
+              : `<span class="sub">${html(link.label)}</span>`}</td>
             <td><div class="inspector-actions">
               <button class="secondary evidence-decision" type="button"
                 data-evidence-id="${html(entry.id)}" data-evidence-status="accepted">Accept</button>

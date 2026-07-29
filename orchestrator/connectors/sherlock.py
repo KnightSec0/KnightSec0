@@ -9,7 +9,7 @@ import shutil
 import tempfile
 import time
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from config import settings
 from intelligence.models import (
@@ -43,6 +43,33 @@ def _site_from_url(url: str) -> str:
     if hostname.startswith("www."):
         hostname = hostname[4:]
     return hostname or "unknown"
+
+
+def _http_status(details: dict[str, Any]) -> int | None:
+    for key in ("http_status", "status_code", "httpStatus"):
+        value = details.get(key)
+        if isinstance(value, int) and 100 <= value <= 599:
+            return value
+        if isinstance(value, str):
+            match = re.search(r"\b([1-5][0-9]{2})\b", value)
+            if match:
+                return int(match.group(1))
+    return None
+
+
+def _username_profile_url(url: str, username: str) -> bool:
+    """Reject home/search URLs that cannot identify the queried account."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    searchable = unquote(f"{parsed.path}?{parsed.query}").casefold()
+    token = username.casefold()
+    return bool(
+        re.search(rf"(?<![\w.-]){re.escape(token)}(?![\w.-])", searchable)
+    )
 
 
 class SherlockConnector(BaseConnector):
@@ -113,13 +140,35 @@ class SherlockConnector(BaseConnector):
         for details in payload:
             if not _claimed(details):
                 continue
-            url = details.get("url_user") or details.get("url_main")
+            url = details.get("url_user")
             if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                continue
+            if not _username_profile_url(url, identifier):
                 continue
             if url in seen:
                 continue
             seen.add(url)
             site = str(details.get("name") or "").strip()[:120]
+            status_code = _http_status(details)
+            metadata: dict[str, Any] = {
+                "username": identifier,
+                "site": site or _site_from_url(url),
+                "platform": _site_from_url(url),
+                "status": str(
+                    details.get("exists")
+                    or details.get("status")
+                    or "claimed"
+                ),
+                "catalogue_claimed": True,
+            }
+            if status_code is not None:
+                metadata["http_status"] = status_code
+                metadata["profile_accessible"] = status_code < 400
+                if status_code in {404, 410}:
+                    metadata["profile_exists"] = False
+                    metadata["not_found"] = True
+                elif status_code >= 400:
+                    metadata["inaccessible_profile"] = True
             evidence.append(
                 Evidence(
                     type="social_profile",
@@ -134,16 +183,7 @@ class SherlockConnector(BaseConnector):
                         "Username presence is not sufficient to confirm identity.",
                         "Manual profile-content validation is required.",
                     ],
-                    metadata={
-                        "username": identifier,
-                        "site": site or _site_from_url(url),
-                        "platform": _site_from_url(url),
-                        "status": str(
-                            details.get("exists")
-                            or details.get("status")
-                            or "claimed"
-                        ),
-                    },
+                    metadata=metadata,
                 )
             )
 

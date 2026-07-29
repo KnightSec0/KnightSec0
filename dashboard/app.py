@@ -1093,6 +1093,20 @@ _IDENTITY_STATUS_ORDER = {
     "confirmed": 4,
 }
 
+_USERNAME_CATALOGUE_SOURCES = {
+    "blackbird",
+    "maigret",
+    "sherlock",
+    "whatsmyname",
+}
+_NON_NAVIGABLE_QUALITY_STATUSES = {
+    "catalogue_only",
+    "inaccessible",
+    "insufficient_context",
+    "quarantined",
+    "rejected",
+}
+
 _PLAIN_RELATIONSHIP_LABELS = {
     "candidate_profile": "Possible public profile",
     "candidate_observation": "Possible public observation",
@@ -1133,11 +1147,42 @@ def _entity_review_details(
     )
     entity_type = str(entity.get("entity_type") or "public_observation")
     confidence = float(entity.get("confidence") or 0)
+    source_tools = {
+        str(source).casefold()
+        for source in entity.get("source_tools", [])
+        if source
+    }
+    matched_attributes = metadata.get("matched_attributes")
+    matched_attributes = (
+        matched_attributes if isinstance(matched_attributes, list) else []
+    )
+    flags = metadata.get("flags")
+    flags = {str(flag) for flag in flags} if isinstance(flags, list) else set()
+    content_validated = bool(
+        flags
+        & {
+            "canonical_profile_match",
+            "content_validated",
+            "profile_content_validated",
+            "username_in_page",
+        }
+    )
+    catalogue_only = bool(
+        entity_type == "public_profile"
+        and source_tools
+        and source_tools.issubset(_USERNAME_CATALOGUE_SOURCES)
+        and not matched_attributes
+        and not content_validated
+    )
     generic_endpoint = _is_generic_profile_endpoint(
         entity.get("canonical_value") or entity.get("label")
     )
     sensitive = bool(metadata.get("sensitive")) or quality_status == "quarantined"
-    suppressed = quality_status in {"rejected", "quarantined"} or generic_endpoint
+    suppressed = (
+        quality_status in _NON_NAVIGABLE_QUALITY_STATUSES
+        or generic_endpoint
+        or catalogue_only
+    )
     analyst_status = str(entity.get("adjudication_status") or "")
 
     if entity_type == "authorized_target":
@@ -1181,6 +1226,22 @@ def _entity_review_details(
                 "This is a generic home or search page, not a person-specific "
                 "profile, so it is hidden from the simplified graph."
             )
+        elif quality_status == "inaccessible":
+            explanation = (
+                "The collector reported that this public page was unavailable "
+                "or returned an HTTP error, so it is retained only for audit."
+            )
+        elif quality_status == "insufficient_context":
+            explanation = (
+                "This search result does not contain enough matching public "
+                "identity context to associate it with the person."
+            )
+        elif catalogue_only:
+            explanation = (
+                "A username catalogue returned this URL, but no observed name, "
+                "employer, location, or profile content ties it to the person. "
+                "It is retained only as an audit lead."
+            )
         else:
             explanation = (
                 "The quality gate identified a non-profile endpoint, so this "
@@ -1210,14 +1271,6 @@ def _entity_review_details(
         explanation = (
             "A public service-registration check returned a signal. It does not "
             "prove account access, current ownership, or activity."
-        )
-    elif publisher_count > 1:
-        priority = "review_first"
-        confidence_label = "Check first"
-        explanation = (
-            "More than one discovery tool returned this public page. Those tools "
-            "may share username catalogues, so the overlap prioritizes review but "
-            "does not independently prove ownership."
         )
     else:
         priority = "low_signal"
@@ -1305,9 +1358,13 @@ def _review_summary(
             "identity attributes or independent sources are needed."
         )
 
-    priority_rank = {"supported": 0, "review_first": 1, "low_signal": 2}
+    priority_rank = {"supported": 0, "review_first": 1}
     priority_leads = sorted(
-        [entity for entity in candidates if entity not in suppressed],
+        [
+            entity
+            for entity in candidates
+            if entity.get("review_priority") in {"supported", "review_first"}
+        ],
         key=lambda entity: (
             priority_rank.get(str(entity.get("review_priority")), 9),
             -int(entity.get("publisher_count") or 0),
@@ -1321,9 +1378,9 @@ def _review_summary(
             "entity_type": entity.get("entity_type"),
             "label": entity.get("label"),
             "public_url": (
-                entity.get("canonical_value")
-                if isinstance(entity.get("canonical_value"), str)
-                and str(entity.get("canonical_value")).startswith(
+                entity.get("public_url")
+                if isinstance(entity.get("public_url"), str)
+                and str(entity.get("public_url")).startswith(
                     ("http://", "https://")
                 )
                 else None
@@ -1591,6 +1648,7 @@ def _normalized_graph_view(
                 or attributes.get("address")
                 or node.get("label")
             ),
+            "public_url": attributes.get("open_url") or attributes.get("url"),
             "aliases": attributes.get("aliases", []),
             "source_tools": sources,
             "source_urls": sorted(
@@ -2005,7 +2063,11 @@ def _node_mapping_type(node: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if kind == "username_observation":
         return "custom", {"title": "Username", "value": label}
     if kind == "public_profile":
-        url = label if label.startswith(("http://", "https://")) else attributes.get("url")
+        url = (
+            attributes.get("open_url")
+            or attributes.get("url")
+            or (label if label.startswith(("http://", "https://")) else None)
+        )
         hostname = ""
         if isinstance(url, str):
             try:
@@ -2839,6 +2901,48 @@ def render_report_html(
     def public_link(value: Any) -> str:
         return public_named_link(value, "Open public page")
 
+    def evidence_link_state(item: dict[str, Any]) -> tuple[str | None, str]:
+        metadata = item.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        quality = metadata.get("quality")
+        quality = quality if isinstance(quality, dict) else {}
+        status = str(quality.get("verification_status") or "").casefold()
+        flags = quality.get("flags")
+        flags = {str(flag) for flag in flags} if isinstance(flags, list) else set()
+        if status in {"inaccessible", "rejected"} or flags & {
+            "inaccessible_profile",
+            "not_found",
+            "profile_missing",
+            "soft_404",
+        }:
+            return None, "Unavailable page"
+        matches = quality.get("matched_attributes")
+        matches = matches if isinstance(matches, list) else []
+        source = str(item.get("source") or "").casefold()
+        validated = bool(
+            flags
+            & {
+                "canonical_profile_match",
+                "content_validated",
+                "profile_content_validated",
+                "username_in_page",
+            }
+        )
+        if status in {
+            "catalogue_only",
+            "insufficient_context",
+            "quarantined",
+        } or (
+            source in _USERNAME_CATALOGUE_SOURCES
+            and not matches
+            and not validated
+        ):
+            return None, "Unvalidated discovery link"
+        value = item.get("source_url")
+        if isinstance(value, str) and public_link(value):
+            return value, "Open public page"
+        return None, "Not available"
+
     verdict = review_summary.get("verdict", {})
     verdict = verdict if isinstance(verdict, dict) else {}
     review_counts = review_summary.get("counts", {})
@@ -2961,6 +3065,9 @@ def render_report_html(
         "defensive_exposure": "Defensive exposure",
         "service_signals": "Service-presence signals",
         "unverified_profiles": "Unverified username leads",
+        "catalogue_leads": "Catalogue-only username leads",
+        "unverified_search_results": "Search results needing identity context",
+        "inaccessible_profiles": "Unavailable profile links",
         "quarantined_candidates": "Quarantined sensitive candidates",
         "rejected_observations": "Rejected observations",
         "other_observations": "Other observations",
@@ -3035,7 +3142,7 @@ def render_report_html(
         label = node_labels.get(str(node_id), node_id)
         attributes = node.get("attributes")
         attributes = attributes if isinstance(attributes, dict) else {}
-        value = attributes.get("url") or label
+        value = attributes.get("open_url") or attributes.get("url") or label
         return public_named_link(value, str(label)) or safe(label)
 
     reviewable_statuses = {"confirmed", "highly_probable", "probable", "possible"}
@@ -3171,8 +3278,10 @@ def render_report_html(
             f"<div class='notice'>{safe(temporal.get('scope_note'))}</div>"
             + "".join(temporal_groups)
         )
-    evidence_ledger = "".join(
-        (
+    evidence_records: list[str] = []
+    for item in report.get("evidence_ledger", []):
+        evidence_url, evidence_url_label = evidence_link_state(item)
+        evidence_records.append(
             f"<article class='finding evidence-record' "
             f"id='evidence-{safe(anchor_id(item.get('id')))}'>"
             f"<h3>{safe(item.get('id'))} · {safe(item.get('source'))}</h3>"
@@ -3183,15 +3292,14 @@ def render_report_html(
             f"{safe(identity_label(item.get('identity_status')))}</p>"
             f"<p><strong>Value:</strong> {safe(item.get('value'))}</p>"
             f"<p><strong>Source URL:</strong> "
-            f"{public_link(item.get('source_url')) or 'Not available'}</p>"
+            f"{public_named_link(evidence_url, evidence_url_label) if evidence_url else safe(evidence_url_label)}</p>"
             f"<p class='meta'>Observed {safe(item.get('observed_at'))}</p>"
             "<p><a href='#interactive-graph'>Return to interactive graph</a> · "
             "<a href='#report-top'>Return to report summary</a></p>"
             f"<pre>{safe(json.dumps(item.get('metadata', {}), indent=2, default=str))}</pre>"
             "</article>"
         )
-        for item in report.get("evidence_ledger", [])
-    )
+    evidence_ledger = "".join(evidence_records)
     adjudication_summary = report.get("adjudication_summary", {})
     adjudication_summary = (
         adjudication_summary if isinstance(adjudication_summary, dict) else {}

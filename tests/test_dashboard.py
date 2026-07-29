@@ -374,6 +374,31 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertEqual(document["review_summary"]["counts"]["suppressed"], 1)
         self.assertEqual(document["review_summary"]["priority_leads"], [])
 
+    def test_simplified_review_hides_catalogue_only_username_pages(self):
+        investigation = self.investigation()
+        graph = investigation.case_metadata["structured_report"]["identity_graph"]
+        graph["nodes"][1]["attributes"] = {
+            "url": "https://social.example/alice",
+            "verification_status": "unverified",
+            "matched_attributes": [],
+            "flags": [],
+        }
+        graph["edges"][0]["provenance_chain"][0]["source"] = "sherlock"
+        investigation.case_metadata["structured_report"]["evidence_ledger"][0][
+            "source"
+        ] = "sherlock"
+
+        document = _graph_document(investigation)
+        profile = next(
+            item
+            for item in document["entities"]
+            if item["entity_id"] == "NODE-PROFILE"
+        )
+
+        self.assertEqual(profile["review_priority"], "suppressed")
+        self.assertIn("username catalogue", profile["plain_language_explanation"])
+        self.assertEqual(document["review_summary"]["priority_leads"], [])
+
     def test_false_positive_is_removed_from_views_exports_and_report(self):
         investigation = self.investigation()
         structured_report = investigation.case_metadata["structured_report"]
@@ -589,6 +614,9 @@ class DashboardGraphExportTests(unittest.TestCase):
         self.assertIn("Cited evidence details", workbench)
         self.assertIn("Ownership conclusion", workbench)
         self.assertIn("Evidence search", workbench)
+        self.assertIn("Unvalidated discovery link", workbench)
+        self.assertIn("Unavailable page", workbench)
+        self.assertIn("const simpleCandidates = prioritized;", workbench)
         self.assertIn("data-evidence-focus", workbench)
         self.assertIn("Click or press Enter on a node", workbench)
         self.assertIn("element.setPointerCapture(event.pointerId)", workbench)

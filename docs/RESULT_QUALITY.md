@@ -13,14 +13,19 @@ before correlation, graph construction, and report generation.
 | Possible profiles | Limited observed context matches the target | Prominent with limitations |
 | Defensive exposure | Public breach or exposure metadata | Prominent |
 | Service signals | An authorized email produced an ambiguous provider-presence signal | Collapsed |
-| Unverified profiles | Username-existence result without observed profile-content matches | Collapsed |
+| Catalogue leads | Username-catalogue URL without an observed person attribute or content validation | Audit ledger only; link labelled unvalidated |
+| Search results needing context | Person-search result matching fewer than two supplied identity attributes | Audit ledger only; not attributed |
+| Unavailable profiles | Page reported missing or inaccessible by its collector | Audit ledger only; link disabled |
+| Unverified profiles | Non-catalogue profile result without observed profile-content matches | Collapsed |
 | Quarantined candidates | Sensitive profile candidate without strong corroboration | Collapsed and never attributed |
 | Rejected observations | Invalid URL, non-profile endpoint, soft-404, generic redirect, negative disambiguation, or similar failure | Audit ledger only |
 
 ## Confidence rules
 
 - Observation confidence and identity confidence are stored separately.
-- An unvalidated username-only candidate is capped at `0.25`.
+- A catalogue-only username candidate is capped at `0.15`.
+- A person-search result must match at least two supplied identity attributes
+  before it can enter the person-review queue.
 - An ambiguous service-presence signal is capped at `0.30`.
 - A sensitive username-only candidate is capped at `0.15` and quarantined.
 - Sherlock, Maigret, Blackbird, and WhatsMyName belong to the same
@@ -42,6 +47,9 @@ Profile URLs are normalized before deduplication:
 - YouTube `/@handle` and `/@handle/about` variants are merged.
 
 The original observations remain inside the correlated provenance metadata.
+Canonical URLs are used only for deduplication; navigation always preserves the
+exact redacted URL returned by the collector so query-based profile links are
+not broken by normalization.
 
 ## Coverage-aware conclusions
 
